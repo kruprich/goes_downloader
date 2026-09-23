@@ -5,6 +5,7 @@
   "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
   "bounds": null,
+  "cmip_precision": 0.25,
   "download": [
     "cmip_c08",
     "cmip_c11",
@@ -73,8 +74,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C07",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c08",
@@ -82,8 +82,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C08",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c09",
@@ -91,8 +90,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C09",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c10",
@@ -100,8 +98,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C10",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c11",
@@ -109,8 +106,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C11",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c12",
@@ -118,8 +114,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C12",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c13",
@@ -127,8 +122,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C13",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c14",
@@ -136,8 +130,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C14",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c15",
@@ -145,8 +138,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C15",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "cmip_c16",
@@ -154,8 +146,7 @@
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C16",
       "data_variable": "CMI",
-      "dqf_variable": "DQF",
-      "precision": 0.25
+      "dqf_variable": "DQF"
     },
     {
       "key": "acha",

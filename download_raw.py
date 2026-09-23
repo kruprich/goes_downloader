@@ -138,16 +138,30 @@ def _require(d: Dict[str, Any], k: str, typ: Any):
     return v
 
 
+CMIP_BAND_PATTERN = re.compile(r"CMIP\w*-M\d+C(\d{2})")
+
+
+def is_cmip_ir_band(product: Dict[str, Any]) -> bool:
+    """CMIP bands 7-16 hold brightness temperature (K); bands 1-6 are reflectance (0-1)."""
+    m = CMIP_BAND_PATTERN.search(str(product.get("filename_must_contain", "")))
+    return bool(m) and int(m.group(1)) >= 7
+
+
 def load_config(config_path: str) -> RawConfig:
     """Reads the shared config.json; keys only used by the feature step are ignored."""
     with open(config_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    # One precision (K) for every infrared CMIP band; a product's own "precision" overrides it
+    cmip_precision = raw.get("cmip_precision")
+    if cmip_precision is not None and (not isinstance(cmip_precision, (int, float)) or cmip_precision <= 0):
+        raise ValueError("cmip_precision must be a positive number or null")
+
     defined_abi: List[ProductSpec] = []
     for i, p in enumerate(_require(raw, "abi_products", list)):
         if not isinstance(p, dict):
             raise ValueError(f"abi_products[{i}] must be an object")
-        precision = p.get("precision")
+        precision = p["precision"] if "precision" in p else (cmip_precision if is_cmip_ir_band(p) else None)
         if precision is not None and (not isinstance(precision, (int, float)) or precision <= 0):
             raise ValueError(f"abi_products[{i}].precision must be a positive number")
         defined_abi.append(

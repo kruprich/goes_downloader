@@ -61,9 +61,11 @@ which makes `value` a float array; pass `mask_and_scale=False` to get the stored
 
 ## Config options for storage
 
-- `precision` (per ABI product, in the product's units): rounds stored values to save space.
-  The CMIP bands are set to 0.25 K, which is below the sensor noise and cuts CMIP storage by
-  about 26%. Categorical products such as cloud top phase must not set it.
+- `cmip_precision` (K): rounds the infrared CMIP bands (7–16) to this step to save space. 0.25 K is
+  below the sensor noise and cuts CMIP storage by about 26%; `null` keeps full precision. The
+  visible bands (1–6) are reflectance and always keep full precision.
+- `precision` (per ABI product, in the product's units): overrides `cmip_precision` for that
+  product, or rounds any other product. Categorical products such as cloud top phase must not set it.
 - `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): crops ABI to the smallest scan-angle
   rectangle containing the box and keeps GLM flashes inside it. `null` keeps the full CONUS sector.
 

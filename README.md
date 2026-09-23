@@ -59,6 +59,39 @@ ABI values are the file's packed numbers, not physical units: the physical value
 `value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
 which makes `value` a float array; pass `mask_and_scale=False` to get the stored integers.
 
+## Assumptions about the source data
+
+**Checked on every scan.** A scan that breaks one of these counts as a file error, which leaves the
+day incomplete so it is retried and visible in the log:
+
+- Within a day, each product's grid (shape and x/y scan angles), fill value and quality-flag data
+  type stay the same as in its first scan.
+- Data values are packed integers that fit in 16 bits; quality flags fit in 8 or 16 bits.
+
+**Recorded, but expected to stay constant.** `scale_factor` and `add_offset` are stored for every
+scan, so a change would be captured. For GOES-19 they have never changed: one file per month for
+every current product, from the start of the data (Oct 2024 for CMIP, Dec 2024 for the others) to
+Sep 2026, all had the same scale, offset and fill value. The feature step can treat them as
+constant per product but should check.
+
+**Assumed, not checked:**
+
+- ABI stays in scan mode 6 (CONUS every 5 minutes). Every product's filename filter contains
+  `-M6`, so scans taken in other modes are not downloaded. Each 5-minute slot holds at most one
+  scan; an extra scan in the same slot is skipped and counted in `n_abi_slot_collisions`.
+- The bucket stores files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
+  file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
+  the file with the newest creation time is used.
+- All products share one projection (the GOES-East fixed grid, centred on 75.0°W). The `bounds`
+  crop is computed from the first ABI scan decoded each day and applied to every product.
+- GLM flash times are "seconds since" offsets in the file. A GLM file belongs to the day its start
+  time falls in, so a flash in the first file of a day can begin a second or two before midnight;
+  select flashes by their own times, not by which day store holds them.
+- GLM flash positions are on GLM's raised "lightning ellipsoid", which the files do not state. The
+  36 km margin on the GLM `bounds` crop covers the resulting offset from ABI positions.
+- In a complete day, `present` = 0 means NOAA did not publish that scan; a failed download would
+  have left the day incomplete.
+
 ## Config options for storage
 
 - `cmip_precision` (K): rounds the infrared CMIP bands (7–16) to this step to save space. 0.25 K is

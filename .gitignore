@@ -1,4 +1,5 @@
 # Pipeline output
+goes_raw/
 goes_abi_glm/
 *.zarr
 *.zarr.tmp

@@ -1,31 +1,39 @@
 # goes_downloader
 
-Builds a per-day Zarr dataset from GOES-19 ABI (CONUS L2) and GLM (LCFA) data in the
-public GCS bucket `gcp-public-data-goes-19`.
+Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from the public GCS bucket
+`gcp-public-data-goes-19` into one raw Zarr store per UTC day, for building a
+lightning-prediction training dataset. No time binning or spatial aggregation happens
+here; that belongs in a separate feature-building step.
 
 For each UTC day it:
 
-1. Lists ABI and GLM files over the GCS JSON API and assigns each file to a time bin
-   (strict: the file's start and end must both fall within the bin).
-2. Downloads and decodes files in a bounded async + process-pool pipeline.
-3. ABI: averages DQF==0 pixels across the files in each bin, then block-averages
-   onto a coarser grid.
-4. GLM: projects good-quality flashes onto the ABI fixed grid and counts them per cell.
-5. Writes `goes_abi_glm/merged/YYYY/YYYYDDD.zarr` with values, valid-pixel fractions
-   and file/pixel accounting under `validation/`.
+1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
+2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15
+   and cloud top phase at 2 km, ACHA cloud height and TPW at 10 km) as the file's packed
+   integers plus its DQF flags.
+3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and which
+   20 s files were read, so missing files show up as coverage gaps.
+4. Writes `goes_raw/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and
+   file succeeded. Incomplete days are rebuilt on the next run.
+
+The full layout is described in the docstring at the top of `download_raw.py`.
 
 ## Usage
 
 ```bash
 pip install -r requirements.txt
-python generate_dataset.py --config config.json
+python download_raw.py --config config.json
 ```
 
 Days already marked `complete` are skipped unless `overwrite_existing` is `true`.
 
-## Known issue
+## Config options for storage
 
-ACHA and TPW are 10 km products, while CMIP band 13 is 2 km. The grid comes from the
-first ABI product found, so the 10 km products are padded into the corner of the 2 km
-grid instead of being resampled. Fix planned: give each product a `resolution_km` in the
-config and aggregate all products to the coarsest resolution.
+- `precision` (per ABI product, in the product's units): rounds stored values to save space.
+  The CMIP bands are set to 0.25 K, which is below the sensor noise and cuts CMIP storage by
+  about 26%. Categorical products such as cloud top phase must not set it.
+- `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): crops ABI to the smallest scan-angle
+  rectangle containing the box and keeps GLM flashes inside it. `null` keeps the full CONUS sector.
+
+Measured on one hour of data with the current products: about 3.1 GB/day for full CONUS.
+A lower-48 box (24–50°N, 125–66°W) keeps about 65% of the ABI pixels.

@@ -2,19 +2,41 @@
   "gcs_bucket": "gcp-public-data-goes-19",
   "start_date_utc": "2025-10-16",
   "end_date_utc": "2026-02-01",
-  "number_of_5min_bins_per_bin": 2,
-  "coarsen_factor": 4,
-  "output_root_dir": "./goes_abi_glm",
+  "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
-  "expected_abi_files_per_5min": 1,
-  "expected_glm_files_per_5min": 15,
+  "bounds": null,
   "abi_products": [
     {
-      "key": "cmip",
+      "key": "cmip_c08",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C08",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
+      "key": "cmip_c11",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C11",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
+      "key": "cmip_c13",
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C13",
       "data_variable": "CMI",
-      "dqf_variable": "DQF"
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
+      "key": "cmip_c15",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C15",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
     },
     {
       "key": "acha",
@@ -29,6 +51,13 @@
       "filename_must_contain": "ABI-L2-TPWC-M6",
       "data_variable": "TPW",
       "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "actp",
+      "gcs_product_prefix": "ABI-L2-ACTPC",
+      "filename_must_contain": "ABI-L2-ACTPC-M6",
+      "data_variable": "Phase",
+      "dqf_variable": "DQF"
     }
   ],
   "glm_product": {

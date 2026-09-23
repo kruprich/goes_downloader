@@ -15,7 +15,8 @@ Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/T
                                               configured "precision" (physical units) if one is set
                                               physical = value * scale_factor[slot] + add_offset[slot]
                                               value == attrs["fill_value"] means no data
-  abi/<key>/dqf[slot, y, x]          uint8    data quality flags as in the file (255 = fill)
+  abi/<key>/dqf[slot, y, x]          uint8    data quality flags as in the file (uint16 for products with
+                                              16-bit flags; attrs["dqf_fill_value"] = fill)
   abi/<key>/scale_factor[slot]       float64
   abi/<key>/add_offset[slot]         float64
   abi/<key>/quantization_step[slot]  float64  physical step between stored values after rounding
@@ -25,7 +26,7 @@ Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/T
   abi/<key>/x_scan_angle_rad[x]      float64
   abi/<key>/y_scan_angle_rad[y]      float64
 
-GLM: every flash from every 20 s file whose start falls in the day, all quality flags kept.
+GLM (only if "glm" is in the config's "download" list): every flash from every 20 s file whose start falls in the day, all quality flags kept.
   glm/files/{start_ns,end_ns,ok,n_flashes}[file]   n_flashes counts flashes kept after the bounds crop
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
   Files with ok=0 are coverage gaps: no flashes there does NOT mean no lightning.
@@ -43,6 +44,9 @@ Root attrs:
 
 Config:
   python download_raw.py --config config.json
+  abi_products / glm_product define every product; "download" lists the keys to fetch.
+  Products that read different variables from the same files (e.g. the dsi_* indices) share one
+  download per scan, and each bucket prefix is listed once per day.
 """
 
 from __future__ import annotations
@@ -105,8 +109,9 @@ class RawConfig:
     # Caps how many files are between "download started" and "written to Zarr" per day.
     max_inflight_payloads: int
 
+    # Only the products named in the config's "download" list
     abi_products: List[ProductSpec]
-    glm_product: ProductSpec
+    glm_product: Optional[ProductSpec]
 
     # None keeps the full ABI sector and every GLM flash
     bounds: Optional[LatLonBounds]
@@ -126,14 +131,14 @@ def load_config(config_path: str) -> RawConfig:
     with open(config_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    abi_products: List[ProductSpec] = []
+    defined_abi: List[ProductSpec] = []
     for i, p in enumerate(_require(raw, "abi_products", list)):
         if not isinstance(p, dict):
             raise ValueError(f"abi_products[{i}] must be an object")
         precision = p.get("precision")
         if precision is not None and (not isinstance(precision, (int, float)) or precision <= 0):
             raise ValueError(f"abi_products[{i}].precision must be a positive number")
-        abi_products.append(
+        defined_abi.append(
             ProductSpec(
                 key=_require(p, "key", str),
                 gcs_product_prefix=_require(p, "gcs_product_prefix", str),
@@ -143,18 +148,23 @@ def load_config(config_path: str) -> RawConfig:
                 precision=float(precision) if precision is not None else None,
             )
         )
-    if not abi_products:
-        raise ValueError("Config must include at least one ABI product in abi_products")
-    keys = [p.key for p in abi_products]
-    if len(set(keys)) != len(keys):
-        raise ValueError(f"abi_products keys must be unique, got {keys}")
-
     glm_raw = _require(raw, "glm_product", dict)
-    glm_product = ProductSpec(
+    defined_glm = ProductSpec(
         key=_require(glm_raw, "key", str),
         gcs_product_prefix=_require(glm_raw, "gcs_product_prefix", str),
         filename_must_contain=_require(glm_raw, "filename_must_contain", str),
     )
+
+    keys = [p.key for p in defined_abi] + [defined_glm.key]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"product keys must be unique across abi_products and glm_product, got {keys}")
+
+    download = _require(raw, "download", list)
+    unknown = [k for k in download if k not in keys]
+    if unknown or not download:
+        raise ValueError(f"download must list product keys from {keys}; unknown: {unknown}")
+    abi_products = [p for p in defined_abi if p.key in download]
+    glm_product = defined_glm if defined_glm.key in download else None
 
     bounds: Optional[LatLonBounds] = None
     bounds_raw = raw.get("bounds")
@@ -311,40 +321,46 @@ async def gcs_list_object_names(
         params["pageToken"] = page_token
 
 
-async def list_day_files(
+async def list_day_names(
     cfg: RawConfig,
     session: aiohttp.ClientSession,
-    spec: ProductSpec,
+    gcs_product_prefix: str,
     day: datetime,
-) -> Tuple[List[RemoteFile], int]:
-    """
-    Returns (files, n_failed_prefixes). Files are deduplicated by scan start time, keeping the
-    newest creation time (reprocessed files), and sorted by start time.
-    """
+) -> Tuple[List[str], int]:
+    """Returns (every object name under the day's 24 hourly prefixes, n_failed_prefixes)."""
     jday = day.timetuple().tm_yday
-    prefixes = [f"{spec.gcs_product_prefix}/{day.year}/{jday:03d}/{hh:02d}/" for hh in LIST_HOURS]
+    prefixes = [f"{gcs_product_prefix}/{day.year}/{jday:03d}/{hh:02d}/" for hh in LIST_HOURS]
     results = await asyncio.gather(
         *(gcs_list_object_names(cfg, session, p) for p in prefixes), return_exceptions=True
     )
 
+    names: List[str] = []
     n_failed = 0
-    by_start: Dict[datetime, RemoteFile] = {}
     for prefix, res in zip(prefixes, results):
         if isinstance(res, BaseException):
             n_failed += 1
             log(f"!! listing failed for {prefix}: {res!r}")
             continue
-        for name in res:
-            if spec.filename_must_contain not in name:
-                continue
-            rf = parse_remote_file(name)
-            if rf is None:
-                continue
-            prev = by_start.get(rf.start)
-            if prev is None or rf.created > prev.created:
-                by_start[rf.start] = rf
+        names.extend(res)
+    return names, n_failed
 
-    return sorted(by_start.values(), key=lambda rf: rf.start), n_failed
+
+def select_files(names: List[str], filename_must_contain: str) -> List[RemoteFile]:
+    """
+    Files whose name contains the pattern, deduplicated by scan start time (keeping the newest
+    creation time, i.e. reprocessed files) and sorted by start time.
+    """
+    by_start: Dict[datetime, RemoteFile] = {}
+    for name in names:
+        if filename_must_contain not in name:
+            continue
+        rf = parse_remote_file(name)
+        if rf is None:
+            continue
+        prev = by_start.get(rf.start)
+        if prev is None or rf.created > prev.created:
+            by_start[rf.start] = rf
+    return sorted(by_start.values(), key=lambda rf: rf.start)
 
 
 # =============================================================================
@@ -388,47 +404,61 @@ def quantize_packed(value: np.ndarray, fill_value: Optional[int], scale_factor: 
     return rounded, step * (1 << n)
 
 
-def decode_abi_file(payload: bytes, data_variable: str, dqf_variable: str, precision: Optional[float]) -> Dict[str, Any]:
+def _decode_abi_variable(ds: Any, data_variable: str, dqf_variable: str, precision: Optional[float]) -> Dict[str, Any]:
+    v = ds.variables[data_variable]
+    q = ds.variables[dqf_variable]
+    v.set_auto_maskandscale(False)
+    q.set_auto_maskandscale(False)
+
+    value = _as_unsigned(_squeeze_to_2d(v[:], data_variable), v, np.uint16, data_variable)
+    dqf_raw = _squeeze_to_2d(q[:], dqf_variable)
+    dqf_dtype = np.uint8 if dqf_raw.dtype.itemsize == 1 else np.uint16
+    dqf = _as_unsigned(dqf_raw, q, dqf_dtype, dqf_variable)
+    if dqf.shape != value.shape:
+        raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {value.shape}")
+
+    fill = getattr(v, "_FillValue", None)
+    fill_value = None
+    if fill is not None:
+        fill_value = int(_as_unsigned(np.asarray([fill], dtype=v.dtype), v, np.uint16, "_FillValue")[0])
+    dqf_fill = getattr(q, "_FillValue", None)
+    dqf_fill_value = (
+        int(_as_unsigned(np.asarray([dqf_fill], dtype=q.dtype), q, dqf_dtype, "DQF _FillValue")[0])
+        if dqf_fill is not None
+        else int(np.iinfo(dqf_dtype).max)
+    )
+
+    scale_factor = float(getattr(v, "scale_factor", 1.0))
+    value, quantization_step = quantize_packed(value, fill_value, scale_factor, precision)
+    return {
+        "value": value,
+        "dqf": dqf,
+        "dqf_fill_value": dqf_fill_value,
+        "scale_factor": scale_factor,
+        "add_offset": float(getattr(v, "add_offset", 0.0)),
+        "quantization_step": quantization_step,
+        "fill_value": fill_value,
+        "units": str(getattr(v, "units", "")),
+    }
+
+
+def decode_abi_file(payload: bytes, variables: List[Tuple[str, str, Optional[float]]]) -> List[Dict[str, Any]]:
+    """
+    Decodes each (data_variable, dqf_variable, precision) from one file, so products that read
+    different variables from the same file (e.g. the DSI indices) share one download.
+    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
-        v = ds.variables[data_variable]
-        q = ds.variables[dqf_variable]
-        v.set_auto_maskandscale(False)
-        q.set_auto_maskandscale(False)
-
-        value = _as_unsigned(_squeeze_to_2d(v[:], data_variable), v, np.uint16, data_variable)
-        dqf = _as_unsigned(_squeeze_to_2d(q[:], dqf_variable), q, np.uint8, dqf_variable)
-        if dqf.shape != value.shape:
-            raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {value.shape}")
-
-        fill = getattr(v, "_FillValue", None)
-        fill_value = None
-        if fill is not None:
-            fill_value = int(_as_unsigned(np.asarray([fill], dtype=v.dtype), v, np.uint16, "_FillValue")[0])
-
         # x/y are scaled int16 in the file; netCDF4 unpacks them to radians by default
         x = np.asarray(ds.variables["x"][:], dtype=np.float64).reshape(-1)
         y = np.asarray(ds.variables["y"][:], dtype=np.float64).reshape(-1)
-
-        scale_factor = float(getattr(v, "scale_factor", 1.0))
-        value, quantization_step = quantize_packed(value, fill_value, scale_factor, precision)
-
         proj = ds.variables["goes_imager_projection"]
         projection = {k: _jsonable(proj.getncattr(k)) for k in proj.ncattrs()}
-
-        return {
-            "value": value,
-            "dqf": dqf,
-            "scale_factor": scale_factor,
-            "add_offset": float(getattr(v, "add_offset", 0.0)),
-            "quantization_step": quantization_step,
-            "fill_value": fill_value,
-            "units": str(getattr(v, "units", "")),
-            "x": x,
-            "y": y,
-            "projection": projection,
-        }
+        return [
+            {**_decode_abi_variable(ds, data_variable, dqf_variable, precision), "x": x, "y": y, "projection": projection}
+            for data_variable, dqf_variable, precision in variables
+        ]
 
 
 def _offset_seconds_to_ns(var: Any) -> np.ndarray:
@@ -605,6 +635,7 @@ class AbiProductState:
                     "dqf_variable": self.spec.dqf_variable,
                     "units": dec["units"],
                     "fill_value": dec["fill_value"],
+                    "dqf_fill_value": dec["dqf_fill_value"],
                     "precision_requested": self.spec.precision,
                     "goes_imager_projection": dec["projection"],
                     "source_filename_must_contain": self.spec.filename_must_contain,
@@ -616,7 +647,9 @@ class AbiProductState:
             common = dict(overwrite=True, compressor=COMPRESSOR, chunks=(1, shape[0], shape[1]))
             fill = dec["fill_value"] if dec["fill_value"] is not None else 0
             self.value_array = g.create_dataset("value", shape=(SLOTS_PER_DAY, *shape), dtype="u2", fill_value=fill, **common)
-            self.dqf_array = g.create_dataset("dqf", shape=(SLOTS_PER_DAY, *shape), dtype="u1", fill_value=255, **common)
+            self.dqf_array = g.create_dataset(
+                "dqf", shape=(SLOTS_PER_DAY, *shape), dtype=dec["dqf"].dtype, fill_value=dec["dqf_fill_value"], **common
+            )
             g.create_dataset("x_scan_angle_rad", data=x, dtype="f8", overwrite=True)
             g.create_dataset("y_scan_angle_rad", data=y, dtype="f8", overwrite=True)
             self.full_shape, self.fill_value, self.x, self.y = full_shape, dec["fill_value"], dec["x"], dec["y"]
@@ -624,10 +657,20 @@ class AbiProductState:
 
         if full_shape != self.full_shape:
             raise ValueError(f"{self.spec.key}: grid {full_shape} != first scan's grid {self.full_shape}")
+        if dec["dqf"].dtype != self.dqf_array.dtype:
+            raise ValueError(f"{self.spec.key}: DQF dtype {dec['dqf'].dtype} != first scan's {self.dqf_array.dtype}")
         if dec["fill_value"] != self.fill_value:
             raise ValueError(f"{self.spec.key}: fill value {dec['fill_value']} != {self.fill_value}")
         if not (np.allclose(dec["x"], self.x, atol=1e-7) and np.allclose(dec["y"], self.y, atol=1e-7)):
             raise ValueError(f"{self.spec.key}: scan-angle coordinates differ from the first scan")
+
+    def record_scan(self, slot: int, dec: Dict[str, Any], f: RemoteFile) -> None:
+        self.scale_factor[slot] = dec["scale_factor"]
+        self.add_offset[slot] = dec["add_offset"]
+        self.quantization_step[slot] = dec["quantization_step"]
+        self.scan_start_ns[slot] = to_ns(f.start)
+        self.scan_end_ns[slot] = to_ns(f.end)
+        self.present[slot] = 1
 
     def write_slot_arrays(self, root: Any) -> None:
         g = root.require_group(f"abi/{self.spec.key}")
@@ -693,38 +736,46 @@ async def process_single_day(
     day_start = day
     day_end = day + timedelta(days=1)
 
-    # --- listing
+    # --- listing: each bucket prefix once, shared by every product that reads from it
     log(f"=== {day_label} listing ===")
-    listings = await asyncio.gather(
-        *(list_day_files(cfg, session, spec, day) for spec in cfg.abi_products),
-        list_day_files(cfg, session, cfg.glm_product, day),
-    )
+    specs = cfg.abi_products + ([cfg.glm_product] if cfg.glm_product is not None else [])
+    prefixes = sorted({spec.gcs_product_prefix for spec in specs})
+    listings = await asyncio.gather(*(list_day_names(cfg, session, p, day) for p in prefixes))
+    names_by_prefix = {p: names for p, (names, _) in zip(prefixes, listings)}
     n_listing_errors = sum(n for _, n in listings)
-    abi_listings = listings[:-1]
-    glm_files = [f for f in listings[-1][0] if day_start <= f.start < day_end]
 
-    # --- ABI slot assignment: slot = 5-min window containing the scan start
+    def day_files(spec: ProductSpec) -> List[RemoteFile]:
+        files = select_files(names_by_prefix[spec.gcs_product_prefix], spec.filename_must_contain)
+        return [f for f in files if day_start <= f.start < day_end]
+
+    glm_files = day_files(cfg.glm_product) if cfg.glm_product is not None else []
+
+    # --- ABI slot assignment: slot = 5-min window containing the scan start. Products that read
+    # the same files (e.g. the DSI indices) are grouped so each file is downloaded once.
     crop = DayCrop(cfg.bounds) if cfg.bounds is not None else None
     abi_states = {spec.key: AbiProductState(spec, crop) for spec in cfg.abi_products}
-    abi_items: List[Tuple[AbiProductState, int, RemoteFile]] = []
+    same_files: Dict[Tuple[str, str], List[AbiProductState]] = {}
+    for spec in cfg.abi_products:
+        same_files.setdefault((spec.gcs_product_prefix, spec.filename_must_contain), []).append(abi_states[spec.key])
+
+    abi_items: List[Tuple[List[AbiProductState], int, RemoteFile]] = []
     n_slot_collisions = 0
-    for spec, (files, _) in zip(cfg.abi_products, abi_listings):
+    for states in same_files.values():
         taken: Dict[int, RemoteFile] = {}
-        for f in files:
-            if not (day_start <= f.start < day_end):
-                continue
+        for f in day_files(states[0].spec):
             slot = int((f.start - day_start).total_seconds() // SLOT_SECONDS)
             if slot in taken:
                 n_slot_collisions += 1
-                log(f"!! {spec.key}: two scans in slot {slot}; keeping {os.path.basename(taken[slot].blob)}")
+                keys = "/".join(st.spec.key for st in states)
+                log(f"!! {keys}: two scans in slot {slot}; keeping {os.path.basename(taken[slot].blob)}")
                 continue
             taken[slot] = f
-            abi_items.append((abi_states[spec.key], slot, f))
+            abi_items.append((states, slot, f))
 
     log(
         f"{day_label}: ABI scans "
-        + ", ".join(f"{k}={sum(1 for s, _, _ in abi_items if s.spec.key == k)}" for k in abi_states)
-        + f"; GLM files={len(glm_files)}; listing errors={n_listing_errors}"
+        + ", ".join(f"{k}={sum(1 for states, _, _ in abi_items for st in states if st.spec.key == k)}" for k in abi_states)
+        + f"; ABI files={len(abi_items)}; GLM files={len(glm_files)}; listing errors={n_listing_errors}"
     )
 
     # --- store (built at *.tmp and moved into place when done)
@@ -745,6 +796,7 @@ async def process_single_day(
             "source_gcs_bucket": cfg.gcs_bucket,
             "source_satellite_label": infer_satellite_label_from_bucket(cfg.gcs_bucket),
             "abi_product_keys": [p.key for p in cfg.abi_products],
+            "glm_included": cfg.glm_product is not None,
             "bounds": vars(cfg.bounds) if cfg.bounds is not None else None,
             "complete": False,
         }
@@ -765,27 +817,19 @@ async def process_single_day(
     async def download(blob: str) -> bytes:
         return await http_get(cfg, session, f"https://storage.googleapis.com/{cfg.gcs_bucket}/{blob}", as_json=False)
 
-    async def run_abi(state: AbiProductState, slot: int, f: RemoteFile) -> None:
+    async def run_abi(states: List[AbiProductState], slot: int, f: RemoteFile) -> None:
         async with inflight:
             try:
                 payload = await download(f.blob)
-                dec = await loop.run_in_executor(
-                    decode_pool,
-                    decode_abi_file,
-                    payload,
-                    state.spec.data_variable,
-                    state.spec.dqf_variable,
-                    state.spec.precision,
-                )
+                variables = [(st.spec.data_variable, st.spec.dqf_variable, st.spec.precision) for st in states]
+                decoded = await loop.run_in_executor(decode_pool, decode_abi_file, payload, variables)
                 del payload
-                state.accept_first_or_validate(root, dec)
-                await asyncio.to_thread(write_abi_frame, state, slot, dec)
-                state.scale_factor[slot] = dec["scale_factor"]
-                state.add_offset[slot] = dec["add_offset"]
-                state.quantization_step[slot] = dec["quantization_step"]
-                state.scan_start_ns[slot] = to_ns(f.start)
-                state.scan_end_ns[slot] = to_ns(f.end)
-                state.present[slot] = 1
+                # Validate every product before writing any, so a bad file leaves no half-written slot
+                for state, dec in zip(states, decoded):
+                    state.accept_first_or_validate(root, dec)
+                for state, dec in zip(states, decoded):
+                    await asyncio.to_thread(write_abi_frame, state, slot, dec)
+                    state.record_scan(slot, dec, f)
             except Exception as e:
                 record_error(f.blob, e)
 
@@ -799,7 +843,7 @@ async def process_single_day(
                 record_error(f.blob, e)
 
     await asyncio.gather(
-        *(run_abi(s, slot, f) for s, slot, f in abi_items),
+        *(run_abi(states, slot, f) for states, slot, f in abi_items),
         *(run_glm(i, f) for i, f in enumerate(glm_files)),
     )
 
@@ -807,14 +851,18 @@ async def process_single_day(
     for state in abi_states.values():
         state.write_slot_arrays(root)
 
+    if crop is not None and crop.rect is not None:
+        root.attrs["crop_scan_angle_rect"] = list(crop.rect)
+
     n_glm_outside_bounds = 0
-    if crop is not None:
-        if crop.rect is None:
+    n_flashes = 0
+    if cfg.glm_product is not None:
+        if crop is not None and crop.rect is None:
             log(f"!! {day_label}: no ABI scan decoded, so GLM flashes are not cropped")
-        else:
+        elif crop is not None:
             n_glm_outside_bounds = await asyncio.to_thread(crop_glm_tables, glm_tables, crop)
-            root.attrs.update({"crop_scan_angle_rect": list(crop.rect), "glm_crop_margin_rad": GLM_CROP_MARGIN_RAD})
-    n_flashes = write_glm_tables(root, glm_files, glm_ok, glm_tables)
+            root.attrs["glm_crop_margin_rad"] = GLM_CROP_MARGIN_RAD
+        n_flashes = write_glm_tables(root, glm_files, glm_ok, glm_tables)
 
     complete = n_listing_errors == 0 and not errors
     root.attrs.update(

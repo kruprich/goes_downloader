@@ -5,9 +5,82 @@
   "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
   "bounds": null,
+  "download": [
+    "cmip_c08",
+    "cmip_c11",
+    "cmip_c13",
+    "cmip_c15",
+    "acha",
+    "tpw",
+    "dsi_cape",
+    "dsi_li",
+    "dsi_ki",
+    "dsi_si",
+    "dsi_tt",
+    "actp",
+    "glm"
+  ],
   "abi_products": [
     {
+      "key": "cmip_c01",
+      "description": "CMIP band 1: 0.47 um blue visible, 1 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C01",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c02",
+      "description": "CMIP band 2: 0.64 um red visible, 0.5 km, daytime only; ~19.5 GB/day to download",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C02",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c03",
+      "description": "CMIP band 3: 0.86 um vegetation near-IR, 1 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C03",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c04",
+      "description": "CMIP band 4: 1.37 um cirrus, 2 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C04",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c05",
+      "description": "CMIP band 5: 1.6 um snow/ice, 1 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C05",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c06",
+      "description": "CMIP band 6: 2.2 um cloud particle size, 2 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C06",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cmip_c07",
+      "description": "CMIP band 7: 3.9 um shortwave IR, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C07",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
       "key": "cmip_c08",
+      "description": "CMIP band 8: 6.2 um upper-level water vapor, 2 km",
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C08",
       "data_variable": "CMI",
@@ -15,7 +88,26 @@
       "precision": 0.25
     },
     {
+      "key": "cmip_c09",
+      "description": "CMIP band 9: 6.9 um mid-level water vapor, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C09",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
+      "key": "cmip_c10",
+      "description": "CMIP band 10: 7.3 um lower-level water vapor, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C10",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
       "key": "cmip_c11",
+      "description": "CMIP band 11: 8.4 um cloud-top phase IR, 2 km",
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C11",
       "data_variable": "CMI",
@@ -23,7 +115,17 @@
       "precision": 0.25
     },
     {
+      "key": "cmip_c12",
+      "description": "CMIP band 12: 9.6 um ozone, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C12",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
       "key": "cmip_c13",
+      "description": "CMIP band 13: 10.3 um clean IR window, 2 km",
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C13",
       "data_variable": "CMI",
@@ -31,7 +133,17 @@
       "precision": 0.25
     },
     {
+      "key": "cmip_c14",
+      "description": "CMIP band 14: 11.2 um IR window, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C14",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
       "key": "cmip_c15",
+      "description": "CMIP band 15: 12.3 um dirty IR window, 2 km",
       "gcs_product_prefix": "ABI-L2-CMIPC",
       "filename_must_contain": "ABI-L2-CMIPC-M6C15",
       "data_variable": "CMI",
@@ -39,29 +151,138 @@
       "precision": 0.25
     },
     {
+      "key": "cmip_c16",
+      "description": "CMIP band 16: 13.3 um CO2, 2 km",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C16",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF",
+      "precision": 0.25
+    },
+    {
       "key": "acha",
+      "description": "Cloud top height (m), 10 km",
       "gcs_product_prefix": "ABI-L2-ACHAC",
       "filename_must_contain": "ABI-L2-ACHAC-M6",
       "data_variable": "HT",
       "dqf_variable": "DQF"
     },
     {
+      "key": "acha_2km",
+      "description": "Cloud top height (m), 2 km",
+      "gcs_product_prefix": "ABI-L2-ACHA2KMC",
+      "filename_must_contain": "ABI-L2-ACHA2KMC-M6",
+      "data_variable": "HT",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "achp_2km",
+      "description": "Cloud top pressure (hPa), 2 km",
+      "gcs_product_prefix": "ABI-L2-ACHP2KMC",
+      "filename_must_contain": "ABI-L2-ACHP2KMC-M6",
+      "data_variable": "PRES",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "ctp",
+      "description": "Cloud top pressure (hPa), 10 km",
+      "gcs_product_prefix": "ABI-L2-CTPC",
+      "filename_must_contain": "ABI-L2-CTPC-M6",
+      "data_variable": "PRES",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "actp",
+      "description": "Cloud top phase categories (clear, liquid, supercooled, mixed, ice, unknown), 2 km; no precision: categorical",
+      "gcs_product_prefix": "ABI-L2-ACTPC",
+      "filename_must_contain": "ABI-L2-ACTPC-M6",
+      "data_variable": "Phase",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "acm",
+      "description": "Binary clear-sky/cloud mask, 2 km; no precision: categorical",
+      "gcs_product_prefix": "ABI-L2-ACMC",
+      "filename_must_contain": "ABI-L2-ACMC-M6",
+      "data_variable": "BCM",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cod",
+      "description": "Cloud optical depth, 2 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CODC",
+      "filename_must_contain": "ABI-L2-CODC-M6",
+      "data_variable": "COD",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "cps",
+      "description": "Cloud particle size (um), 2 km, daytime only",
+      "gcs_product_prefix": "ABI-L2-CPSC",
+      "filename_must_contain": "ABI-L2-CPSC-M6",
+      "data_variable": "CPS",
+      "dqf_variable": "DQF"
+    },
+    {
       "key": "tpw",
+      "description": "Total precipitable water (mm), 10 km, clear sky only",
       "gcs_product_prefix": "ABI-L2-TPWC",
       "filename_must_contain": "ABI-L2-TPWC-M6",
       "data_variable": "TPW",
       "dqf_variable": "DQF_Overall"
     },
     {
-      "key": "actp",
-      "gcs_product_prefix": "ABI-L2-ACTPC",
-      "filename_must_contain": "ABI-L2-ACTPC-M6",
-      "data_variable": "Phase",
+      "key": "dsi_cape",
+      "description": "Derived stability index: convective available potential energy (J/kg), 10 km, clear sky only; all dsi_* share one download",
+      "gcs_product_prefix": "ABI-L2-DSIC",
+      "filename_must_contain": "ABI-L2-DSIC-M6",
+      "data_variable": "CAPE",
+      "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "dsi_li",
+      "description": "Derived stability index: lifted index (K), 10 km, clear sky only; all dsi_* share one download",
+      "gcs_product_prefix": "ABI-L2-DSIC",
+      "filename_must_contain": "ABI-L2-DSIC-M6",
+      "data_variable": "LI",
+      "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "dsi_ki",
+      "description": "Derived stability index: K-index (K), 10 km, clear sky only; all dsi_* share one download",
+      "gcs_product_prefix": "ABI-L2-DSIC",
+      "filename_must_contain": "ABI-L2-DSIC-M6",
+      "data_variable": "KI",
+      "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "dsi_si",
+      "description": "Derived stability index: Showalter index (K), 10 km, clear sky only; all dsi_* share one download",
+      "gcs_product_prefix": "ABI-L2-DSIC",
+      "filename_must_contain": "ABI-L2-DSIC-M6",
+      "data_variable": "SI",
+      "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "dsi_tt",
+      "description": "Derived stability index: total totals index (K), 10 km, clear sky only; all dsi_* share one download",
+      "gcs_product_prefix": "ABI-L2-DSIC",
+      "filename_must_contain": "ABI-L2-DSIC-M6",
+      "data_variable": "TT",
+      "dqf_variable": "DQF_Overall"
+    },
+    {
+      "key": "lst",
+      "description": "Land surface temperature (K), 2 km, hourly, clear sky only",
+      "gcs_product_prefix": "ABI-L2-LSTC",
+      "filename_must_contain": "ABI-L2-LSTC-M6",
+      "data_variable": "LST",
       "dqf_variable": "DQF"
     }
   ],
   "glm_product": {
     "key": "glm",
+    "description": "GLM lightning flashes (time, lat/lon, area, energy, quality)",
     "gcs_product_prefix": "GLM-L2-LCFA",
     "filename_must_contain": "GLM-L2-LCFA"
   }

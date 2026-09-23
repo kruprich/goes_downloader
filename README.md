@@ -42,6 +42,23 @@ indices (CAPE, lifted index, K-index, Showalter index, total totals), share one 
 scan. Leave out `"glm"` to skip lightning. Changing the list does not touch days already marked
 complete; delete them or set `overwrite_existing` to rebuild them with the new products.
 
+## Reading the data
+
+Each day store opens directly with xarray, one product (or GLM table) at a time, and several days
+combine into one continuous time series:
+
+```python
+import glob, xarray as xr
+
+days = sorted(glob.glob("goes_raw/*/*.zarr"))
+c13 = xr.open_mfdataset(days, engine="zarr", group="abi/cmip_c13", combine="by_coords")
+flashes = xr.open_mfdataset(days, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
+```
+
+ABI values are the file's packed numbers, not physical units: the physical value is
+`value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
+which makes `value` a float array; pass `mask_and_scale=False` to get the stored integers.
+
 ## Config options for storage
 
 - `precision` (per ABI product, in the product's units): rounds stored values to save space.

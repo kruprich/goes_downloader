@@ -1,7 +1,7 @@
 {
   "gcs_bucket": "gcp-public-data-goes-19",
   "start_date_utc": "2025-10-16",
-  "end_date_utc": "2026-02-01",
+  "end_date_utc": "2026-09-01",
   "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
   "bounds": null,
@@ -12,6 +12,7 @@
     "cmip_c15",
     "acha",
     "tpw",
+    "acm",
     "dsi_cape",
     "dsi_li",
     "dsi_ki",

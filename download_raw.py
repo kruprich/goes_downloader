@@ -9,18 +9,24 @@ and quality filtering can all happen later in a feature-building step.
 
 Layout of <raw_output_root_dir>/YYYY/YYYYDDD.zarr
 
+Every array names its dimensions and each day's metadata is consolidated, so xarray can open the
+stores (see "Reading with xarray" below).
+
 ABI: one group per configured product, one slot per 5-min CONUS scan (288 per day).
 Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/TPW: 10 km, 300x500).
+  abi/<key>/time[slot]               datetime64 start of each 5-min slot (the xarray "time" coordinate)
   abi/<key>/value[slot, y, x]        uint16   packed values as in the file, rounded to the product's
                                               configured "precision" (physical units) if one is set
                                               physical = value * scale_factor[slot] + add_offset[slot]
-                                              value == attrs["fill_value"] means no data
+                                              value == attrs["fill_value"] means no data (for files without a
+                                              _FillValue the store uses 65535)
   abi/<key>/dqf[slot, y, x]          uint8    data quality flags as in the file (uint16 for products with
                                               16-bit flags; attrs["dqf_fill_value"] = fill)
   abi/<key>/scale_factor[slot]       float64
   abi/<key>/add_offset[slot]         float64
   abi/<key>/quantization_step[slot]  float64  physical step between stored values after rounding
-  abi/<key>/scan_start_ns[slot]      int64    scan start/end from the filename; NaT (int64 min) if no scan
+  abi/<key>/scan_start_ns[slot]      int64    scan start/end from the filename, ns since 1970; NaT (int64 min)
+                                              if no scan. xarray decodes these to datetime64
   abi/<key>/scan_end_ns[slot]        int64
   abi/<key>/present[slot]            uint8    1 if the scan was downloaded and decoded
   abi/<key>/x_scan_angle_rad[x]      float64
@@ -41,6 +47,12 @@ Optional "bounds" crop (lat/lon box in config):
 Root attrs:
   complete = true only if every listing request succeeded and every file was downloaded and
   decoded. Incomplete days are rebuilt from scratch on the next run.
+
+Reading with xarray (one product or GLM table across several days):
+  xr.open_mfdataset(day_paths, engine="zarr", group="abi/cmip_c13", combine="by_coords")
+  xr.open_mfdataset(day_paths, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
+  xarray turns value/dqf fill values into NaN (floats); pass mask_and_scale=False for the stored integers
+  and apply scale_factor/add_offset yourself.
 
 Config:
   python download_raw.py --config config.json
@@ -207,6 +219,8 @@ def load_config(config_path: str) -> RawConfig:
 SLOTS_PER_DAY = 288
 SLOT_SECONDS = 300
 NAT_NS = np.iinfo(np.int64).min  # int64 view of numpy NaT
+# CF attributes that make xarray decode int64 nanosecond arrays to datetime64 (int64 min -> NaT)
+TIME_ATTRS = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
 LIST_HOURS = range(24)
 MAX_ERRORS_LOGGED_PER_DAY = 5
 
@@ -585,6 +599,17 @@ def crop_glm_tables(tables: Dict[int, Dict[str, np.ndarray]], crop: DayCrop) -> 
 # =============================================================================
 
 COMPRESSOR = zarr.Blosc(cname="zstd", clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+
+
+def _write_array(group: Any, name: str, data: np.ndarray, dims: List[str], **attrs: Any) -> Any:
+    """
+    Writes a fully populated array with its dimension names for xarray. fill_value=None matters:
+    zarr's default fill of 0 would make xarray read every legitimate 0 as missing.
+    """
+    array = group.create_dataset(name, data=data, fill_value=None, overwrite=True, **attrs.pop("zarr", {}))
+    array.attrs.update({"_ARRAY_DIMENSIONS": dims, **attrs})
+    return array
+
 GLM_FLASH_COLUMNS = {
     "time_first_ns": np.int64,
     "time_last_ns": np.int64,
@@ -628,13 +653,15 @@ class AbiProductState:
                 self.xs = crop_slice(dec["x"], x0, x1, f"{self.spec.key} x")
             x, y = dec["x"][self.xs], dec["y"][self.ys]
             shape = (len(y), len(x))
+            # Unwritten slots read back as this value; files without a _FillValue get 65535
+            storage_fill = dec["fill_value"] if dec["fill_value"] is not None else int(np.iinfo(np.uint16).max)
             g = root.require_group(f"abi/{self.spec.key}")
             g.attrs.update(
                 {
                     "data_variable": self.spec.data_variable,
                     "dqf_variable": self.spec.dqf_variable,
                     "units": dec["units"],
-                    "fill_value": dec["fill_value"],
+                    "fill_value": storage_fill,
                     "dqf_fill_value": dec["dqf_fill_value"],
                     "precision_requested": self.spec.precision,
                     "goes_imager_projection": dec["projection"],
@@ -645,13 +672,14 @@ class AbiProductState:
                 }
             )
             common = dict(overwrite=True, compressor=COMPRESSOR, chunks=(1, shape[0], shape[1]))
-            fill = dec["fill_value"] if dec["fill_value"] is not None else 0
-            self.value_array = g.create_dataset("value", shape=(SLOTS_PER_DAY, *shape), dtype="u2", fill_value=fill, **common)
+            self.value_array = g.create_dataset("value", shape=(SLOTS_PER_DAY, *shape), dtype="u2", fill_value=storage_fill, **common)
             self.dqf_array = g.create_dataset(
                 "dqf", shape=(SLOTS_PER_DAY, *shape), dtype=dec["dqf"].dtype, fill_value=dec["dqf_fill_value"], **common
             )
-            g.create_dataset("x_scan_angle_rad", data=x, dtype="f8", overwrite=True)
-            g.create_dataset("y_scan_angle_rad", data=y, dtype="f8", overwrite=True)
+            for array in (self.value_array, self.dqf_array):
+                array.attrs.update({"_ARRAY_DIMENSIONS": ["time", "y", "x"], "coordinates": "x_scan_angle_rad y_scan_angle_rad"})
+            _write_array(g, "x_scan_angle_rad", x.astype(np.float64), ["x"], units="rad")
+            _write_array(g, "y_scan_angle_rad", y.astype(np.float64), ["y"], units="rad")
             self.full_shape, self.fill_value, self.x, self.y = full_shape, dec["fill_value"], dec["x"], dec["y"]
             return
 
@@ -672,17 +700,18 @@ class AbiProductState:
         self.scan_end_ns[slot] = to_ns(f.end)
         self.present[slot] = 1
 
-    def write_slot_arrays(self, root: Any) -> None:
+    def write_slot_arrays(self, root: Any, slot_start_ns: np.ndarray) -> None:
         g = root.require_group(f"abi/{self.spec.key}")
+        _write_array(g, "time", slot_start_ns, ["time"], **TIME_ATTRS)
+        _write_array(g, "scan_start_ns", self.scan_start_ns, ["time"], **TIME_ATTRS)
+        _write_array(g, "scan_end_ns", self.scan_end_ns, ["time"], **TIME_ATTRS)
         for name, arr in [
             ("scale_factor", self.scale_factor),
             ("add_offset", self.add_offset),
             ("quantization_step", self.quantization_step),
-            ("scan_start_ns", self.scan_start_ns),
-            ("scan_end_ns", self.scan_end_ns),
             ("present", self.present),
         ]:
-            g.create_dataset(name, data=arr, overwrite=True)
+            _write_array(g, name, arr, ["time"])
         g.attrs["n_present"] = int(self.present.sum())
         g.attrs["has_frames"] = self.full_shape is not None
 
@@ -697,10 +726,10 @@ def write_glm_tables(root: Any, files: List[RemoteFile], file_ok: np.ndarray, ta
     g = root.require_group("glm")
     n_flashes = np.array([len(tables[i]["lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
     fg = g.require_group("files")
-    fg.create_dataset("start_ns", data=np.array([to_ns(f.start) for f in files], dtype=np.int64), overwrite=True)
-    fg.create_dataset("end_ns", data=np.array([to_ns(f.end) for f in files], dtype=np.int64), overwrite=True)
-    fg.create_dataset("ok", data=file_ok.astype(np.uint8), overwrite=True)
-    fg.create_dataset("n_flashes", data=n_flashes, overwrite=True)
+    _write_array(fg, "start_ns", np.array([to_ns(f.start) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
+    _write_array(fg, "end_ns", np.array([to_ns(f.end) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
+    _write_array(fg, "ok", file_ok.astype(np.uint8), ["file"])
+    _write_array(fg, "n_flashes", n_flashes, ["file"])
 
     cols: Dict[str, List[np.ndarray]] = {k: [] for k in GLM_FLASH_COLUMNS}
     for i in sorted(tables):
@@ -713,7 +742,10 @@ def write_glm_tables(root: Any, files: List[RemoteFile], file_ok: np.ndarray, ta
     order = np.argsort(merged["time_first_ns"], kind="stable")
     for k, arr in merged.items():
         arr = arr[order]
-        flash_group.create_dataset(k, data=arr, chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR, overwrite=True)
+        _write_array(
+            flash_group, k, arr, ["flash"], **(TIME_ATTRS if k.startswith("time_") else {}),
+            zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR),
+        )
     return int(n_flashes.sum())
 
 
@@ -785,7 +817,6 @@ async def process_single_day(
     root = zarr.open_group(zarr.DirectoryStore(tmp_path), mode="w")
     root.attrs.update(
         {
-            "schema_version": "raw_v1",
             "day_utc": day.date().isoformat(),
             "year": day.year,
             "julian_day": day.timetuple().tm_yday,
@@ -848,8 +879,9 @@ async def process_single_day(
     )
 
     # --- per-slot metadata, GLM tables, completion
+    slot_start_ns = to_ns(day_start) + np.arange(SLOTS_PER_DAY, dtype=np.int64) * SLOT_SECONDS * 1_000_000_000
     for state in abi_states.values():
-        state.write_slot_arrays(root)
+        state.write_slot_arrays(root, slot_start_ns)
 
     if crop is not None and crop.rect is not None:
         root.attrs["crop_scan_angle_rect"] = list(crop.rect)
@@ -877,6 +909,9 @@ async def process_single_day(
             "completed_utc": datetime.now(timezone.utc).isoformat() if complete else None,
         }
     )
+
+    # One metadata file per day, so opening many days with xarray is fast
+    zarr.consolidate_metadata(root.store)
 
     shutil.rmtree(out_path, ignore_errors=True)
     shutil.move(tmp_path, out_path)

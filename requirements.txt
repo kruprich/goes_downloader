@@ -1,0 +1,5 @@
+aiohttp
+netCDF4
+numpy
+pyproj
+zarr>=2.18,<3

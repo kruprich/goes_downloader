@@ -1,0 +1,16 @@
+# Pipeline output
+goes_abi_glm/
+*.zarr
+*.zarr.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

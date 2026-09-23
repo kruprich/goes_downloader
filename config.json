@@ -1,0 +1,39 @@
+{
+  "gcs_bucket": "gcp-public-data-goes-19",
+  "start_date_utc": "2025-10-16",
+  "end_date_utc": "2026-02-01",
+  "number_of_5min_bins_per_bin": 2,
+  "coarsen_factor": 4,
+  "output_root_dir": "./goes_abi_glm",
+  "overwrite_existing": false,
+  "expected_abi_files_per_5min": 1,
+  "expected_glm_files_per_5min": 15,
+  "abi_products": [
+    {
+      "key": "cmip",
+      "gcs_product_prefix": "ABI-L2-CMIPC",
+      "filename_must_contain": "ABI-L2-CMIPC-M6C13",
+      "data_variable": "CMI",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "acha",
+      "gcs_product_prefix": "ABI-L2-ACHAC",
+      "filename_must_contain": "ABI-L2-ACHAC-M6",
+      "data_variable": "HT",
+      "dqf_variable": "DQF"
+    },
+    {
+      "key": "tpw",
+      "gcs_product_prefix": "ABI-L2-TPWC",
+      "filename_must_contain": "ABI-L2-TPWC-M6",
+      "data_variable": "TPW",
+      "dqf_variable": "DQF_Overall"
+    }
+  ],
+  "glm_product": {
+    "key": "glm",
+    "gcs_product_prefix": "GLM-L2-LCFA",
+    "filename_must_contain": "GLM-L2-LCFA"
+  }
+}

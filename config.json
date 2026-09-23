@@ -4,7 +4,12 @@
   "end_date_utc": "2026-09-01",
   "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
-  "bounds": null,
+  "bounds": {
+    "lat_min": 24.0,
+    "lat_max": 50.0,
+    "lon_min": -125.0,
+    "lon_max": -66.0
+  },
   "cmip_precision": 0.25,
   "download": [
     "cmip_c08",

@@ -33,16 +33,17 @@ Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/T
   abi/<key>/y_scan_angle_rad[y]      float64
 
 GLM (only if "glm" is in the config's "download" list): every flash from every 20 s file whose start falls in the day, all quality flags kept.
-  glm/files/{start_ns,end_ns,ok,n_flashes}[file]   n_flashes counts flashes kept after the bounds crop
+  glm/files/{start_ns,end_ns,ok,n_flashes}[file]
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
   Files with ok=0 are coverage gaps: no flashes there does NOT mean no lightning.
 
-Optional "bounds" crop (lat/lon box in config):
-  The box is turned into the smallest scan-angle rectangle that contains it, shared by all products.
-  Each ABI product keeps the pixels whose cell overlaps that rectangle (attrs crop_y0/crop_x0 give the
-  offset into the uncropped grid; x/y_scan_angle_rad are the cropped coordinates). GLM keeps flashes
-  inside the rectangle plus GLM_CROP_MARGIN_RAD. Days already complete are not re-cropped when the
-  bounds change; delete them or set overwrite_existing.
+Optional "bounds" crop (lat/lon box in config), ABI only:
+  The box is turned into the smallest scan-angle rectangle that contains it, shared by all ABI
+  products. Each ABI product keeps the pixels whose cell overlaps that rectangle (attrs crop_y0/crop_x0
+  give the offset into the uncropped grid; x/y_scan_angle_rad are the cropped coordinates). GLM is not
+  cropped: every flash is kept (~36 MB/day), and the feature step selects the ones its grid needs.
+  Days already complete are not re-cropped when the bounds change; delete them or set
+  overwrite_existing.
 
 Root attrs:
   complete = true only if every listing request succeeded and every file was downloaded and
@@ -529,12 +530,8 @@ def _jsonable(v: Any) -> Any:
 
 
 # =============================================================================
-# Lat/lon bounds crop
+# Lat/lon bounds crop (ABI only)
 # =============================================================================
-
-# ~36 km at nadir. GLM navigates flashes to a raised "lightning ellipsoid" while ABI navigates to the
-# surface, so the same storm can land a few km apart; the margin keeps flashes at the crop edges.
-GLM_CROP_MARGIN_RAD = 1e-3
 
 
 def latlon_to_scan_angle(lat: np.ndarray, lon: np.ndarray, projection: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
@@ -581,31 +578,12 @@ class DayCrop:
     """The configured bounds as one scan-angle rectangle, fixed by the first ABI scan decoded in the day."""
 
     bounds: LatLonBounds
-    projection: Optional[Dict[str, Any]] = None
     rect: Optional[Tuple[float, float, float, float]] = None
 
     def rect_for(self, projection: Dict[str, Any]) -> Tuple[float, float, float, float]:
         if self.rect is None:
             self.rect = scan_angle_rect(self.bounds, projection)
-            self.projection = projection
         return self.rect
-
-
-def crop_glm_tables(tables: Dict[int, Dict[str, np.ndarray]], crop: DayCrop) -> int:
-    """Drops flashes outside the crop rectangle (+ margin) in place; returns how many were dropped."""
-    if not tables or crop.rect is None or crop.projection is None:
-        return 0
-    keys = sorted(tables)
-    x, y = latlon_to_scan_angle(
-        np.concatenate([tables[i]["lat"] for i in keys]), np.concatenate([tables[i]["lon"] for i in keys]), crop.projection
-    )
-    x0, x1, y0, y1 = crop.rect
-    m = GLM_CROP_MARGIN_RAD
-    keep = (x >= x0 - m) & (x <= x1 + m) & (y >= y0 - m) & (y <= y1 + m)
-    splits = np.cumsum([len(tables[i]["lat"]) for i in keys])[:-1]
-    for i, k in zip(keys, np.split(keep, splits)):
-        tables[i] = {name: col[k] for name, col in tables[i].items()}
-    return int((~keep).sum())
 
 
 # =============================================================================
@@ -900,15 +878,7 @@ async def process_single_day(
     if crop is not None and crop.rect is not None:
         root.attrs["crop_scan_angle_rect"] = list(crop.rect)
 
-    n_glm_outside_bounds = 0
-    n_flashes = 0
-    if cfg.glm_product is not None:
-        if crop is not None and crop.rect is None:
-            log(f"!! {day_label}: no ABI scan decoded, so GLM flashes are not cropped")
-        elif crop is not None:
-            n_glm_outside_bounds = await asyncio.to_thread(crop_glm_tables, glm_tables, crop)
-            root.attrs["glm_crop_margin_rad"] = GLM_CROP_MARGIN_RAD
-        n_flashes = write_glm_tables(root, glm_files, glm_ok, glm_tables)
+    n_flashes = write_glm_tables(root, glm_files, glm_ok, glm_tables) if cfg.glm_product is not None else 0
 
     complete = n_listing_errors == 0 and not errors
     root.attrs.update(
@@ -918,7 +888,6 @@ async def process_single_day(
             "n_abi_slot_collisions": n_slot_collisions,
             "n_glm_files": len(glm_files),
             "n_glm_flashes": n_flashes,
-            "n_glm_flashes_outside_bounds": n_glm_outside_bounds,
             "complete": complete,
             "completed_utc": datetime.now(timezone.utc).isoformat() if complete else None,
         }

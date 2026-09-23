@@ -82,13 +82,12 @@ constant per product but should check.
 - The bucket stores files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
   file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
   the file with the newest creation time is used.
-- All products share one projection (the GOES-East fixed grid, centred on 75.0°W). The `bounds`
-  crop is computed from the first ABI scan decoded each day and applied to every product.
+- All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W). The
+  `bounds` crop is computed from the first ABI scan decoded each day and applied to every ABI
+  product.
 - GLM flash times are "seconds since" offsets in the file. A GLM file belongs to the day its start
   time falls in, so a flash in the first file of a day can begin a second or two before midnight;
   select flashes by their own times, not by which day store holds them.
-- GLM flash positions are on GLM's raised "lightning ellipsoid", which the files do not state. The
-  36 km margin on the GLM `bounds` crop covers the resulting offset from ABI positions.
 - In a complete day, `present` = 0 means NOAA did not publish that scan; a failed download would
   have left the day incomplete.
 
@@ -99,8 +98,12 @@ constant per product but should check.
   visible bands (1–6) are reflectance and always keep full precision.
 - `precision` (per ABI product, in the product's units): overrides `cmip_precision` for that
   product, or rounds any other product. Categorical products such as cloud top phase must not set it.
-- `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): crops ABI to the smallest scan-angle
-  rectangle containing the box and keeps GLM flashes inside it. `null` keeps the full CONUS sector.
+- `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): **applies to ABI only.** Crops every ABI
+  product to the smallest scan-angle rectangle containing the box; `null` keeps the full CONUS
+  sector. GLM is never cropped: every flash in GLM's field of view is kept (about 36 MB/day), and
+  the feature step selects the flashes its grid needs.
+  The config uses 24–50°N, 125–66°W, the contiguous-US bounding box NOAA NCEI publishes for its
+  nClimGrid-Daily dataset.
 
 Measured on one hour of data with the current products: about 3.3 GB/day for full CONUS.
-A lower-48 box (24–50°N, 125–66°W) keeps about 65% of the ABI pixels.
+That box keeps about 65% of the ABI pixels.

@@ -1,4 +1,5 @@
 aiohttp
+h5py
 netCDF4
 numpy
 pyproj

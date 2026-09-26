@@ -8,9 +8,9 @@ here; that belongs in a separate feature-building step.
 For each UTC day it:
 
 1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
-2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15
-   and the cloud mask at 2 km; ACHA cloud height, TPW and the DSI stability indices at
-   10 km) as the file's packed integers plus its DQF flags.
+2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15 at
+   2 km; ACHA cloud height, TPW and the DSI stability indices at 10 km) as the file's packed
+   integers plus its DQF flags.
 3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) plus a coverage flag for
    every 20-second window, so outages (including files NOAA never published) show up as gaps
    rather than as "no lightning".

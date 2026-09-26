@@ -283,5 +283,43 @@
     "description": "GLM lightning flashes (time, lat/lon, area, energy, quality)",
     "gcs_product_prefix": "GLM-L2-LCFA",
     "filename_must_contain": "GLM-L2-LCFA"
+  },
+  "features": {
+    "output_root_dir": "./goes_features",
+    "start_date_utc": null,
+    "end_date_utc": null,
+    "overwrite_existing": false,
+    "max_workers": 4,
+    "grid": {
+      "resolution_km": 4
+    },
+    "time_step_minutes": 15,
+    "dtype": "float16",
+    "chunk_yx": [256, 256],
+    "glm": {
+      "quality_flags": null,
+      "lightning_ellipsoid_km": {"equatorial": 14.0, "polar": 6.0},
+      "min_coverage": 0.95
+    },
+    "channels": [
+      {"name": "c08", "product": "cmip_c08", "description": "6.2 um upper-level water vapour (K)"},
+      {"name": "c11", "product": "cmip_c11", "description": "8.4 um (K), cloud-top phase"},
+      {"name": "c13", "product": "cmip_c13", "description": "10.3 um clean IR window (K)"},
+      {"name": "c13_min", "product": "cmip_c13", "aggregation": "min", "description": "coldest 2 km pixel in the cell (K): overshooting tops"},
+      {"name": "c15", "product": "cmip_c15", "description": "12.3 um dirty IR window (K)"},
+      {"name": "wv_minus_ir", "expr": "c08 - c13", "description": "6.2 minus 10.3 um (K): near or above 0 over tops reaching the tropopause"},
+      {"name": "c13_change_15min", "expr": "c13 - lag(c13, 15)", "description": "10.3 um change over 15 min (K): negative where cloud tops cool as updrafts grow"},
+      {"name": "cloud_top_height", "product": "acha", "valid_dqf": [0, 1], "description": "m; NaN under clear sky"},
+      {"name": "tpw", "product": "tpw", "fill_gaps_minutes": 60, "description": "total precipitable water (mm); clear sky only, so each cell keeps its last value for up to 60 min"},
+      {"name": "cape", "product": "dsi_cape", "fill_gaps_minutes": 60, "description": "J/kg; clear sky only, last value kept up to 60 min"},
+      {"name": "lifted_index", "product": "dsi_li", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
+      {"name": "k_index", "product": "dsi_ki", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
+      {"name": "flashes", "glm": "count", "output": false, "description": "flashes starting in each 5-min slot (helper)"},
+      {"name": "flashes_past_15min", "expr": "sum_past(flashes, 15)", "description": "flashes in the 15 min before the issue time"}
+    ],
+    "labels": [
+      {"name": "lightning_next_30min", "start_minutes": 0, "end_minutes": 30, "radius_cells": 2, "description": "a flash within 2 cells in the 30 min after the issue time"},
+      {"name": "lightning_next_60min", "start_minutes": 0, "end_minutes": 60, "radius_cells": 2, "description": "a flash within 2 cells in the 60 min after the issue time"}
+    ]
   }
 }

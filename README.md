@@ -3,7 +3,8 @@
 Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from the public GCS bucket
 `gcp-public-data-goes-19` into one raw Zarr store per UTC day, for building a
 lightning-prediction training dataset. No time binning or spatial aggregation happens
-here; that belongs in a separate feature-building step.
+here; that is the job of `build_features.py`, which turns the raw stores into CNN inputs and
+lightning labels on one grid (see [Building features](#building-features)).
 
 For each UTC day it:
 
@@ -141,3 +142,164 @@ That box keeps about 65% of the ABI pixels.
 Download speed is usually limited by the internet connection, not by these settings. On a
 connection that delivers about 60 MB/s, 64 connections with 8 decode processes was no faster than
 the defaults, 128 connections was slower, and decoding used only about 1.3 CPU cores.
+
+## Building features
+
+`build_features.py` reads the raw day stores and writes one feature store per UTC day to
+`goes_features/YYYY/YYYYDDD.zarr`: the configured channels and lightning labels on one grid, every
+`time_step_minutes`. It is configured by the `features` section of `config.json` and reuses the raw
+settings (`raw_output_root_dir`, dates, products). The full layout is in the docstring at the top of
+`build_features.py`.
+
+```bash
+python build_features.py --config config.json                   # every day in the range
+python build_features.py --config config.json --start 2025-10-16 --end 2026-05-31 --stats
+```
+
+`--start`, `--end`, `--workers` and `--overwrite` override the config for one run. `--stats` builds
+nothing: it combines the per-day sums of the days in the range into
+`goes_features/stats_<start>_<end>.json` (mean, std, min, max and valid fraction per channel, positive
+fraction per label). Run it over the training days only, so normalisation doesn't see the test period.
+
+A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
+before for lags and gap filling, the day after for labels. Neighbours outside the download date range
+never arrive, so they don't hold a day back; their slots are just missing. Incomplete days are rebuilt
+on the next run. As with the downloader, changing the `features` config doesn't touch days already
+complete: pass `--overwrite` (or delete `goes_features/`) to rebuild them.
+
+### Grid and time
+
+- `grid.resolution_km` (4): cell size at the sub-satellite point, a multiple of the finest product's
+  (2 km for the CMIP bands, 10 km if only 10 km products are used). Cells are blocks of ABI fixed-grid
+  pixels, so a 4 km cell is 2x2 CMIP pixels and a 10 km cell is exactly one DSI pixel. Over CONUS, cells
+  are larger than nominal because the satellite sees the US at an angle: a 4 km cell is about 4.4 km
+  east-west by 5.8 km north-south in the middle, up to 7–9 km at the northern edge.
+- `grid.bounds`: lat/lon box of the grid. Left out, it is the download `bounds`; `null` keeps
+  everything the raw stores hold.
+- `grid.reference_product`: the product whose grid the cells are built from; default the finest one used.
+- `time_step_minutes` (15): how often a sample is written (a multiple of 5 that divides a day). Channels
+  are always computed on the 5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5 minutes
+  whatever the step.
+
+Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends there,
+and every label window starts there.
+
+### Channels
+
+Each entry of `features.channels` has a `name` (usable in expressions), an optional `description`, and
+`"output": false` for helper channels that other channels read but that aren't stored. It takes its
+values from exactly one of:
+
+- **`product`**: an ABI product from the `download` list, converted to physical units.
+  - `aggregation` (`mean`): how source pixels become a cell when the product is at least as fine as
+    the grid: `mean`, `min`, `max`, `std`, or `fraction` of pixels whose value is in `values` (for
+    categorical products, e.g. `"product": "actp", "aggregation": "fraction", "values": [4]` for the ice
+    fraction). A product coarser than the grid (10 km DSI on a 4 km grid) takes the pixel containing the
+    cell centre instead.
+  - `valid_dqf` (`[0]`): quality flag values kept; other pixels count as missing. `null` ignores the DQF.
+  - `min_valid_fraction` (0.5): a cell is missing unless this fraction of its pixels is valid.
+  - `fill_gaps_minutes` (0): each cell keeps its last valid value for up to this long. Useful for
+    clear-sky-only products (TPW, DSI), which disappear under the clouds that matter most.
+- **`glm`**: GLM flashes starting in each 5-minute slot, per cell: `count`, `energy_fj` (total optical
+  energy, femtojoules) or `area_km2` (total flash area). Missing when GLM covered less than
+  `glm.min_coverage` of the slot.
+- **`expr`**: an expression over other channels with `+ - * / **`, numbers and these functions:
+  `lag(x, minutes)` (the value `minutes` earlier), `sum_past`, `mean_past`, `min_past`, `max_past(x, minutes)`
+  (over the slots of the last `minutes`, the current one included), `abs`, `sqrt`, `log1p`, `exp`,
+  `minimum(a, b)`, `maximum(a, b)` and `clip(x, low, high)`. Any missing input makes the result missing.
+
+The default channels are the four IR bands, the coldest pixel of band 13 in each cell, the 6.2 − 10.3 µm
+difference, the 15-minute change of band 13, cloud-top height, TPW, CAPE, lifted index, K-index (gap-filled
+up to 60 minutes) and the flashes of the last 15 minutes.
+
+Other options: `dtype` (`float16`, or `float32`; float16 keeps about 3 significant digits and overflows
+above 65504, so sums such as `energy_fj` should go through `log1p` or use `float32`; values that overflow
+are stored as NaN and counted in the store's `float16_overflow` attribute), `chunk_yx` (`[256, 256]`,
+spatial chunk size: smaller suits random patches, larger suits whole frames), `max_workers` (4, days
+built in parallel, up to about 1.3 GB of memory each).
+
+### Labels
+
+Each entry of `features.labels` is 1 where at least `min_flashes` (1) flashes started within
+`radius_cells` (0) cells between `start_minutes` (0) and `end_minutes` after the issue time. The radius is
+in cells, so it scales with `resolution_km`; the configured labels use 2 cells, about 10 km on the 4 km
+grid, roughly GLM's location accuracy plus its pixel size. A label is 255 (unknown) where GLM covered less
+than `glm.min_coverage` (0.95) of the window, so outages never become "no lightning". Lightning is rare:
+in the October test hours 0.5% of known cells were positive for 30 minutes, so weight the loss accordingly.
+
+`flash_count` holds the flashes of each `time_step_minutes` window ending at the issue time, so other
+labels (longer windows, other thresholds) can be derived later without rebuilding.
+
+`glm.quality_flags` (`null` = all) filters flashes by quality flag. About 8% of flashes are flagged 3
+(more events than a threshold): they are large flashes, not false detections, so they are kept by
+default. `glm.lightning_ellipsoid_km` (14/6) places flashes where ABI sees their cloud tops: GLM
+geolocates each flash on this ellipsoid (the Earth raised 14 km at the equator, 6 km at the poles; NOAA's
+operational value since 2018), so reading the lat/lon back on it recovers the direction GLM saw, the same
+direction ABI, on the same satellite, views the cloud top from. `null` reads them on the ground ellipsoid
+instead, which moves flashes about 2 km (up to 4 km) over CONUS; the shift is small because the lightning
+ellipsoid is flatter, which moves a given latitude south and cancels most of the height's parallax.
+
+### Reading features for training
+
+`xarray.open_mfdataset` combines days into one time axis (see [Reading the data](#reading-the-data)).
+Features are float16 on disk: convert to float32 before any arithmetic, since float16 sums overflow.
+A PyTorch dataset that stacks the channels at `t`, `t - 15` and `t - 30` minutes and returns one label as
+the target:
+
+```python
+import glob, json
+import numpy as np
+import torch
+import xarray as xr
+
+stats = json.load(open("goes_features/stats_2025-10-16_2026-05-31.json"))["channels"]
+
+
+class LightningDataset(torch.utils.data.Dataset):
+    """Channels at t, t-15 and t-30 min stacked as the input, one label at t as the target, random patches."""
+
+    def __init__(self, days, label="lightning_next_60min", history=(0, 1, 2), patch=256, min_valid=0.9):
+        ds = xr.open_mfdataset(days, engine="zarr", combine="by_coords", mask_and_scale=False)
+        self.x, self.y, self.patch = ds.features, ds.labels.sel(label=label), patch
+        names = list(ds.channel.values)
+        self.mean = np.array([stats[c]["mean"] for c in names], np.float32)[:, None, None]
+        self.std = np.array([stats[c]["std"] for c in names], np.float32)[:, None, None]
+        # Samples whose history steps all exist (a missing day leaves a gap in time) and have their ABI scan;
+        # c13 is NaN only where the scan is missing, unlike cloud height or the clear-sky products
+        step = np.timedelta64(int(ds.attrs["time_step_minutes"]), "m")
+        times = ds.time.values
+        index = {t: i for i, t in enumerate(times)}
+        ok = ds.channel_valid_fraction.sel(channel="c13").values >= min_valid
+        self.samples = [
+            [index[t - h * step] for h in history]
+            for t in times
+            if all(t - h * step in index and ok[index[t - h * step]] for h in history)
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        steps = self.samples[i]
+        y0 = np.random.randint(0, self.x.sizes["y"] - self.patch + 1)
+        x0 = np.random.randint(0, self.x.sizes["x"] - self.patch + 1)
+        win = dict(y=slice(y0, y0 + self.patch), x=slice(x0, x0 + self.patch))
+        # float16 on disk: convert before any arithmetic
+        frames = [(self.x.isel(time=t, **win).values.astype(np.float32) - self.mean) / self.std for t in steps]
+        x = np.nan_to_num(np.concatenate(frames), nan=0.0)  # missing -> the channel mean
+        y = self.y.isel(time=steps[0], **win).values  # uint8: 1 lightning, 0 none, 255 unknown (mask in the loss)
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
+train = LightningDataset(sorted(glob.glob("goes_features/2025/*.zarr")))
+```
+
+Reading patch by patch through xarray is simple but slow; for long training runs, load whole days
+into memory or read the Zarr arrays directly (`zarr.open_consolidated(day)["features"][t, :, y0:y1, x0:x1]`).
+
+### Size and speed
+
+With the default channels (13 channels, 4 km, every 15 minutes, float16) a day takes about 0.5 GB,
+about 160 GB for the configured date range. Size grows with channels, samples per day and cells:
+5-minute steps triple it, 8 km cells divide it by four. A day builds in about 35 seconds per worker, so
+4 workers get through the range in about an hour. Both numbers are extrapolated from 5 hours of one day.

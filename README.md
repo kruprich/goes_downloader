@@ -11,10 +11,12 @@ For each UTC day it:
 2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15
    and cloud top phase at 2 km; ACHA cloud height, TPW and the DSI stability indices at
    10 km) as the file's packed integers plus its DQF flags.
-3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and which
-   20 s files were read, so missing files show up as coverage gaps.
-4. Writes `goes_raw/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and
-   file succeeded. Incomplete days are rebuilt on the next run.
+3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) plus a coverage flag for
+   every 20-second window, so outages (including files NOAA never published) show up as gaps
+   rather than as "no lightning".
+4. Writes `goes_raw/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and file
+   succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
+   Incomplete days are rebuilt on the next run.
 
 The full layout is described in the docstring at the top of `download_raw.py`.
 
@@ -53,7 +55,12 @@ import glob, xarray as xr
 days = sorted(glob.glob("goes_raw/*/*.zarr"))
 c13 = xr.open_mfdataset(days, engine="zarr", group="abi/cmip_c13", combine="by_coords")
 flashes = xr.open_mfdataset(days, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
+coverage = xr.open_mfdataset(days, engine="zarr", group="glm/coverage", combine="by_coords")
 ```
+
+`coverage.covered` has one entry per 20-second window: 0 means there is no GLM data for that
+window, so no flashes there does not mean no lightning. NOAA misses a few GLM files on most days,
+and on 2026-07-15 published no GLM data from 20:22:40 UTC to midnight.
 
 ABI values are the file's packed numbers, not physical units: the physical value is
 `value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
@@ -82,14 +89,17 @@ constant per product but should check.
 - The bucket stores files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
   file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
   the file with the newest creation time is used.
-- All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W). The
-  `bounds` crop is computed from the first ABI scan decoded each day and applied to every ABI
-  product.
+- All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W) since
+  GOES-19 moved to the GOES-East position in 2025. Earlier files (e.g. January 2025) use its
+  89.5°W test position, so don't mix those dates with later ones. The `bounds` crop is computed
+  from the first ABI scan decoded each day and applied to every ABI product.
 - GLM flash times are "seconds since" offsets in the file. A GLM file belongs to the day its start
   time falls in, so a flash in the first file of a day can begin a second or two before midnight;
   select flashes by their own times, not by which day store holds them.
-- In a complete day, `present` = 0 means NOAA did not publish that scan; a failed download would
-  have left the day incomplete.
+- NOAA publishes a day's files within 24 hours of the day ending; later files are missed once
+  the day is marked complete.
+- In a complete day, ABI `present` = 0 and GLM `covered` = 0 mean NOAA did not publish that scan
+  or file; a failed download would have left the day incomplete.
 
 ## Config options for storage
 

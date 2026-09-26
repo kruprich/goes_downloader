@@ -32,10 +32,14 @@ Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/T
   abi/<key>/x_scan_angle_rad[x]      float64
   abi/<key>/y_scan_angle_rad[y]      float64
 
-GLM (only if "glm" is in the config's "download" list): every flash from every 20 s file whose start falls in the day, all quality flags kept.
-  glm/files/{start_ns,end_ns,ok,n_flashes}[file]
+GLM (only if "glm" is in the config's "download" list): every flash from every 20 s file whose start
+falls in the day, all quality flags kept.
+  glm/files/{start_ns,end_ns,ok,n_flashes}[file]    one row per file NOAA published for the day
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
-  Files with ok=0 are coverage gaps: no flashes there does NOT mean no lightning.
+  glm/coverage/time[window]            datetime64 start of each 20 s window (4320 per day)
+  glm/coverage/covered[window]         uint8  1 if a GLM file for the window was published and decoded
+  Windows with covered=0 are gaps (NOAA published no file, or it failed): no flashes there does NOT
+  mean no lightning.
 
 Optional "bounds" crop (lat/lon box in config), ABI only:
   The box is turned into the smallest scan-angle rectangle that contains it, shared by all ABI
@@ -46,8 +50,9 @@ Optional "bounds" crop (lat/lon box in config), ABI only:
   overwrite_existing.
 
 Root attrs:
-  complete = true only if every listing request succeeded and every file was downloaded and
-  decoded. Incomplete days are rebuilt from scratch on the next run.
+  complete = true only if every listing request succeeded, every file was downloaded and decoded,
+  and the day ended at least 24 h ago (NOAA publishes some files late). Incomplete days are rebuilt
+  from scratch on the next run.
 
 Reading with xarray (one product or GLM table across several days):
   xr.open_mfdataset(day_paths, engine="zarr", group="abi/cmip_c13", combine="by_coords")
@@ -72,6 +77,7 @@ import random
 import re
 import shutil
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -233,6 +239,10 @@ def load_config(config_path: str) -> RawConfig:
 
 SLOTS_PER_DAY = 288
 SLOT_SECONDS = 300
+GLM_WINDOW_SECONDS = 20
+GLM_WINDOWS_PER_DAY = 86400 // GLM_WINDOW_SECONDS
+# A day is only marked complete once it ended this long ago; NOAA publishes some files late
+MIN_AGE_FOR_COMPLETE = timedelta(hours=24)
 NAT_NS = np.iinfo(np.int64).min  # int64 view of numpy NaT
 # CF attributes that make xarray decode int64 nanosecond arrays to datetime64 (int64 min -> NaT)
 TIME_ATTRS = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
@@ -529,6 +539,39 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
+class DecodePool:
+    """
+    Process pool for decoding. A worker process that dies (out of memory, a crash on a corrupt file)
+    breaks the whole ProcessPoolExecutor, so the first task to notice replaces it. The files that were
+    decoding at that moment fail, which leaves their days incomplete for the next run to redo.
+    """
+
+    def __init__(self, workers: int):
+        self.workers = workers
+        self.pool = ProcessPoolExecutor(max_workers=workers)
+
+    async def run(self, fn: Any, *args: Any) -> Any:
+        pool = self.pool
+        try:
+            return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+        except BrokenProcessPool:
+            if self.pool is pool:
+                log("!! a decode process died; starting a new process pool")
+                self.pool = ProcessPoolExecutor(max_workers=self.workers)
+                # Before Python 3.12 the broken pool's feeder thread can block forever writing a queued
+                # file to the dead workers, which then hangs the program at exit (CPython gh-94777).
+                # Closing the read end of that pipe unblocks it, as newer Pythons do themselves.
+                try:
+                    pool._call_queue._reader.close()
+                except Exception:
+                    pass
+                pool.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    def shutdown(self) -> None:
+        self.pool.shutdown()
+
+
 # =============================================================================
 # Lat/lon bounds crop (ABI only)
 # =============================================================================
@@ -714,8 +757,22 @@ def write_abi_frame(state: AbiProductState, slot: int, dec: Dict[str, Any]) -> N
     state.dqf_array[slot] = dec["dqf"][state.ys, state.xs]
 
 
-def write_glm_tables(root: Any, files: List[RemoteFile], file_ok: np.ndarray, tables: Dict[int, Dict[str, np.ndarray]]) -> int:
+def write_glm_tables(
+    root: Any, day_start: datetime, files: List[RemoteFile], file_ok: np.ndarray, tables: Dict[int, Dict[str, np.ndarray]]
+) -> Tuple[int, int]:
+    """Writes the file, flash and coverage tables; returns (n_flashes, n_windows_covered)."""
     g = root.require_group("glm")
+
+    # Coverage per 20 s window, so outages where NOAA published no file show up as gaps too
+    covered = np.zeros(GLM_WINDOWS_PER_DAY, dtype=np.uint8)
+    for f, ok in zip(files, file_ok):
+        if ok:
+            covered[int((f.start - day_start).total_seconds() // GLM_WINDOW_SECONDS)] = 1
+    cg = g.require_group("coverage")
+    window_start_ns = to_ns(day_start) + np.arange(GLM_WINDOWS_PER_DAY, dtype=np.int64) * GLM_WINDOW_SECONDS * 1_000_000_000
+    _write_array(cg, "time", window_start_ns, ["time"], **TIME_ATTRS)
+    _write_array(cg, "covered", covered, ["time"])
+
     n_flashes = np.array([len(tables[i]["lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
     fg = g.require_group("files")
     _write_array(fg, "start_ns", np.array([to_ns(f.start) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
@@ -738,7 +795,7 @@ def write_glm_tables(root: Any, files: List[RemoteFile], file_ok: np.ndarray, ta
             flash_group, k, arr, ["flash"], **(TIME_ATTRS if k.startswith("time_") else {}),
             zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR),
         )
-    return int(n_flashes.sum())
+    return int(n_flashes.sum()), int(covered.sum())
 
 
 # =============================================================================
@@ -749,7 +806,7 @@ async def process_single_day(
     cfg: RawConfig,
     day: datetime,
     session: aiohttp.ClientSession,
-    decode_pool: ProcessPoolExecutor,
+    decode_pool: DecodePool,
 ) -> bool:
     day_label = f"{day.date().isoformat()} ({day.year}{day.timetuple().tm_yday:03d})"
     out_path = output_zarr_path_for_day(cfg.raw_output_root_dir, day)
@@ -826,7 +883,6 @@ async def process_single_day(
     )
 
     # --- download + decode + write, bounded by max_inflight_payloads
-    loop = asyncio.get_running_loop()
     inflight = asyncio.Semaphore(max(1, cfg.max_inflight_payloads))
     glm_ok = np.zeros(len(glm_files), dtype=bool)
     glm_tables: Dict[int, Dict[str, np.ndarray]] = {}
@@ -845,7 +901,7 @@ async def process_single_day(
             try:
                 payload = await download(f.blob)
                 variables = [(st.spec.data_variable, st.spec.dqf_variable, st.spec.precision) for st in states]
-                decoded = await loop.run_in_executor(decode_pool, decode_abi_file, payload, variables)
+                decoded = await decode_pool.run(decode_abi_file, payload, variables)
                 del payload
                 # Validate every product before writing any, so a bad file leaves no half-written slot
                 for state, dec in zip(states, decoded):
@@ -860,7 +916,7 @@ async def process_single_day(
         async with inflight:
             try:
                 payload = await download(f.blob)
-                glm_tables[i] = await loop.run_in_executor(decode_pool, decode_glm_file, payload)
+                glm_tables[i] = await decode_pool.run(decode_glm_file, payload)
                 glm_ok[i] = True
             except Exception as e:
                 record_error(f.blob, e)
@@ -878,9 +934,12 @@ async def process_single_day(
     if crop is not None and crop.rect is not None:
         root.attrs["crop_scan_angle_rect"] = list(crop.rect)
 
-    n_flashes = write_glm_tables(root, glm_files, glm_ok, glm_tables) if cfg.glm_product is not None else 0
+    n_flashes, n_windows_covered = 0, 0
+    if cfg.glm_product is not None:
+        n_flashes, n_windows_covered = write_glm_tables(root, day_start, glm_files, glm_ok, glm_tables)
 
-    complete = n_listing_errors == 0 and not errors
+    too_recent = datetime.now(timezone.utc) < day_end + MIN_AGE_FOR_COMPLETE
+    complete = n_listing_errors == 0 and not errors and not too_recent
     root.attrs.update(
         {
             "n_listing_errors": n_listing_errors,
@@ -888,6 +947,8 @@ async def process_single_day(
             "n_abi_slot_collisions": n_slot_collisions,
             "n_glm_files": len(glm_files),
             "n_glm_flashes": n_flashes,
+            "n_glm_windows_missing": GLM_WINDOWS_PER_DAY - n_windows_covered if cfg.glm_product is not None else None,
+            "too_recent": too_recent,
             "complete": complete,
             "completed_utc": datetime.now(timezone.utc).isoformat() if complete else None,
         }
@@ -899,8 +960,14 @@ async def process_single_day(
     shutil.rmtree(out_path, ignore_errors=True)
     shutil.move(tmp_path, out_path)
 
-    status = "OK" if complete else f"INCOMPLETE (listing errors={n_listing_errors}, file errors={len(errors)}; rerun to retry)"
-    log(f"-> {day_label} {status}: {out_path}  flashes={n_flashes}")
+    if complete:
+        status = "OK"
+    elif too_recent and n_listing_errors == 0 and not errors:
+        status = "INCOMPLETE (ended less than 24 h ago; NOAA may still publish files, rerun later)"
+    else:
+        status = f"INCOMPLETE (listing errors={n_listing_errors}, file errors={len(errors)}; rerun to retry)"
+    gaps = f"  GLM windows missing={GLM_WINDOWS_PER_DAY - n_windows_covered}" if cfg.glm_product is not None else ""
+    log(f"-> {day_label} {status}: {out_path}  flashes={n_flashes}{gaps}")
     return complete
 
 
@@ -924,8 +991,8 @@ async def run_all_days(cfg: RawConfig) -> None:
     failed: List[str] = []
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        with ProcessPoolExecutor(max_workers=cfg.max_decode_processes) as pool:
-
+        pool = DecodePool(cfg.max_decode_processes)
+        try:
             async def worker() -> None:
                 while True:
                     try:
@@ -941,6 +1008,8 @@ async def run_all_days(cfg: RawConfig) -> None:
                     (ok if good else failed).append(label)
 
             await asyncio.gather(*(worker() for _ in range(max(1, cfg.max_days_in_flight))))
+        finally:
+            pool.shutdown()
 
     print("\n" + "=" * 72)
     print(f"Days attempted:  {len(days)}")

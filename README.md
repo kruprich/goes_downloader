@@ -9,7 +9,7 @@ For each UTC day it:
 
 1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
 2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15
-   and cloud top phase at 2 km; ACHA cloud height, TPW and the DSI stability indices at
+   and the cloud mask at 2 km; ACHA cloud height, TPW and the DSI stability indices at
    10 km) as the file's packed integers plus its DQF flags.
 3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) plus a coverage flag for
    every 20-second window, so outages (including files NOAA never published) show up as gaps
@@ -28,6 +28,11 @@ python download_raw.py --config config.json
 ```
 
 Days already marked `complete` are skipped unless `overwrite_existing` is `true`.
+
+While it runs, the last line shows a progress bar, days done, data downloaded, data saved to
+disk (added as each day finishes), download speed (last 30 s) and an ETA. The ETA uses each
+day's exact size once the day is listed and the average listed day for days not reached yet.
+When output is redirected to a file, a progress line is printed once a minute instead.
 
 ## Choosing products
 
@@ -60,7 +65,9 @@ coverage = xr.open_mfdataset(days, engine="zarr", group="glm/coverage", combine=
 
 `coverage.covered` has one entry per 20-second window: 0 means there is no GLM data for that
 window, so no flashes there does not mean no lightning. NOAA misses a few GLM files on most days,
-and on 2026-07-15 published no GLM data from 20:22:40 UTC to midnight.
+and on 2026-07-15 published no GLM data from 20:22:40 UTC to midnight. A flash's `file_index` is
+its row in the same day's `glm/files`, so it no longer identifies a file once several days are
+combined; use the flash times instead.
 
 ABI values are the file's packed numbers, not physical units: the physical value is
 `value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,

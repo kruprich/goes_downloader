@@ -13,7 +13,7 @@ Every array names its dimensions and each day's metadata is consolidated, so xar
 stores (see "Reading with xarray" below).
 
 ABI: one group per configured product, one slot per 5-min CONUS scan (288 per day).
-Each product keeps its native grid (CMIP bands and ACTP: 2 km, 1500x2500; ACHA/TPW: 10 km, 300x500).
+Each product keeps its native grid (CMIP bands, ACM, ACTP: 2 km, 1500x2500; ACHA, TPW, DSI: 10 km, 300x500).
   abi/<key>/time[slot]               datetime64 start of each 5-min slot (the xarray "time" coordinate)
   abi/<key>/value[slot, y, x]        uint16   packed values as in the file, rounded to the product's
                                               configured "precision" (physical units) if one is set
@@ -36,6 +36,8 @@ GLM (only if "glm" is in the config's "download" list): every flash from every 2
 falls in the day, all quality flags kept.
   glm/files/{start_ns,end_ns,ok,n_flashes}[file]    one row per file NOAA published for the day
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
+                                       file_index is the row in the same day's glm/files; it is not
+                                       unique once several days are combined
   glm/coverage/time[window]            datetime64 start of each 20 s window (4320 per day)
   glm/coverage/covered[window]         uint8  1 if a GLM file for the window was published and decoded
   Windows with covered=0 are gaps (NOAA published no file, or it failed): no flashes there does NOT
@@ -76,6 +78,9 @@ import os
 import random
 import re
 import shutil
+import sys
+import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
@@ -257,7 +262,127 @@ RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
+    if _PROGRESS is not None:
+        _PROGRESS.clear()
     print(f"[{ts}] {msg}", flush=True)
+    if _PROGRESS is not None:
+        _PROGRESS.restore()
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+class Progress:
+    """
+    One-line progress bar with download speed and ETA. In a terminal it is redrawn in place and log
+    lines print above it; when output goes to a file it prints a plain progress line once a minute.
+    Each day's download size is known exactly once it is listed; days not listed yet are estimated
+    from the average listed day.
+    """
+
+    WIDTH = 30
+    SPEED_WINDOW_SECONDS = 30.0
+    PLAIN_EVERY_SECONDS = 60.0
+
+    def __init__(self, total_days: int):
+        self.total_days = total_days
+        self.days_done = 0
+        self.day_total: Dict[str, int] = {}  # bytes to download, per day in progress
+        self.day_done: Dict[str, int] = {}
+        self.listed_day_bytes: List[int] = []
+        self.bytes_done = 0
+        self.bytes_saved = 0  # on-disk size of the day stores written this run, added as each day finishes
+        self.started = time.monotonic()
+        self.samples: deque = deque([(self.started, 0)])
+        self.tty = sys.stdout.isatty()
+        self.text = ""
+        self.shown = False
+        self.last_plain = self.started
+
+    def start_day(self, day: str, total_bytes: int) -> None:
+        self.day_total[day] = total_bytes
+        self.day_done[day] = 0
+        self.listed_day_bytes.append(total_bytes)
+
+    def add_bytes(self, day: str, n: int) -> None:
+        if day in self.day_done:
+            self.day_done[day] += n
+        self.bytes_done += n
+
+    def add_saved(self, n: int) -> None:
+        self.bytes_saved += n
+
+    def finish_day(self, day: str) -> None:
+        self.day_total.pop(day, None)
+        self.day_done.pop(day, None)
+        self.days_done += 1
+
+    def _speed(self) -> float:
+        now = time.monotonic()
+        self.samples.append((now, self.bytes_done))
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.SPEED_WINDOW_SECONDS:
+            self.samples.popleft()
+        t0, b0 = self.samples[0]
+        return (self.bytes_done - b0) / (now - t0) if now > t0 else 0.0
+
+    def _remaining_bytes(self) -> Optional[float]:
+        in_progress = sum(max(0, self.day_total[d] - self.day_done[d]) for d in self.day_total)
+        not_started = self.total_days - self.days_done - len(self.day_total)
+        if not_started <= 0:
+            return float(in_progress)
+        if not self.listed_day_bytes:
+            return None
+        return in_progress + not_started * sum(self.listed_day_bytes) / len(self.listed_day_bytes)
+
+    def _line(self) -> str:
+        speed = self._speed()
+        partial = sum(min(1.0, self.day_done[d] / self.day_total[d]) for d in self.day_total if self.day_total[d])
+        frac = min(1.0, (self.days_done + partial) / max(1, self.total_days))
+        filled = int(round(frac * self.WIDTH))
+        remaining = self._remaining_bytes()
+        eta = _format_duration(remaining / speed) if remaining is not None and speed > 0 else "--"
+        return (
+            f"[{'█' * filled}{'░' * (self.WIDTH - filled)}] {100 * frac:5.1f}%  "
+            f"{self.days_done}/{self.total_days} days  {self.bytes_done / 1e9:.1f} GB downloaded  "
+            f"{self.bytes_saved / 1e9:.1f} GB saved  {speed / 1e6:5.1f} MB/s  ETA {eta}"
+        )
+
+    def draw(self) -> None:
+        self.text = self._line()
+        if self.tty:
+            self.restore()
+        elif time.monotonic() - self.last_plain >= self.PLAIN_EVERY_SECONDS:
+            self.last_plain = time.monotonic()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] progress {self.text}", flush=True)
+
+    def restore(self) -> None:
+        if self.tty and self.text:
+            sys.stdout.write("\r\x1b[2K" + self.text)
+            sys.stdout.flush()
+            self.shown = True
+
+    def clear(self) -> None:
+        if self.tty and self.shown:
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.flush()
+            self.shown = False
+
+    def close(self) -> None:
+        """Leaves the final progress line on screen and moves to the next line."""
+        self.draw()
+        if self.tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] progress {self.text}", flush=True)
+        self.shown = False
+
+
+_PROGRESS: Optional[Progress] = None
 
 
 def to_ns(t: datetime) -> int:
@@ -281,6 +406,10 @@ def output_zarr_path_for_day(root_dir: str, day: datetime) -> str:
     return os.path.join(root_dir, str(day.year), f"{day.year}{day.timetuple().tm_yday:03d}.zarr")
 
 
+def directory_size(path: str) -> int:
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(path) for f in files)
+
+
 def zarr_store_is_complete(path: str) -> bool:
     if not os.path.exists(os.path.join(path, ".zgroup")):
         return False
@@ -296,9 +425,10 @@ class RemoteFile:
     start: datetime
     end: datetime
     created: datetime
+    size: int = 0
 
 
-def parse_remote_file(blob: str) -> Optional[RemoteFile]:
+def parse_remote_file(blob: str, size: int = 0) -> Optional[RemoteFile]:
     times: Dict[str, datetime] = {}
     for m in GOES_FILENAME_TIME_PATTERN.finditer(os.path.basename(blob)):
         kind, y, j, hh, mm, ss, tenth = m.groups()
@@ -307,7 +437,7 @@ def parse_remote_file(blob: str) -> Optional[RemoteFile]:
         )
     if set(times) != {"s", "e", "c"}:
         return None
-    return RemoteFile(blob=blob, start=times["s"], end=times["e"], created=times["c"])
+    return RemoteFile(blob=blob, start=times["s"], end=times["e"], created=times["c"], size=size)
 
 
 # =============================================================================
@@ -347,16 +477,17 @@ async def gcs_list_object_names(
     cfg: RawConfig,
     session: aiohttp.ClientSession,
     prefix: str,
-) -> List[str]:
+) -> Dict[str, int]:
+    """Object name -> size in bytes for everything under the prefix."""
     url = f"https://storage.googleapis.com/storage/v1/b/{cfg.gcs_bucket}/o"
-    params: Dict[str, str] = {"prefix": prefix, "fields": "items(name),nextPageToken", "maxResults": "1000"}
-    names: List[str] = []
+    params: Dict[str, str] = {"prefix": prefix, "fields": "items(name,size),nextPageToken", "maxResults": "1000"}
+    objects: Dict[str, int] = {}
     while True:
         js = await http_get(cfg, session, url, params, as_json=True)
-        names.extend(it["name"] for it in js.get("items", []) if it.get("name"))
+        objects.update((it["name"], int(it.get("size", 0))) for it in js.get("items", []) if it.get("name"))
         page_token = js.get("nextPageToken")
         if not page_token:
-            return names
+            return objects
         params["pageToken"] = page_token
 
 
@@ -365,35 +496,35 @@ async def list_day_names(
     session: aiohttp.ClientSession,
     gcs_product_prefix: str,
     day: datetime,
-) -> Tuple[List[str], int]:
-    """Returns (every object name under the day's 24 hourly prefixes, n_failed_prefixes)."""
+) -> Tuple[Dict[str, int], int]:
+    """Returns (name -> size for every object under the day's 24 hourly prefixes, n_failed_prefixes)."""
     jday = day.timetuple().tm_yday
     prefixes = [f"{gcs_product_prefix}/{day.year}/{jday:03d}/{hh:02d}/" for hh in LIST_HOURS]
     results = await asyncio.gather(
         *(gcs_list_object_names(cfg, session, p) for p in prefixes), return_exceptions=True
     )
 
-    names: List[str] = []
+    objects: Dict[str, int] = {}
     n_failed = 0
     for prefix, res in zip(prefixes, results):
         if isinstance(res, BaseException):
             n_failed += 1
             log(f"!! listing failed for {prefix}: {res!r}")
             continue
-        names.extend(res)
-    return names, n_failed
+        objects.update(res)
+    return objects, n_failed
 
 
-def select_files(names: List[str], filename_must_contain: str) -> List[RemoteFile]:
+def select_files(objects: Dict[str, int], filename_must_contain: str) -> List[RemoteFile]:
     """
     Files whose name contains the pattern, deduplicated by scan start time (keeping the newest
     creation time, i.e. reprocessed files) and sorted by start time.
     """
     by_start: Dict[datetime, RemoteFile] = {}
-    for name in names:
+    for name, size in objects.items():
         if filename_must_contain not in name:
             continue
-        rf = parse_remote_file(name)
+        rf = parse_remote_file(name, size)
         if rf is None:
             continue
         prev = by_start.get(rf.start)
@@ -428,15 +559,16 @@ def _as_unsigned(raw: np.ndarray, var: Any, target: Any, name: str) -> np.ndarra
 def quantize_packed(value: np.ndarray, fill_value: Optional[int], scale_factor: float, precision: Optional[float]) -> Tuple[np.ndarray, float]:
     """
     Rounds packed values to the nearest multiple of 2**n, the largest power of two whose physical
-    step (scale_factor * 2**n) is <= precision. Zeroing low bits lets the compressor shrink the data;
-    physical = value * scale_factor + add_offset still holds. Returns (values, physical step).
+    step (scale_factor * 2**n) is <= precision, with ties to even so the rounding adds no bias.
+    Zeroing low bits lets the compressor shrink the data; physical = value * scale_factor +
+    add_offset still holds. Returns (values, physical step).
     """
     step = abs(scale_factor)
     if precision is None or step <= 0 or precision < 2 * step:
         return value, step
     n = int(np.floor(np.log2(precision / step)))
     top = (fill_value - 1) if fill_value is not None else np.iinfo(np.uint16).max
-    rounded = ((value.astype(np.int32) + (1 << (n - 1))) >> n) << n
+    rounded = np.round(value.astype(np.float64) / (1 << n)) * (1 << n)  # exact: integers / powers of two
     rounded = np.minimum(rounded, (top >> n) << n).astype(np.uint16)
     if fill_value is not None:
         rounded[value == fill_value] = fill_value
@@ -822,11 +954,11 @@ async def process_single_day(
     specs = cfg.abi_products + ([cfg.glm_product] if cfg.glm_product is not None else [])
     prefixes = sorted({spec.gcs_product_prefix for spec in specs})
     listings = await asyncio.gather(*(list_day_names(cfg, session, p, day) for p in prefixes))
-    names_by_prefix = {p: names for p, (names, _) in zip(prefixes, listings)}
+    objects_by_prefix = {p: objects for p, (objects, _) in zip(prefixes, listings)}
     n_listing_errors = sum(n for _, n in listings)
 
     def day_files(spec: ProductSpec) -> List[RemoteFile]:
-        files = select_files(names_by_prefix[spec.gcs_product_prefix], spec.filename_must_contain)
+        files = select_files(objects_by_prefix[spec.gcs_product_prefix], spec.filename_must_contain)
         return [f for f in files if day_start <= f.start < day_end]
 
     glm_files = day_files(cfg.glm_product) if cfg.glm_product is not None else []
@@ -858,6 +990,9 @@ async def process_single_day(
         + ", ".join(f"{k}={sum(1 for states, _, _ in abi_items for st in states if st.spec.key == k)}" for k in abi_states)
         + f"; ABI files={len(abi_items)}; GLM files={len(glm_files)}; listing errors={n_listing_errors}"
     )
+    progress_key = day.date().isoformat()
+    if _PROGRESS is not None:
+        _PROGRESS.start_day(progress_key, sum(f.size for _, _, f in abi_items) + sum(f.size for f in glm_files))
 
     # --- store (built at *.tmp and moved into place when done)
     tmp_path = out_path + ".tmp"
@@ -894,7 +1029,10 @@ async def process_single_day(
             log(f"!! {os.path.basename(blob)}: {e!r}")
 
     async def download(blob: str) -> bytes:
-        return await http_get(cfg, session, f"https://storage.googleapis.com/{cfg.gcs_bucket}/{blob}", as_json=False)
+        payload = await http_get(cfg, session, f"https://storage.googleapis.com/{cfg.gcs_bucket}/{blob}", as_json=False)
+        if _PROGRESS is not None:
+            _PROGRESS.add_bytes(progress_key, len(payload))
+        return payload
 
     async def run_abi(states: List[AbiProductState], slot: int, f: RemoteFile) -> None:
         async with inflight:
@@ -959,6 +1097,8 @@ async def process_single_day(
 
     shutil.rmtree(out_path, ignore_errors=True)
     shutil.move(tmp_path, out_path)
+    if _PROGRESS is not None:
+        _PROGRESS.add_saved(await asyncio.to_thread(directory_size, out_path))
 
     if complete:
         status = "OK"
@@ -990,6 +1130,15 @@ async def run_all_days(cfg: RawConfig) -> None:
     ok: List[str] = []
     failed: List[str] = []
 
+    global _PROGRESS
+    progress = _PROGRESS = Progress(len(days))
+
+    async def redraw() -> None:
+        while True:
+            progress.draw()
+            await asyncio.sleep(1.0)
+
+    redraw_task = asyncio.create_task(redraw())
     async with aiohttp.ClientSession(connector=connector) as session:
         pool = DecodePool(cfg.max_decode_processes)
         try:
@@ -1005,16 +1154,26 @@ async def run_all_days(cfg: RawConfig) -> None:
                     except Exception as e:
                         log(f"!! {label} failed: {e!r}")
                         good = False
+                    finally:
+                        progress.finish_day(label)
                     (ok if good else failed).append(label)
 
             await asyncio.gather(*(worker() for _ in range(max(1, cfg.max_days_in_flight))))
         finally:
             pool.shutdown()
+            redraw_task.cancel()
+            progress.close()
+            _PROGRESS = None
 
+    elapsed = time.monotonic() - progress.started
     print("\n" + "=" * 72)
     print(f"Days attempted:  {len(days)}")
     print(f"Days complete:   {len(ok)}")
     print(f"Days incomplete: {len(failed)}" + (f"  {sorted(failed)}" if failed else ""))
+    print(f"Downloaded:      {progress.bytes_done / 1e9:.1f} GB in {_format_duration(elapsed)}"
+          f" ({progress.bytes_done / 1e6 / max(elapsed, 1e-9):.0f} MB/s average)")
+    print(f"Saved to disk:   {progress.bytes_saved / 1e9:.1f} GB"
+          + (f" ({100 * progress.bytes_saved / progress.bytes_done:.0f}% of downloaded)" if progress.bytes_done else ""))
     print(f"Output root:     {os.path.abspath(cfg.raw_output_root_dir)}")
     print("=" * 72)
 

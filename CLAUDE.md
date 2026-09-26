@@ -20,8 +20,8 @@ python download_raw.py --config config.json
 
 There are no tests or linters. Verify changes by running a short real download. `LIST_HOURS`
 limits listing to chosen hours, and the harness must be a script file: the decode
-`ProcessPoolExecutor` uses spawn on macOS, so code fed through stdin (`python3 - <<EOF`) fails in
-every worker.
+`ProcessPoolExecutor` always uses spawn (Linux would otherwise fork), so code fed through stdin
+(`python3 - <<EOF`) fails in every worker.
 
 ```python
 # run_test.py: one hour into a scratch dir (copy config.json, override dates/output/overwrite)

@@ -32,9 +32,10 @@ if __name__ == "__main__":
     asyncio.run(dr.run_all_days(dr.load_config(sys.argv[1])))
 ```
 
-The usual reference hour is 2025-10-27 18 UTC (~5 s, ~216 files). Check results against the
-original NetCDF files and/or the previous version's output array by array. Days that ended less
-than 24 h ago are never marked complete, so test with past dates.
+The usual reference hour is 2025-10-27 18 UTC (~5 s, 264 files). Check results against the
+original NetCDF files and/or the previous version's output array by array, and run changes to
+decoding or fetching with both `download_method` values: the two stores must be identical. Days
+that ended less than 24 h ago are never marked complete, so test with past dates.
 
 ## Architecture
 
@@ -53,7 +54,11 @@ crops ABI only.
 3. Download (`http_get`, retries on transient errors) → decode in `DecodePool` (returns packed
    integers + DQF) → validate every product of the file (`accept_first_or_validate`: grid, fill,
    DQF dtype must match the day's first scan) before writing any → write one Zarr chunk per slot
-   from a thread.
+   from a thread. With `download_method` `"byte_ranges"` the pool workers fetch too
+   (`ranged_decode_abi_file` / `ranged_decode_glm_file`): h5py reads the HDF5 metadata through
+   `_RangeFile`, only the chunks that are decoded are fetched (ABI: those overlapping the crop),
+   and the unchanged NetCDF decoders read the resulting file-sized buffer. Files start in scan-time
+   order so latency-bound GLM fetches overlap bandwidth-bound ABI ones.
 4. GLM flashes accumulate in memory and are written at the end with per-file rows and a
    `glm/coverage` flag per 20-second window.
 5. Build in `<day>.zarr.tmp`, consolidate metadata, then move into place. `complete` is true only
@@ -71,6 +76,11 @@ crops ABI only.
   the GOES-East fixed grid). GLM is deliberately never cropped (~36 MB/day).
 - `DecodePool` replaces the process pool when a worker dies, and closes the dead pool's call-queue
   reader to avoid CPython gh-94777, a hang at exit on Python < 3.12.
+- With byte ranges, every byte that is not fetched is zero, so a decoder must read only what the
+  ranged functions fetch: GLM only the variables in `GLM_SOURCE_VARIABLES`, ABI only `x`, `y` and
+  the data/DQF variables inside the window. Reading anything else fails for compressed variables
+  and silently gives zeros for uncompressed ones such as the GLM flash variables. Test changes
+  with the unfetched bytes filled with random data instead of zeros.
 - Missing data is explicit: ABI `present` = 0 and GLM `covered` = 0. In a complete day these mean
   NOAA never published the file.
 
@@ -82,5 +92,6 @@ crops ABI only.
   module docstring (store layout) in sync with behaviour changes. Assumptions that only matter for
   interpreting the data belong in the future feature step, not the README.
 - Output goes to `raw_output_root_dir` (default `./goes_raw`, git-ignored). Current config: about
-  2.1 GB/day stored with the NOAA CONUS bounds (~700 GB over the date range) and 6–8 GB/day
-  downloaded, since whole files are fetched regardless of bounds.
+  2.1 GB/day stored with the NOAA CONUS bounds (~700 GB over the date range). Downloads are
+  6–8 GB/day with `"whole_files"`, since whole files are fetched regardless of bounds, and about
+  4.7 GB/day with `"byte_ranges"`.

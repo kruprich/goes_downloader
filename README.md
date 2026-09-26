@@ -127,17 +127,40 @@ That box keeps about 65% of the ABI pixels.
 
 ## Config options for speed
 
-- `max_concurrent_http_requests` (32): open connections shared by all days, for listing and
-  downloads.
-- `http_timeout_seconds` (60): time limit for one request, including reading the whole file.
+- `download_method` (`"whole_files"`): how files are fetched.
+  - `"whole_files"` downloads every file in full and decodes it in `max_decode_processes` processes.
+  - `"byte_ranges"` downloads only the parts that are used: each file's internal HDF5 index, the
+    GLM flash variables (not the events and groups that make up most of a GLM file), and for ABI
+    only the image blocks that overlap `bounds`. This fetches about 68% of the bytes
+    (4.7 instead of 6.9 GB per day). Each file then takes a few requests in a row, so the requests
+    run in `byte_range_processes` worker processes. The stored data is identical either way.
+- `byte_range_processes` (48): with `"byte_ranges"`, worker processes that each fetch and decode
+  one file at a time. Each uses about 200 MB of memory.
+- `max_concurrent_http_requests` (32): open connections shared by all days, for listing and, with
+  `"whole_files"`, downloads. Byte-range workers use their own connections.
+- `http_timeout_seconds` (60): time limit for one request, including reading the whole file. With
+  `"byte_ranges"` it limits each network read instead.
 - `http_retries` (5): attempts per request. Timeouts, connection errors and HTTP 408, 429 and 5xx
   are retried with backoff; other errors fail at once.
-- `max_decode_processes` (4): worker processes that decode the NetCDF files.
+- `max_decode_processes` (4): with `"whole_files"`, worker processes that decode the NetCDF files.
 - `max_days_in_flight` (2): days processed at the same time, so the next day's listing overlaps the
   current day's downloads.
-- `max_inflight_payloads` (optional, defaults to `max_concurrent_http_requests`): files per day
-  that can be between download start and being written to Zarr, which caps memory use.
+- `max_inflight_payloads` (optional): files per day that can be between download start and being
+  written to Zarr, which caps memory use. Defaults to `max_concurrent_http_requests`, or to
+  `byte_range_processes` with `"byte_ranges"`.
 
-Download speed is usually limited by the internet connection, not by these settings. On a
-connection that delivers about 60 MB/s, 64 connections with 8 decode processes was no faster than
-the defaults, 128 connections was slower, and decoding used only about 1.3 CPU cores.
+Download speed is usually limited by the internet connection. On a connection that delivers about
+60 MB/s, 64 connections with 8 decode processes was no faster than the defaults, 128 connections
+was slower, and decoding used only about 1.3 CPU cores.
+
+Measured on one full day (2025-10-27) on that connection with 12 CPU cores:
+
+| `download_method` | Time per day | Downloaded | CPU time | Worker memory |
+|---|---|---|---|---|
+| `"whole_files"` | 106–107 s | 6.9 GB | 125 s | 0.5 GB |
+| `"byte_ranges"`, 32 processes | 90 s | 4.7 GB | not measured | 6.3 GB |
+| `"byte_ranges"`, 48 processes | 79–82 s | 4.7 GB | 438 s | 9.5 GB |
+
+Byte ranges save about a quarter of the time, but only with enough worker processes. GLM files are
+small, so fetching them is limited by request round trips, not bandwidth. They overlap with the
+bandwidth-bound ABI files only because files start in scan-time order.

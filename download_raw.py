@@ -67,12 +67,16 @@ Config:
   abi_products / glm_product define every product; "download" lists the keys to fetch.
   Products that read different variables from the same files (e.g. the dsi_* indices) share one
   download per scan, and each bucket prefix is listed once per day.
+  download_method "byte_ranges" fetches only the HDF5 metadata and the chunks that are decoded
+  (ABI chunks inside the crop) instead of whole files; the stored data is the same.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import http.client
+import io
 import json
 import multiprocessing
 import os
@@ -80,9 +84,10 @@ import random
 import re
 import shutil
 import sys
+import threading
 import time
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -133,6 +138,12 @@ class RawConfig:
     max_days_in_flight: int
     # Caps how many files are between "download started" and "written to Zarr" per day.
     max_inflight_payloads: int
+
+    # "whole_files": the main process downloads each file and decode processes decode it.
+    # "byte_ranges": worker processes fetch only the HDF5 metadata and the chunks that are read
+    # (inside the ABI crop), then decode, so each worker handles one file at a time.
+    download_method: str
+    byte_range_processes: int
 
     # Only the products named in the config's "download" list
     abi_products: List[ProductSpec]
@@ -219,7 +230,14 @@ def load_config(config_path: str) -> RawConfig:
     datetime.strptime(start_date_utc, "%Y-%m-%d")
     datetime.strptime(end_date_utc, "%Y-%m-%d")
 
+    download_method = raw.get("download_method", "whole_files")
+    if download_method not in ("whole_files", "byte_ranges"):
+        raise ValueError(f"download_method must be 'whole_files' or 'byte_ranges', got {download_method!r}")
+
     max_concurrent_http_requests = int(raw.get("max_concurrent_http_requests", 32))
+    byte_range_processes = int(raw.get("byte_range_processes", 48))
+    # A file waiting for a byte-range worker holds no data, so let every worker have one per day
+    default_inflight = byte_range_processes if download_method == "byte_ranges" else max_concurrent_http_requests
     return RawConfig(
         gcs_bucket=_require(raw, "gcs_bucket", str),
         start_date_utc=start_date_utc,
@@ -232,7 +250,9 @@ def load_config(config_path: str) -> RawConfig:
         # Decoding takes ~35 s of CPU per day of data, so a few processes keep up with the download
         max_decode_processes=int(raw.get("max_decode_processes", 4)),
         max_days_in_flight=int(raw.get("max_days_in_flight", 2)),
-        max_inflight_payloads=int(raw.get("max_inflight_payloads", max_concurrent_http_requests)),
+        max_inflight_payloads=int(raw.get("max_inflight_payloads", default_inflight)),
+        download_method=download_method,
+        byte_range_processes=byte_range_processes,
         abi_products=abi_products,
         glm_product=glm_product,
         bounds=bounds,
@@ -282,7 +302,8 @@ class Progress:
     One-line progress bar with download speed and ETA. In a terminal it is redrawn in place and log
     lines print above it; when output goes to a file it prints a plain progress line once a minute.
     Each day's download size is known exactly once it is listed; days not listed yet are estimated
-    from the average listed day.
+    from the average listed day. The bar and ETA count source file sizes; the GB downloaded and MB/s
+    shown are what actually went over the network, which is less with byte-range downloads.
     """
 
     WIDTH = 30
@@ -292,13 +313,14 @@ class Progress:
     def __init__(self, total_days: int):
         self.total_days = total_days
         self.days_done = 0
-        self.day_total: Dict[str, int] = {}  # bytes to download, per day in progress
+        self.day_total: Dict[str, int] = {}  # source file bytes, per day in progress
         self.day_done: Dict[str, int] = {}
         self.listed_day_bytes: List[int] = []
-        self.bytes_done = 0
+        self.bytes_done = 0  # source file bytes of the files handled so far
+        self.bytes_downloaded = 0
         self.bytes_saved = 0  # on-disk size of the day stores written this run, added as each day finishes
         self.started = time.monotonic()
-        self.samples: deque = deque([(self.started, 0)])
+        self.samples: deque = deque([(self.started, 0, 0)])
         self.tty = sys.stdout.isatty()
         self.text = ""
         self.shown = False
@@ -309,10 +331,12 @@ class Progress:
         self.day_done[day] = 0
         self.listed_day_bytes.append(total_bytes)
 
-    def add_bytes(self, day: str, n: int) -> None:
+    def add_bytes(self, day: str, n: int, downloaded: Optional[int] = None) -> None:
+        """n: source file bytes handled; downloaded: bytes fetched for them (default n)."""
         if day in self.day_done:
             self.day_done[day] += n
         self.bytes_done += n
+        self.bytes_downloaded += n if downloaded is None else downloaded
 
     def add_saved(self, n: int) -> None:
         self.bytes_saved += n
@@ -322,13 +346,16 @@ class Progress:
         self.day_done.pop(day, None)
         self.days_done += 1
 
-    def _speed(self) -> float:
+    def _speeds(self) -> Tuple[float, float]:
+        """(source file bytes/s, downloaded bytes/s) over the last SPEED_WINDOW_SECONDS."""
         now = time.monotonic()
-        self.samples.append((now, self.bytes_done))
+        self.samples.append((now, self.bytes_done, self.bytes_downloaded))
         while len(self.samples) > 2 and now - self.samples[0][0] > self.SPEED_WINDOW_SECONDS:
             self.samples.popleft()
-        t0, b0 = self.samples[0]
-        return (self.bytes_done - b0) / (now - t0) if now > t0 else 0.0
+        t0, b0, d0 = self.samples[0]
+        if now <= t0:
+            return 0.0, 0.0
+        return (self.bytes_done - b0) / (now - t0), (self.bytes_downloaded - d0) / (now - t0)
 
     def _remaining_bytes(self) -> Optional[float]:
         in_progress = sum(max(0, self.day_total[d] - self.day_done[d]) for d in self.day_total)
@@ -340,7 +367,7 @@ class Progress:
         return in_progress + not_started * sum(self.listed_day_bytes) / len(self.listed_day_bytes)
 
     def _line(self) -> str:
-        speed = self._speed()
+        speed, download_speed = self._speeds()
         partial = sum(min(1.0, self.day_done[d] / self.day_total[d]) for d in self.day_total if self.day_total[d])
         frac = min(1.0, (self.days_done + partial) / max(1, self.total_days))
         filled = int(round(frac * self.WIDTH))
@@ -348,8 +375,8 @@ class Progress:
         eta = _format_duration(remaining / speed) if remaining is not None and speed > 0 else "--"
         return (
             f"[{'█' * filled}{'░' * (self.WIDTH - filled)}] {100 * frac:5.1f}%  "
-            f"{self.days_done}/{self.total_days} days  {self.bytes_done / 1e9:.1f} GB downloaded  "
-            f"{self.bytes_saved / 1e9:.1f} GB saved  {speed / 1e6:5.1f} MB/s  ETA {eta}"
+            f"{self.days_done}/{self.total_days} days  {self.bytes_downloaded / 1e9:.1f} GB downloaded  "
+            f"{self.bytes_saved / 1e9:.1f} GB saved  {download_speed / 1e6:5.1f} MB/s  ETA {eta}"
         )
 
     def draw(self) -> None:
@@ -445,8 +472,12 @@ def parse_remote_file(blob: str, size: int = 0) -> Optional[RemoteFile]:
 # HTTP (retries on transient errors, raises when out of attempts)
 # =============================================================================
 
+def _backoff_seconds(attempt: int) -> float:
+    return min(30.0, 0.5 * 2 ** (attempt - 1)) * (0.5 + random.random())
+
+
 async def _backoff(attempt: int) -> None:
-    await asyncio.sleep(min(30.0, 0.5 * 2 ** (attempt - 1)) * (0.5 + random.random()))
+    await asyncio.sleep(_backoff_seconds(attempt))
 
 
 async def http_get(
@@ -576,18 +607,31 @@ def quantize_packed(value: np.ndarray, fill_value: Optional[int], scale_factor: 
     return rounded, step * (1 << n)
 
 
-def _decode_abi_variable(ds: Any, data_variable: str, dqf_variable: str, precision: Optional[float]) -> Dict[str, Any]:
+def _embed(part: np.ndarray, shape: Tuple[int, ...], ys: slice, xs: slice, fill: int) -> np.ndarray:
+    full = np.full(shape, fill, dtype=part.dtype)
+    full[ys, xs] = part
+    return full
+
+
+def _decode_abi_variable(
+    ds: Any, data_variable: str, dqf_variable: str, precision: Optional[float], window: Optional[Tuple[int, int, int, int]]
+) -> Dict[str, Any]:
     v = ds.variables[data_variable]
     q = ds.variables[dqf_variable]
     v.set_auto_maskandscale(False)
     q.set_auto_maskandscale(False)
 
-    value = _as_unsigned(_squeeze_to_2d(v[:], data_variable), v, np.uint16, data_variable)
-    dqf_raw = _squeeze_to_2d(q[:], dqf_variable)
+    if window is None:
+        value_raw, dqf_raw = v[:], q[:]
+    else:
+        if v.ndim != 2 or q.ndim != 2:
+            raise ValueError(f"{data_variable}/{dqf_variable}: byte-range downloads need 2D variables")
+        ys, xs = slice(window[0], window[1]), slice(window[2], window[3])
+        value_raw, dqf_raw = v[ys, xs], q[ys, xs]
+    value = _as_unsigned(_squeeze_to_2d(value_raw, data_variable), v, np.uint16, data_variable)
+    dqf_raw = _squeeze_to_2d(dqf_raw, dqf_variable)
     dqf_dtype = np.uint8 if dqf_raw.dtype.itemsize == 1 else np.uint16
     dqf = _as_unsigned(dqf_raw, q, dqf_dtype, dqf_variable)
-    if dqf.shape != value.shape:
-        raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {value.shape}")
 
     fill = getattr(v, "_FillValue", None)
     fill_value = None
@@ -602,6 +646,12 @@ def _decode_abi_variable(ds: Any, data_variable: str, dqf_variable: str, precisi
 
     scale_factor = float(getattr(v, "scale_factor", 1.0))
     value, quantization_step = quantize_packed(value, fill_value, scale_factor, precision)
+    if window is not None:
+        # Only the window was downloaded; the main process crops the rest of the frame away
+        value = _embed(value, v.shape, ys, xs, fill_value if fill_value is not None else int(np.iinfo(np.uint16).max))
+        dqf = _embed(dqf, q.shape, ys, xs, dqf_fill_value)
+    if dqf.shape != value.shape:
+        raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {value.shape}")
     return {
         "value": value,
         "dqf": dqf,
@@ -614,21 +664,29 @@ def _decode_abi_variable(ds: Any, data_variable: str, dqf_variable: str, precisi
     }
 
 
-def decode_abi_file(payload: bytes, variables: List[Tuple[str, str, Optional[float]]]) -> List[Dict[str, Any]]:
+def _abi_grid(ds: Any) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """(x, y, projection attributes) of an open ABI file."""
+    # x/y are scaled int16 in the file; netCDF4 unpacks them to radians by default
+    x = np.asarray(ds.variables["x"][:], dtype=np.float64).reshape(-1)
+    y = np.asarray(ds.variables["y"][:], dtype=np.float64).reshape(-1)
+    proj = ds.variables["goes_imager_projection"]
+    return x, y, {k: _jsonable(proj.getncattr(k)) for k in proj.ncattrs()}
+
+
+def decode_abi_file(
+    payload: bytes, variables: List[Tuple[str, str, Optional[float]]], window: Optional[Tuple[int, int, int, int]] = None
+) -> List[Dict[str, Any]]:
     """
     Decodes each (data_variable, dqf_variable, precision) from one file, so products that read
-    different variables from the same file (e.g. the DSI indices) share one download.
+    different variables from the same file (e.g. the DSI indices) share one download. With a window
+    (y0, y1, x0, x1) only those pixels are read and the rest of each frame is fill.
     """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
-        # x/y are scaled int16 in the file; netCDF4 unpacks them to radians by default
-        x = np.asarray(ds.variables["x"][:], dtype=np.float64).reshape(-1)
-        y = np.asarray(ds.variables["y"][:], dtype=np.float64).reshape(-1)
-        proj = ds.variables["goes_imager_projection"]
-        projection = {k: _jsonable(proj.getncattr(k)) for k in proj.ncattrs()}
+        x, y, projection = _abi_grid(ds)
         return [
-            {**_decode_abi_variable(ds, data_variable, dqf_variable, precision), "x": x, "y": y, "projection": projection}
+            {**_decode_abi_variable(ds, data_variable, dqf_variable, precision, window), "x": x, "y": y, "projection": projection}
             for data_variable, dqf_variable, precision in variables
         ]
 
@@ -645,21 +703,34 @@ def _offset_seconds_to_ns(var: Any) -> np.ndarray:
     return out
 
 
+# Flash column -> GLM file variable. decode_glm_file reads only these, and byte-range downloads fetch only these.
+GLM_SOURCE_VARIABLES = {
+    "time_first_ns": "flash_time_offset_of_first_event",
+    "time_last_ns": "flash_time_offset_of_last_event",
+    "lat": "flash_lat",
+    "lon": "flash_lon",
+    "area_m2": "flash_area",
+    "energy_j": "flash_energy",
+    "quality_flag": "flash_quality_flag",
+}
+
+
 def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
     import netCDF4 as nc
 
-    def floats(ds: Any, name: str) -> np.ndarray:
-        return np.ma.filled(np.ma.asarray(ds.variables[name][:], dtype=np.float32), np.nan).reshape(-1)
+    def floats(var: Any) -> np.ndarray:
+        return np.ma.filled(np.ma.asarray(var[:], dtype=np.float32), np.nan).reshape(-1)
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
-        quality = np.ma.filled(np.ma.asarray(ds.variables["flash_quality_flag"][:], dtype=np.int16), 255)
+        var = {column: ds.variables[name] for column, name in GLM_SOURCE_VARIABLES.items()}
+        quality = np.ma.filled(np.ma.asarray(var["quality_flag"][:], dtype=np.int16), 255)
         return {
-            "time_first_ns": _offset_seconds_to_ns(ds.variables["flash_time_offset_of_first_event"]),
-            "time_last_ns": _offset_seconds_to_ns(ds.variables["flash_time_offset_of_last_event"]),
-            "lat": floats(ds, "flash_lat"),
-            "lon": floats(ds, "flash_lon"),
-            "area_m2": floats(ds, "flash_area"),
-            "energy_j": floats(ds, "flash_energy"),
+            "time_first_ns": _offset_seconds_to_ns(var["time_first_ns"]),
+            "time_last_ns": _offset_seconds_to_ns(var["time_last_ns"]),
+            "lat": floats(var["lat"]),
+            "lon": floats(var["lon"]),
+            "area_m2": floats(var["area_m2"]),
+            "energy_j": floats(var["energy_j"]),
             "quality_flag": quality.astype(np.uint8).reshape(-1),
         }
 
@@ -674,9 +745,10 @@ def _jsonable(v: Any) -> Any:
 
 class DecodePool:
     """
-    Process pool for decoding. A worker process that dies (out of memory, a crash on a corrupt file)
-    breaks the whole ProcessPoolExecutor, so the first task to notice replaces it. The files that were
-    decoding at that moment fail, which leaves their days incomplete for the next run to redo.
+    Process pool for decoding (and, with byte-range downloads, for fetching too). A worker process
+    that dies (out of memory, a crash on a corrupt file) breaks the whole ProcessPoolExecutor, so the
+    first task to notice replaces it. The files that were in the pool at that moment fail, which
+    leaves their days incomplete for the next run to redo.
     """
 
     def __init__(self, workers: int):
@@ -765,6 +837,211 @@ class DayCrop:
         if self.rect is None:
             self.rect = scan_angle_rect(self.bounds, projection)
         return self.rect
+
+
+# =============================================================================
+# Byte-range downloads (download_method "byte_ranges"; runs in worker processes)
+# =============================================================================
+#
+# A worker reads the file's HDF5 metadata through h5py, which fetches it piece by piece, then
+# fetches only the chunks of the variables that are decoded (for ABI, only chunks overlapping the
+# crop). Everything lands in a file-sized buffer whose other bytes stay zero, and the same NetCDF
+# decoders as for whole files read that buffer.
+
+GCS_HOST = "storage.googleapis.com"
+# The first request fetches both ends of the file, where netCDF-C writes most of the metadata
+RANGE_HEAD_BYTES = 80 * 1024
+RANGE_TAIL_BYTES = 64 * 1024
+# Metadata elsewhere is fetched in aligned blocks of this size when h5py asks for it
+RANGE_BLOCK_BYTES = 16 * 1024
+# Needed ranges closer together than this are fetched in one request
+RANGE_MERGE_GAP_BYTES = 16 * 1024
+# Requests one worker makes at once for one file's chunks
+RANGE_THREADS_PER_PROCESS = 4
+
+_range_connections = threading.local()  # one keep-alive HTTPS connection per thread
+_range_threads: Optional[ThreadPoolExecutor] = None
+_crop_rects: Dict[str, Tuple[float, float, float, float]] = {}
+
+
+def _get_range(path: str, start: int, end: int, timeout: int, retries: int) -> bytes:
+    """Bytes [start, end) of a bucket object, over this thread's keep-alive connection; retries transient errors."""
+    last_error = "no attempts"
+    for attempt in range(1, retries + 1):
+        conn = getattr(_range_connections, "conn", None)
+        if conn is None:
+            conn = _range_connections.conn = http.client.HTTPSConnection(GCS_HOST, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"Range": f"bytes={start}-{end - 1}"})
+            r = conn.getresponse()
+            body = r.read()
+            if r.status == 206 and len(body) == end - start:
+                return body
+            last_error = f"HTTP {r.status} with {len(body)} bytes"
+            if r.status != 206 and r.status not in RETRYABLE_HTTP_STATUS:
+                break
+        except (OSError, http.client.HTTPException) as e:
+            last_error = repr(e)
+            conn.close()
+            _range_connections.conn = None
+        if attempt < retries:
+            time.sleep(_backoff_seconds(attempt))
+    raise RuntimeError(f"GET {path} bytes {start}-{end - 1} failed: {last_error}")
+
+
+def _range_executor() -> ThreadPoolExecutor:
+    global _range_threads
+    if _range_threads is None:
+        _range_threads = ThreadPoolExecutor(RANGE_THREADS_PER_PROCESS)
+    return _range_threads
+
+
+class _RangeFile(io.RawIOBase):
+    """A remote file for h5py: reads come from a file-sized buffer, fetching missing bytes in aligned blocks."""
+
+    def __init__(self, path: str, size: int, timeout: int, retries: int):
+        if size <= 0:
+            raise ValueError(f"{path}: size unknown")
+        self.path, self.size, self.timeout, self.retries = path, size, timeout, retries
+        self.buf = bytearray(size)
+        self.have = np.zeros(size, dtype=bool)
+        self.pos = 0
+        self.downloaded = 0
+
+    def fetch(self, ranges: List[Tuple[int, int]], merge_gap: int = RANGE_MERGE_GAP_BYTES) -> None:
+        """Fetches whatever is missing of the [start, end) ranges, merging close ones, in parallel."""
+        need = np.zeros(self.size, dtype=bool)
+        for start, end in ranges:
+            need[max(0, start):min(self.size, end)] = True
+        need &= ~self.have
+        if not need.any():
+            return
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], need.view(np.int8), [0]))))
+        spans: List[List[int]] = []
+        for start, end in edges.reshape(-1, 2).tolist():
+            if spans and start - spans[-1][1] < merge_gap:
+                spans[-1][1] = end
+            else:
+                spans.append([start, end])
+
+        def get(span: List[int]) -> bytes:
+            return _get_range(self.path, span[0], span[1], self.timeout, self.retries)
+
+        bodies = [get(spans[0])] if len(spans) == 1 else list(_range_executor().map(get, spans))
+        for (start, end), body in zip(spans, bodies):
+            self.buf[start:end] = body
+            self.have[start:end] = True
+            self.downloaded += len(body)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self.pos = {io.SEEK_SET: 0, io.SEEK_CUR: self.pos, io.SEEK_END: self.size}[whence] + offset
+        return self.pos
+
+    def readinto(self, b: Any) -> int:
+        n = min(len(b), self.size - self.pos)
+        if n <= 0:
+            return 0
+        if not self.have[self.pos:self.pos + n].all():
+            block = RANGE_BLOCK_BYTES
+            self.fetch([(self.pos // block * block, -(-(self.pos + n) // block) * block)], merge_gap=block)
+        b[:n] = self.buf[self.pos:self.pos + n]
+        self.pos += n
+        return n
+
+
+def _open_remote(
+    path: str, size: int, names: List[str], timeout: int, retries: int
+) -> Tuple[_RangeFile, Dict[str, Tuple[Optional[Tuple[int, ...]], List[Tuple[Tuple[int, ...], int, int]]]]]:
+    """
+    Fetches a remote file's metadata and locates the stored chunks of `names`. Returns the file and,
+    per name, (chunk shape or None, [(first element index, byte offset, byte size)]).
+    """
+    import h5py
+
+    rf = _RangeFile(path, size, timeout, retries)
+    rf.fetch([(0, RANGE_HEAD_BYTES), (size - RANGE_TAIL_BYTES, size)])
+    with h5py.File(rf, "r") as h:
+        # netCDF-C reads every object header and attribute when it opens a file, so fetch them all
+        def touch(obj: Any) -> None:
+            for name in obj.attrs:
+                try:
+                    obj.attrs[name]
+                except Exception:
+                    pass  # h5py cannot convert a few attribute types; their bytes are fetched with the header
+
+        touch(h)
+        h.visititems(lambda _, obj: touch(obj))
+        chunks = {}
+        for name in names:
+            d = h[name]
+            if d.chunks is None:
+                offset = d.id.get_offset()  # None for compact data, which is inside the fetched header
+                stored = [] if offset is None else [((0,) * d.ndim, offset, d.id.get_storage_size())]
+            else:
+                stored = [
+                    (tuple(c.chunk_offset), c.byte_offset, c.size)
+                    for c in (d.id.get_chunk_info(i) for i in range(d.id.get_num_chunks()))
+                ]
+            chunks[name] = (d.chunks, stored)
+    return rf, chunks
+
+
+def _crop_window(bounds: LatLonBounds, projection: Dict[str, Any], x: np.ndarray, y: np.ndarray) -> Tuple[int, int, int, int]:
+    """(y0, y1, x0, x1) the main process will keep, computed the same way as there."""
+    key = json.dumps([vars(bounds), projection], sort_keys=True)
+    if key not in _crop_rects:
+        _crop_rects[key] = scan_angle_rect(bounds, projection)
+    x0, x1, y0, y1 = _crop_rects[key]
+    ys, xs = crop_slice(y, y0, y1, "y"), crop_slice(x, x0, x1, "x")
+    return ys.start, ys.stop, xs.start, xs.stop
+
+
+def ranged_decode_abi_file(
+    path: str, size: int, variables: List[Tuple[str, str, Optional[float]]], bounds: Optional[LatLonBounds], timeout: int, retries: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """decode_abi_file on a remote file, fetching only metadata, x/y and the chunks inside the crop. Returns (decoded, bytes downloaded)."""
+    import netCDF4 as nc
+
+    data_names = sorted({name for dv, qv, _ in variables for name in (dv, qv)})
+    rf, chunks = _open_remote(path, size, ["x", "y", *data_names], timeout, retries)
+    grid = [(offset, offset + n) for name in ("x", "y") for _, offset, n in chunks[name][1]]
+    window = None
+    if bounds is not None:
+        rf.fetch(grid)
+        with nc.Dataset("inmem", mode="r", memory=bytes(rf.buf)) as ds:
+            x, y, projection = _abi_grid(ds)
+        window = _crop_window(bounds, projection, x, y)
+    needed = list(grid)
+    for name in data_names:
+        chunk_shape, stored = chunks[name]
+        for first, offset, n in stored:
+            if window is not None and chunk_shape is not None:
+                (cy, cx), (chy, chx) = first[-2:], chunk_shape[-2:]
+                if not (cy < window[1] and cy + chy > window[0] and cx < window[3] and cx + chx > window[2]):
+                    continue
+            needed.append((offset, offset + n))
+    rf.fetch(needed)
+    decoded = decode_abi_file(bytes(rf.buf), variables, window)
+    for dec in decoded:
+        dec["window"] = window
+    return decoded, rf.downloaded
+
+
+def ranged_decode_glm_file(path: str, size: int, timeout: int, retries: int) -> Tuple[Dict[str, np.ndarray], int]:
+    """decode_glm_file on a remote file, fetching only metadata and the flash variables. Returns (decoded, bytes downloaded)."""
+    names = list(GLM_SOURCE_VARIABLES.values())
+    rf, chunks = _open_remote(path, size, names, timeout, retries)
+    rf.fetch([(offset, offset + n) for name in names for _, offset, n in chunks[name][1]])
+    return decode_glm_file(bytes(rf.buf)), rf.downloaded
 
 
 # =============================================================================
@@ -864,6 +1141,12 @@ class AbiProductState:
             raise ValueError(f"{self.spec.key}: fill value {dec['fill_value']} != {self.fill_value}")
         if not (np.allclose(dec["x"], self.x, atol=1e-7) and np.allclose(dec["y"], self.y, atol=1e-7)):
             raise ValueError(f"{self.spec.key}: scan-angle coordinates differ from the first scan")
+
+    def check_window(self, dec: Dict[str, Any]) -> None:
+        """With byte-range downloads, the pixels kept must be exactly the ones the worker downloaded."""
+        window = dec.get("window")
+        if window is not None and window != (self.ys.start, self.ys.stop, self.xs.start, self.xs.stop):
+            raise ValueError(f"{self.spec.key}: downloaded window {window} != crop {(self.ys, self.xs)}")
 
     def record_scan(self, slot: int, dec: Dict[str, Any], f: RemoteFile) -> None:
         self.scale_factor[slot] = dec["scale_factor"]
@@ -1034,22 +1317,35 @@ async def process_single_day(
         if len(errors) <= MAX_ERRORS_LOGGED_PER_DAY:
             log(f"!! {os.path.basename(blob)}: {e!r}")
 
+    byte_ranges = cfg.download_method == "byte_ranges"
+    http_args = (cfg.http_timeout_seconds, cfg.http_retries)
+
     async def download(blob: str) -> bytes:
-        payload = await http_get(cfg, session, f"https://storage.googleapis.com/{cfg.gcs_bucket}/{blob}", as_json=False)
+        payload = await http_get(cfg, session, f"https://{GCS_HOST}/{cfg.gcs_bucket}/{blob}", as_json=False)
         if _PROGRESS is not None:
             _PROGRESS.add_bytes(progress_key, len(payload))
         return payload
 
+    async def run_ranged(f: RemoteFile, fn: Any, *args: Any) -> Any:
+        decoded, n_downloaded = await decode_pool.run(fn, f"/{cfg.gcs_bucket}/{f.blob}", f.size, *args, *http_args)
+        if _PROGRESS is not None:
+            _PROGRESS.add_bytes(progress_key, f.size, n_downloaded)
+        return decoded
+
     async def run_abi(states: List[AbiProductState], slot: int, f: RemoteFile) -> None:
         async with inflight:
             try:
-                payload = await download(f.blob)
                 variables = [(st.spec.data_variable, st.spec.dqf_variable, st.spec.precision) for st in states]
-                decoded = await decode_pool.run(decode_abi_file, payload, variables)
-                del payload
+                if byte_ranges:
+                    decoded = await run_ranged(f, ranged_decode_abi_file, variables, cfg.bounds)
+                else:
+                    payload = await download(f.blob)
+                    decoded = await decode_pool.run(decode_abi_file, payload, variables)
+                    del payload
                 # Validate every product before writing any, so a bad file leaves no half-written slot
                 for state, dec in zip(states, decoded):
                     state.accept_first_or_validate(root, dec)
+                    state.check_window(dec)
                 for state, dec in zip(states, decoded):
                     await asyncio.to_thread(write_abi_frame, state, slot, dec)
                     state.record_scan(slot, dec, f)
@@ -1059,16 +1355,20 @@ async def process_single_day(
     async def run_glm(i: int, f: RemoteFile) -> None:
         async with inflight:
             try:
-                payload = await download(f.blob)
-                glm_tables[i] = await decode_pool.run(decode_glm_file, payload)
+                if byte_ranges:
+                    glm_tables[i] = await run_ranged(f, ranged_decode_glm_file)
+                else:
+                    glm_tables[i] = await decode_pool.run(decode_glm_file, await download(f.blob))
                 glm_ok[i] = True
             except Exception as e:
                 record_error(f.blob, e)
 
-    await asyncio.gather(
-        *(run_abi(states, slot, f) for states, slot, f in abi_items),
-        *(run_glm(i, f) for i, f in enumerate(glm_files)),
-    )
+    # Files start in scan-time order, so small GLM files (latency-bound with byte ranges) overlap the
+    # larger ABI files (bandwidth-bound) instead of all running after them
+    jobs = [(f.start, run_abi(states, slot, f)) for states, slot, f in abi_items]
+    jobs += [(f.start, run_glm(i, f)) for i, f in enumerate(glm_files)]
+    jobs.sort(key=lambda job: job[0])
+    await asyncio.gather(*(job for _, job in jobs))
 
     # --- per-slot metadata, GLM tables, completion
     slot_start_ns = to_ns(day_start) + np.arange(SLOTS_PER_DAY, dtype=np.int64) * SLOT_SECONDS * 1_000_000_000
@@ -1146,7 +1446,8 @@ async def run_all_days(cfg: RawConfig) -> None:
 
     redraw_task = asyncio.create_task(redraw())
     async with aiohttp.ClientSession(connector=connector) as session:
-        pool = DecodePool(cfg.max_decode_processes)
+        byte_ranges = cfg.download_method == "byte_ranges"
+        pool = DecodePool(cfg.byte_range_processes if byte_ranges else cfg.max_decode_processes)
         try:
             async def worker() -> None:
                 while True:
@@ -1176,10 +1477,13 @@ async def run_all_days(cfg: RawConfig) -> None:
     print(f"Days attempted:  {len(days)}")
     print(f"Days complete:   {len(ok)}")
     print(f"Days incomplete: {len(failed)}" + (f"  {sorted(failed)}" if failed else ""))
-    print(f"Downloaded:      {progress.bytes_done / 1e9:.1f} GB in {_format_duration(elapsed)}"
-          f" ({progress.bytes_done / 1e6 / max(elapsed, 1e-9):.0f} MB/s average)")
+    downloaded = progress.bytes_downloaded
+    print(f"Downloaded:      {downloaded / 1e9:.1f} GB in {_format_duration(elapsed)}"
+          f" ({downloaded / 1e6 / max(elapsed, 1e-9):.0f} MB/s average)")
+    if cfg.download_method == "byte_ranges":
+        print(f"Source files:    {progress.bytes_done / 1e9:.1f} GB ({100 * downloaded / max(progress.bytes_done, 1):.0f}% downloaded)")
     print(f"Saved to disk:   {progress.bytes_saved / 1e9:.1f} GB"
-          + (f" ({100 * progress.bytes_saved / progress.bytes_done:.0f}% of downloaded)" if progress.bytes_done else ""))
+          + (f" ({100 * progress.bytes_saved / downloaded:.0f}% of downloaded)" if downloaded else ""))
     print(f"Output root:     {os.path.abspath(cfg.raw_output_root_dir)}")
     print("=" * 72)
 

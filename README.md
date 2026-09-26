@@ -124,3 +124,20 @@ constant per product but should check.
 
 Measured on one hour of data with the current products: about 3.3 GB/day for full CONUS.
 That box keeps about 65% of the ABI pixels.
+
+## Config options for speed
+
+- `max_concurrent_http_requests` (32): open connections shared by all days, for listing and
+  downloads.
+- `http_timeout_seconds` (60): time limit for one request, including reading the whole file.
+- `http_retries` (5): attempts per request. Timeouts, connection errors and HTTP 408, 429 and 5xx
+  are retried with backoff; other errors fail at once.
+- `max_decode_processes` (4): worker processes that decode the NetCDF files.
+- `max_days_in_flight` (2): days processed at the same time, so the next day's listing overlaps the
+  current day's downloads.
+- `max_inflight_payloads` (optional, defaults to `max_concurrent_http_requests`): files per day
+  that can be between download start and being written to Zarr, which caps memory use.
+
+Download speed is usually limited by the internet connection, not by these settings. On a
+connection that delivers about 60 MB/s, 64 connections with 8 decode processes was no faster than
+the defaults, 128 connections was slower, and decoding used only about 1.3 CPU cores.

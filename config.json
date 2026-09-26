@@ -4,6 +4,11 @@
   "end_date_utc": "2026-09-01",
   "raw_output_root_dir": "./goes_raw",
   "overwrite_existing": false,
+  "max_concurrent_http_requests": 32,
+  "http_timeout_seconds": 60,
+  "http_retries": 5,
+  "max_decode_processes": 4,
+  "max_days_in_flight": 2,
   "bounds": {
     "lat_min": 24.0,
     "lat_max": 50.0,

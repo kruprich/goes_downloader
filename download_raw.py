@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -680,7 +681,12 @@ class DecodePool:
 
     def __init__(self, workers: int):
         self.workers = workers
-        self.pool = ProcessPoolExecutor(max_workers=workers)
+        self.pool = self._new_pool()
+
+    def _new_pool(self) -> ProcessPoolExecutor:
+        # Workers start as fresh processes on every platform (the macOS default). Linux would otherwise
+        # fork this process while its HTTP and Zarr-writer threads run, which can deadlock a worker.
+        return ProcessPoolExecutor(max_workers=self.workers, mp_context=multiprocessing.get_context("spawn"))
 
     async def run(self, fn: Any, *args: Any) -> Any:
         pool = self.pool
@@ -689,7 +695,7 @@ class DecodePool:
         except BrokenProcessPool:
             if self.pool is pool:
                 log("!! a decode process died; starting a new process pool")
-                self.pool = ProcessPoolExecutor(max_workers=self.workers)
+                self.pool = self._new_pool()
                 # Before Python 3.12 the broken pool's feeder thread can block forever writing a queued
                 # file to the dead workers, which then hangs the program at exit (CPython gh-94777).
                 # Closing the read end of that pipe unblocks it, as newer Pythons do themselves.

@@ -100,7 +100,9 @@ is only practical with `"byte_ranges"` (~59 MB per whole file; `run_all_days` wa
 The `download` list selects which to fetch; it currently holds LightningCast's bands 2, 5, 13 and
 15 (`mcmip_*`). `cmip_precision` applies to infrared CMIP bands 7–16 (band number from
 `filename_must_contain`, or from the `CMI_Cnn` data variable for MCMIPC); a product's own
-`precision` overrides it. `bounds` crops ABI only. Unknown top-level keys are ignored.
+`precision` overrides it. `bounds` crops ABI only. `load_config` logs every key it doesn't read
+(`unknown_keys`; `_`-prefixed keys are notes): a new setting must be added to `TOP_LEVEL_KEYS` (or
+the product/bounds key sets) as well as read.
 
 **Per-day flow (`process_single_day`).**
 1. List each distinct `gcs_product_prefix` once (24 hourly prefixes). `select_files` filters by

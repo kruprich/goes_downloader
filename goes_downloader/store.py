@@ -61,6 +61,21 @@ Root attrs:
   complete = true only if every listing request succeeded, every file was downloaded and decoded,
   and the day ended at least 24 h ago (NOAA publishes some files late). Incomplete days are rebuilt
   from scratch on the next run.
+  too_recent             the day ended less than 24 h before the run (so complete is false)
+  completed_utc          when a complete store was written (null otherwise)
+  n_listing_errors, n_file_errors, n_abi_slot_collisions (extra scans in an already filled slot)
+  n_glm_files, n_glm_flashes, n_glm_events, n_glm_windows_missing (null without GLM)
+  day_utc, year, julian_day, slots_per_day, slot_seconds, slot_rule, time_encoding
+  source_gcs_bucket, source_satellite_label, abi_product_keys, glm_included
+  bounds                 the configured lat/lon box (null for none); crop_scan_angle_rect is the
+                         scan-angle rectangle (x_min, x_max, y_min, y_max) computed from it
+
+ABI group attrs (abi/<key>):
+  n_present, has_frames  scans stored, and whether any were (without any, value/dqf don't exist)
+  fill_value, dqf_fill_value, units, data_variable, dqf_variable, source_filename_must_contain
+  precision_requested    the product's rounding step in physical units (null: full precision)
+  goes_imager_projection the file's projection attributes
+  uncropped_shape, crop_y0, crop_x0   the source grid and where the stored crop starts in it
 
 Reading with xarray (one product or GLM table across several days):
   xr.open_mfdataset(day_paths, engine="zarr", group="abi/mcmip_c13", combine="by_coords")

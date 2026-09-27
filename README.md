@@ -8,9 +8,9 @@ here; that belongs in a separate feature-building step.
 For each UTC day it:
 
 1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
-2. ABI: stores every 5-min scan on the product's grid (bands 2, 5, 13 and 15 at 2 km, read from
-   the all-band MCMIPC files; ACHA cloud height, TPW and the DSI stability indices at 10 km) as the
-   file's packed integers plus its DQF flags.
+2. ABI: stores every 5-min scan on the product's grid, cropped to `bounds`, as the file's packed
+   integers plus its DQF flags. The current config stores bands 2, 5, 13 and 15 at 2 km (read
+   from the all-band MCMIPC files) and ACHA cloud height, TPW and the DSI stability indices at 10 km.
 3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and every event (lat/lon
    and the flash it belongs to), plus a coverage flag for every 20-second window, so outages
    (including files NOAA never published) show up as gaps rather than as "no lightning".
@@ -18,55 +18,103 @@ For each UTC day it:
    succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
    Incomplete days are rebuilt on the next run.
 
-The full layout is described in the docstring at the top of `goes_downloader/store.py`.
+The full store layout, including every attribute, is described in the docstring at the top of
+`goes_downloader/store.py`.
 
-## Usage
+## Files
 
-Use Python 3.11–3.13: the `zarr<3` pin needs `numcodecs<0.16`, which has no Python 3.14 wheel.
-`requirements.lock` holds the exact versions the downloader was tested with.
+| Path | What it is |
+|---|---|
+| `download_raw.py` | Runs the download (`python download_raw.py --config config.json`) |
+| `report.py` | Shows which days the stores hold and how complete they are |
+| `config.json` | Date range, output folder, products to download and all settings |
+| `goes_downloader/` | The code; `store.py` documents the store layout |
+| `tests/` | The test suite (see [Tests](#tests)) |
+| `requirements.txt`, `requirements.lock`, `requirements-dev.txt` | Dependencies; exact tested versions; test tools |
+
+## Setup
+
+Use Python 3.11–3.13 (tested with 3.13). Python 3.14 does not work: the `zarr<3` pin needs
+`numcodecs<0.16`, which has no 3.14 wheel, so installing tries to compile it.
 
 ```bash
-uv venv --python 3.13 .venv && source .venv/bin/activate
-uv pip install -r requirements.lock        # or: pip install -r requirements.lock
+uv venv --python 3.13 .venv && source .venv/bin/activate   # or: python3.13 -m venv .venv
+uv pip install -r requirements.lock                        # or: pip install -r requirements.lock
+```
+
+`requirements.lock` holds the exact versions the downloader was tested with; `requirements.txt`
+lists the direct dependencies without pins.
+
+What a run needs, with the current config (measured on 2025-10-27, 12 CPU cores, ~60 MB/s):
+
+- **Disk:** about 2.1 GB per day stored, so ~675 GB for the 321 days of the configured range.
+- **Network:** about 4.9 GB per day downloaded. A day takes 95–110 s, so the range takes 8.5–10 h.
+- **Memory:** about 10 GB: 7.2–7.7 GB for the 48 byte-range workers and up to 1.9 GB for the main
+  process, which holds a day's GLM events until the day is written. Lower `byte_range_processes`
+  to use less.
+
+## Running a download
+
+```bash
 python download_raw.py --config config.json
 ```
 
-Days already marked `complete` are skipped unless `overwrite_existing` is `true`.
+Days already marked `complete` are skipped unless `overwrite_existing` is `true`, so running the
+same command again continues where the last run stopped and retries incomplete days.
 
 While it runs, the last line shows a progress bar, days done, data downloaded, data saved to
 disk (added as each day finishes), download speed (last 30 s) and an ETA. The ETA uses each
 day's exact size once the day is listed and the average listed day for days not reached yet.
-When output is redirected to a file, a progress line is printed once a minute instead.
+When output is redirected to a file, a progress line is printed once a minute instead. When the
+run finishes, it prints a summary and then the data report (see
+[Checking the data](#checking-the-data)); `--no-report` skips the report.
 
 Ctrl-C stops the run within a few seconds: files being decoded finish, the days in progress are
 left as `.zarr.tmp` folders, and running the same command again rebuilds those days and continues.
+
+For a long run, use `screen` or `tmux` so it survives closing the terminal, and keep a log:
+
+```bash
+screen -S goes                     # detach with Ctrl-A D, reattach with: screen -r goes
+source .venv/bin/activate
+python download_raw.py --config config.json 2>&1 | tee -a goes_download.log
+```
+
+Lines starting with `!!` in the log are errors (`grep '!!' goes_download.log`). Don't edit the
+code while a run is going: a worker process that dies is replaced, and the replacement loads
+whatever the code is at that moment.
 
 ## Checking the data
 
 `report.py` reads every day store in the config's date range and lists the days that need
 attention: not complete (or missing, or interrupted), an ABI product with less than 98% of its
 scans, or less than 99% GLM coverage. The download prints the same report when a run finishes,
-covering the whole date range including days done by earlier runs (not after Ctrl-C);
-`--no-report` skips it.
+covering the whole date range including days done by earlier runs (not after Ctrl-C).
 
 ```bash
 python report.py --config config.json                  # summary and days needing attention
 python report.py --config config.json --all --csv days.csv
 ```
 
-## Tests
+## Config basics
 
-```bash
-uv pip install -r requirements-dev.txt
-pytest              # offline, in seconds: small synthetic files stand in for the GOES ones
-pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
-```
+- `gcs_bucket`: the public bucket to read (`gcp-public-data-goes-19`).
+- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included.
+- `raw_output_root_dir` (default `./goes_raw`, relative to where you run the command): where the
+  day stores go. `goes_raw/` is git-ignored.
+- `overwrite_existing` (default `false`): rebuild days that are already complete, e.g. after
+  changing the products or `bounds`.
+- `download`: the product keys to fetch (see below).
+
+Days that ended less than 24 hours before the run are stored but not marked complete (the report
+shows them as "too recent"); any later run rebuilds them, and marks them complete once the
+24 hours have passed.
 
 ## Choosing products
 
-`abi_products` and `glm_product` in `config.json` define every available product (all 16 CMIP
-bands plus the CONUS L2 products), each with a `description`. Only the keys
-listed in `download` are fetched, for example:
+`abi_products` and `glm_product` in `config.json` define the products that can be downloaded
+(all 16 CMIP bands in two sets, plus the CONUS L2 products), each with a `description`. Only the
+keys listed in `download` are fetched, for example:
 
 ```json
 "download": ["mcmip_c02", "mcmip_c05", "mcmip_c13", "mcmip_c15", "acha", "tpw", "dsi_cape", "dsi_li", "dsi_ki", "glm"]
@@ -88,8 +136,10 @@ products.
 
 ## Reading the data
 
-Each day store opens directly with xarray, one product (or GLM table) at a time, and several days
-combine into one continuous time series:
+Reading needs `xarray` and `dask`, which the downloader itself does not install
+(`uv pip install xarray dask`; checked with xarray 2026.7 and dask 2026.8). Each day store opens
+directly with xarray, one product (or GLM table) at a time, and several days combine into one
+continuous time series:
 
 ```python
 import glob, xarray as xr
@@ -114,7 +164,9 @@ each flash's centre and area. Like `file_index`, `flash_index` only works within
 
 ABI values are the file's packed numbers, not physical units: the physical value is
 `value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
-which makes `value` a float array; pass `mask_and_scale=False` to get the stored integers.
+which makes `value` a float array; pass `mask_and_scale=False` to get the stored integers. Time
+slots without a scan read as all NaN, and the ABI x/y coordinates are `x_scan_angle_rad` and
+`y_scan_angle_rad`.
 
 ## Assumptions about the source data
 
@@ -129,9 +181,9 @@ day incomplete so it is retried and visible in the log:
 
 **Recorded, but expected to stay constant.** `scale_factor` and `add_offset` are stored for every
 scan, so a change would be captured. For GOES-19 they have never changed: one file per month for
-every current product, from the start of the data (Oct 2024 for CMIP, Dec 2024 for the others) to
-Sep 2026, all had the same scale, offset and fill value. The feature step can treat them as
-constant per product but should check.
+every current product, from the start of the data (Oct 2024 for CMIP and MCMIPC, Dec 2024 for the
+others) to Sep 2026, all had the same scale, offset and fill value. The feature step can treat
+them as constant per product but should check.
 
 **Assumed, not checked:**
 
@@ -142,9 +194,9 @@ constant per product but should check.
   file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
   the file with the newest creation time is used.
 - All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W) since
-  GOES-19 moved to the GOES-East position in 2025. Earlier files (e.g. January 2025) use its
-  89.5°W test position, so don't mix those dates with later ones. The `bounds` crop is computed
-  from the first ABI scan decoded each day and applied to every ABI product.
+  GOES-19 moved to the GOES-East position in April 2025. Earlier files use its 89.5°W test
+  position, so don't mix those dates with later ones. The `bounds` crop is computed from the first
+  ABI scan decoded each day and applied to every ABI product.
 - GLM flash times are "seconds since" offsets in the file. A GLM file belongs to the day its start
   time falls in, so a flash in the first file of a day can begin a second or two before midnight;
   select flashes by their own times, not by which day store holds them.
@@ -155,9 +207,11 @@ constant per product but should check.
 
 ## Config options for storage
 
-- `cmip_precision` (K): rounds the infrared CMIP bands (7–16) to this step to save space. 0.25 K is
-  below the sensor noise and cuts CMIP storage by about 26%; `null` keeps full precision. The
-  visible bands (1–6) are reflectance and always keep full precision.
+- `cmip_precision` (K, `0.25` in the config): rounds the infrared CMIP bands (7–16) to save space.
+  The step is the largest power-of-two number of packed counts that is at most this many K (0.246 K
+  for band 13, 0.238 K for band 15) and is stored per scan in `quantization_step`; each value moves
+  by at most half a step. This cuts CMIP storage by about 26%; `null` keeps full precision. The
+  visible and near-infrared bands (1–6) are reflectance and keep full precision.
 - `precision` (per ABI product, in the product's units): overrides `cmip_precision` for that
   product, or rounds any other product. Categorical products such as cloud top phase must not set it.
 - `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): **applies to ABI only.** Crops every ABI
@@ -173,7 +227,8 @@ shrink to about a tenth at night; days with more daylight store more.
 
 ## Config options for speed
 
-- `download_method` (`"whole_files"`): how files are fetched.
+- `download_method` (`"whole_files"` if not set; the config uses `"byte_ranges"`): how files are
+  fetched.
   - `"whole_files"` downloads every file in full and decodes it in `max_decode_processes` processes.
   - `"byte_ranges"` downloads only the parts that are used: each file's internal HDF5 index, the
     variables that are stored (for GLM the flash and event variables and the ids linking them, not
@@ -182,7 +237,7 @@ shrink to about a tenth at night; days with more daylight store more.
     Each file then takes a few requests in a row, so the requests run in `byte_range_processes`
     worker processes. The stored data is identical either way.
 - `byte_range_processes` (48): with `"byte_ranges"`, worker processes that each fetch and decode
-  one file at a time. Together they peaked at 7.7 GB of memory with the current products.
+  one file at a time. Together they peaked at 7.2–7.7 GB of memory with the current products.
 - `max_concurrent_http_requests` (32): open connections shared by all days, for listing and, with
   `"whole_files"`, downloads. Byte-range workers use their own connections.
 - `http_timeout_seconds` (60): time limit for one request, including reading the whole file. With
@@ -201,9 +256,9 @@ Download speed is usually limited by the internet connection. On a connection th
 was slower, and decoding used only about 1.3 CPU cores.
 
 Measured on one full day (2025-10-27) on that connection with 12 CPU cores. With the current
-products, `"byte_ranges"` with 48 processes took 95 s, downloaded 4.9 GB, used 288 s of CPU and
-7.7 GB for the workers; `"whole_files"` would download 16.1 GB. An earlier comparison, with
-single-band files for bands 8, 11, 13 and 15 and GLM flashes only:
+products, `"byte_ranges"` with 48 processes took 95–110 s, downloaded 4.9 GB, used 288 s of CPU
+and 7.2–7.7 GB for the workers; `"whole_files"` would download 16.1 GB. An earlier comparison,
+with single-band files for bands 8, 11, 13 and 15 and GLM flashes only:
 
 | `download_method` | Time per day | Downloaded | CPU time | Worker memory |
 |---|---|---|---|---|
@@ -214,3 +269,22 @@ single-band files for bands 8, 11, 13 and 15 and GLM flashes only:
 Byte ranges save about a quarter of the time, but only with enough worker processes. GLM files are
 small, so fetching them is limited by request round trips, not bandwidth. They overlap with the
 bandwidth-bound ABI files only because files start in scan-time order.
+
+## Tests
+
+```bash
+uv pip install -r requirements-dev.txt
+pytest              # offline, under a second: small synthetic files stand in for the GOES ones
+pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
+```
+
+## Troubleshooting
+
+- **Installing fails while building `numcodecs`:** you are on Python 3.14; use 3.11–3.13.
+- **A day stays incomplete:** run the same command again; failed files are retried. The `!!` log
+  lines and `report.py` show which days and files failed. A file that fails on every run points
+  to a problem with that file at the source.
+- **"too recent" in the report:** the day ended less than 24 hours before the run; run again later.
+- **Running out of memory:** lower `byte_range_processes` (32 used ~6.3 GB and was ~10% slower).
+- **Slower than expected:** check the connection's speed first. With `"byte_ranges"`, fewer than
+  ~48 workers leaves bandwidth unused.

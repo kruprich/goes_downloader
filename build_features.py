@@ -18,7 +18,11 @@ view angle, recovered with the lightning ellipsoid GLM navigates to, so they lin
 ABI sees from the same satellite (the ground ellipsoid would move them by ~2 km over CONUS).
 
 Time: slot t holds the ABI scan starting in [t, t+5 min). The issue time is the end of the slot
-(t + 5 min): every input ends there and every label window starts there.
+(t + 5 min): every input ends there and every label window starts there. Solar channels (sun position)
+are computed for the middle of the slot.
+
+Static fields come from the grid geometry or from lat/lon NetCDF sources (e.g. terrain, land/sea mask),
+downloaded once into features.static_cache_dir and aggregated or interpolated onto the grid.
 
 Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
   time[time]                           datetime64 slot start, every time_step_minutes
@@ -32,14 +36,18 @@ Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
   channel_valid_fraction[time, channel] float32 fraction of cells that are not NaN
   x[x], y[y]                           float64 cell-centre scan angles (rad) on the ABI fixed grid
   lat[y, x], lon[y, x]                 float32 cell centres (deg)
+  static[static_channel, y, x]         float32 fields that don't change with time (terrain, land fraction, viewing
+                                       angle), computed once per run and the same in every day store
+  static_channel[static_channel]       names, in config order
 
 Root attrs:
   complete = true only if the day's raw store and every neighbouring raw day that was read (lookback for
   lags and gap filling, lookahead for labels) are complete. A neighbour outside the raw config's date range
   never will be, so it counts as unavailable instead: its slots are NaN / unknown. Incomplete days are
   rebuilt from scratch on the next run.
-  channel_stats / label_stats: per-day sums for normalisation and class balance (combine with --stats).
-  grid, channels, labels, glm, time_step_minutes: the settings the store was built with.
+  channel_stats / static_stats / label_stats: per-day sums for normalisation and class balance (combine with
+  --stats).
+  grid, channels, labels, static, glm, time_step_minutes: the settings the store was built with.
 
 Usage:
   python build_features.py --config config.json                  # build every day in the range
@@ -51,12 +59,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gzip
 import json
 import math
 import multiprocessing
 import os
 import shutil
 import time
+import urllib.parse
+import urllib.request
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -78,6 +90,9 @@ FLOAT16_MAX = float(np.finfo(np.float16).max)
 
 AGGREGATIONS = ("mean", "min", "max", "std", "fraction")
 GLM_STATS = ("count", "energy_fj", "area_km2")
+SOLAR_VALUES = ("cos_zenith", "local_hour_sin", "local_hour_cos")
+GEOMETRY_VALUES = ("satellite_zenith", "latitude", "longitude")
+STATIC_AGGREGATIONS = ("mean", "std", "min", "max")
 
 
 # =============================================================================
@@ -99,6 +114,8 @@ class ChannelSpec:
     fill_gaps_slots: int = 0
     # kind == "glm"
     glm_stat: Optional[str] = None
+    # kind == "solar"
+    solar: Optional[str] = None
     # kind == "expr"
     expr: Optional[str] = None
 
@@ -111,6 +128,22 @@ class LabelSpec:
     min_flashes: int
     radius_cells: float
     description: str = ""
+
+
+@dataclass(frozen=True)
+class StaticSpec:
+    """A field that doesn't change with time: computed from the grid, or regridded from a lat/lon file."""
+
+    name: str
+    description: str = ""
+    geometry: Optional[str] = None
+    url: Optional[str] = None
+    file: Optional[str] = None
+    variable: Optional[str] = None
+    aggregation: str = "mean"
+    clip: Tuple[Optional[float], Optional[float]] = (None, None)
+    scale: float = 1.0
+    offset: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -132,6 +165,8 @@ class FeatureConfig:
     glm_min_coverage: float
     channels: Tuple[ChannelSpec, ...]
     labels: Tuple[LabelSpec, ...]
+    static: Tuple[StaticSpec, ...]
+    static_cache_dir: str
 
     @property
     def uses_glm(self) -> bool:
@@ -141,6 +176,7 @@ class FeatureConfig:
 CHANNEL_KEYS = {
     "product": {"product", "aggregation", "values", "valid_dqf", "min_valid_fraction", "fill_gaps_minutes"},
     "glm": {"glm"},
+    "solar": {"solar"},
     "expr": {"expr"},
 }
 
@@ -174,7 +210,7 @@ def _parse_channel(i: int, c: Any, abi_keys: List[str], has_glm: bool) -> Channe
     where = f"channel {name!r}"
     kinds = [k for k in CHANNEL_KEYS if k in c]
     if len(kinds) != 1:
-        raise ValueError(f"{where} needs exactly one of \"product\", \"glm\" or \"expr\"")
+        raise ValueError(f"{where} needs exactly one of " + ", ".join(f'"{k}"' for k in CHANNEL_KEYS))
     kind = kinds[0]
     unknown = set(c) - {"name", "output", "description"} - CHANNEL_KEYS[kind]
     if unknown:
@@ -209,6 +245,10 @@ def _parse_channel(i: int, c: Any, abi_keys: List[str], has_glm: bool) -> Channe
         if c["glm"] not in GLM_STATS:
             raise ValueError(f"{where}: glm must be one of {GLM_STATS}, got {c['glm']!r}")
         return ChannelSpec(**common, glm_stat=c["glm"])
+    if kind == "solar":
+        if c["solar"] not in SOLAR_VALUES:
+            raise ValueError(f"{where}: solar must be one of {SOLAR_VALUES}, got {c['solar']!r}")
+        return ChannelSpec(**common, solar=c["solar"])
     if not isinstance(c["expr"], str):
         raise ValueError(f"{where}: expr must be a string")
     parse_expression(c["expr"], where)
@@ -239,6 +279,45 @@ def _parse_label(i: int, l: Any) -> LabelSpec:
     return LabelSpec(name, start, end, min_flashes, float(radius), str(l.get("description", "")))
 
 
+STATIC_KEYS = {"name", "description", "geometry", "url", "file", "variable", "aggregation", "clip", "scale", "offset"}
+
+
+def _parse_static(i: int, f: Any) -> StaticSpec:
+    where = f"features.static[{i}]"
+    if not isinstance(f, dict):
+        raise ValueError(f"{where} must be an object")
+    unknown = set(f) - STATIC_KEYS
+    if unknown:
+        raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
+    name = f.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{where}.name must be a non-empty string")
+    where = f"static field {name!r}"
+    description = str(f.get("description", ""))
+    if "geometry" in f:
+        extra = set(f) - {"name", "description", "geometry"}
+        if extra:
+            raise ValueError(f"{where}: a geometry field takes no {sorted(extra)}")
+        if f["geometry"] not in GEOMETRY_VALUES:
+            raise ValueError(f"{where}: geometry must be one of {GEOMETRY_VALUES}, got {f['geometry']!r}")
+        return StaticSpec(name, description, geometry=f["geometry"])
+    if not (f.get("url") or f.get("file")) or not isinstance(f.get("variable"), str):
+        raise ValueError(f"{where} needs \"geometry\", or a \"variable\" with a \"url\" and/or \"file\"")
+    aggregation = f.get("aggregation", "mean")
+    if aggregation not in STATIC_AGGREGATIONS:
+        raise ValueError(f"{where}: aggregation must be one of {STATIC_AGGREGATIONS}, got {aggregation!r}")
+    clip = f.get("clip", [None, None])
+    if not (isinstance(clip, list) and len(clip) == 2 and all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)) for v in clip)):
+        raise ValueError(f"{where}: clip must be [low, high] with numbers or null")
+    for k in ("scale", "offset"):
+        if k in f and (isinstance(f[k], bool) or not isinstance(f[k], (int, float))):
+            raise ValueError(f"{where}: {k} must be a number")
+    return StaticSpec(
+        name, description, url=f.get("url"), file=f.get("file"), variable=f["variable"], aggregation=aggregation,
+        clip=tuple(None if v is None else float(v) for v in clip), scale=float(f.get("scale", 1.0)), offset=float(f.get("offset", 0.0)),
+    )
+
+
 def load_feature_config(config_path: str) -> FeatureConfig:
     """Reads the "features" section of the shared config.json; the raw settings come from download_raw."""
     raw = dr.load_config(config_path)
@@ -264,6 +343,10 @@ def load_feature_config(config_path: str) -> FeatureConfig:
         raise ValueError("labels need \"glm\" in the download list")
     if len({l.name for l in labels}) != len(labels):
         raise ValueError("label names must be unique")
+
+    static = tuple(_parse_static(i, f) for i, f in enumerate(section.get("static", [])))
+    if len({f.name for f in static}) != len(static):
+        raise ValueError("static field names must be unique")
 
     grid = section.get("grid", {})
     resolution_km = grid.get("resolution_km", 4)
@@ -318,6 +401,8 @@ def load_feature_config(config_path: str) -> FeatureConfig:
         glm_min_coverage=_fraction(glm.get("min_coverage", 0.95), "features.glm.min_coverage"),
         channels=channels,
         labels=labels,
+        static=static,
+        static_cache_dir=str(section.get("static_cache_dir", "./goes_static")),
     )
     make_plan(cfg)  # checks expression references and cycles
     return cfg
@@ -458,7 +543,7 @@ def make_plan(cfg: FeatureConfig) -> Plan:
     for c in order:  # dependencies first, so need[r] is known
         if c.kind == "product":
             need[c.name] = c.fill_gaps_slots
-        elif c.kind == "glm":
+        elif c.kind in ("glm", "solar"):
             need[c.name] = 0
         else:
             need[c.name] = max((off + need[r] for r, off in refs[c.name]), default=0)
@@ -586,6 +671,70 @@ def glm_projection(projection: Dict[str, Any], ellipsoid_km: Optional[Tuple[floa
         "semi_minor_axis": float(projection["semi_minor_axis"]) + pol,
         "perspective_point_height": float(projection["perspective_point_height"]) - eq,
     }
+
+
+class SolarGeometry:
+    """
+    Sun position per cell with the algorithm of NOAA's solar calculator (after Meeus, Astronomical
+    Algorithms): about 0.01 deg in declination and a few seconds in solar time, against a scan that can
+    fall anywhere in its 5-min slot. Local solar time t (true solar time, 0-24 h) is given as sin/cos of
+    2 pi t / 24 h, so it has no jump at midnight: noon is (0, -1), midnight (0, 1).
+    """
+
+    def __init__(self, lat: np.ndarray, lon: np.ndarray):
+        phi, lam = np.radians(lat.astype(np.float64)), np.radians(lon.astype(np.float64))
+        self.sin_phi, self.cos_phi = np.sin(phi), np.cos(phi)
+        self.sin_lam, self.cos_lam = np.sin(lam), np.cos(lam)
+
+    @staticmethod
+    def sun(t_ns: int) -> Tuple[float, float]:
+        """(declination in rad, equation of time in minutes) at t (ns since 1970, UTC)."""
+        T = (t_ns / 86400e9 + 2440587.5 - 2451545.0) / 36525  # Julian centuries since J2000
+        rad = math.radians
+        l0 = rad((280.46646 + T * (36000.76983 + 0.0003032 * T)) % 360)  # mean longitude
+        m = rad(357.52911 + T * (35999.05029 - 0.0001537 * T))  # mean anomaly
+        e = 0.016708634 - T * (0.000042037 + 0.0000001267 * T)  # orbit eccentricity
+        centre = rad(math.sin(m) * (1.914602 - T * (0.004817 + 0.000014 * T))
+                     + math.sin(2 * m) * (0.019993 - 0.000101 * T) + math.sin(3 * m) * 0.000289)
+        omega = rad(125.04 - 1934.136 * T)
+        apparent_longitude = l0 + centre - rad(0.00569 + 0.00478 * math.sin(omega))
+        mean_obliquity = 23 + (26 + (21.448 - T * (46.815 + T * (0.00059 - T * 0.001813))) / 60) / 60
+        obliquity = rad(mean_obliquity + 0.00256 * math.cos(omega))
+        decl = math.asin(math.sin(obliquity) * math.sin(apparent_longitude))
+        y = math.tan(obliquity / 2) ** 2
+        eqtime = 4 * math.degrees(y * math.sin(2 * l0) - 2 * e * math.sin(m) + 4 * e * y * math.sin(m) * math.cos(2 * l0)
+                                  - 0.5 * y * y * math.sin(4 * l0) - 1.25 * e * e * math.sin(2 * m))
+        return decl, eqtime
+
+    def frames(self, t_ns: int) -> Dict[str, np.ndarray]:
+        decl, eqtime = self.sun(t_ns)
+        minutes = (t_ns % (86400 * 10**9)) / 60e9
+        # True solar time as an angle: (minutes + eqtime) / 1440 turns at Greenwich, plus the longitude
+        b = 2 * math.pi * (minutes + eqtime) / 1440
+        day_cos = math.cos(b) * self.cos_lam - math.sin(b) * self.sin_lam
+        day_sin = math.sin(b) * self.cos_lam + math.cos(b) * self.sin_lam
+        # The hour angle is that angle minus pi, so cos(hour angle) = -day_cos
+        cos_zenith = self.sin_phi * math.sin(decl) - self.cos_phi * math.cos(decl) * day_cos
+        return {
+            "cos_zenith": cos_zenith.astype(np.float32),
+            "local_hour_sin": day_sin.astype(np.float32),
+            "local_hour_cos": day_cos.astype(np.float32),
+        }
+
+
+def satellite_zenith_deg(lat: np.ndarray, lon: np.ndarray, projection: Dict[str, Any]) -> np.ndarray:
+    """Angle between the local vertical and the direction to the satellite, on the ground ellipsoid (deg)."""
+    a, b = float(projection["semi_major_axis"]), float(projection["semi_minor_axis"])
+    r_sat = a + float(projection["perspective_point_height"])
+    lon0 = math.radians(float(projection["longitude_of_projection_origin"]))
+    phi, lam = np.radians(lat.astype(np.float64)), np.radians(lon.astype(np.float64))
+    e2 = 1 - (b / a) ** 2
+    n = a / np.sqrt(1 - e2 * np.sin(phi) ** 2)
+    up = (np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi))  # ellipsoid normal
+    point = (n * up[0], n * up[1], n * (1 - e2) * up[2])
+    to_sat = (r_sat * math.cos(lon0) - point[0], r_sat * math.sin(lon0) - point[1], -point[2])
+    cos_z = sum(v * u for v, u in zip(to_sat, up)) / np.sqrt(sum(v * v for v in to_sat))
+    return np.degrees(np.arccos(np.clip(cos_z, -1.0, 1.0))).astype(np.float32)
 
 
 def _nominal_km(step_rad: float, projection: Dict[str, Any]) -> float:
@@ -902,6 +1051,242 @@ def neighbourhood_sum(a: np.ndarray, offsets: List[Tuple[int, int]]) -> np.ndarr
 
 
 # =============================================================================
+# Static fields (terrain, land fraction, viewing geometry)
+# =============================================================================
+
+@dataclass
+class StaticFields:
+    """The configured static fields on the grid, computed once per run and written to every day store."""
+
+    specs: Tuple[StaticSpec, ...]
+    values: np.ndarray  # (field, y, x) float32
+
+    def stats(self) -> Dict[str, Dict[str, Any]]:
+        out = {}
+        for spec, v in zip(self.specs, self.values):
+            st = ChannelStats()
+            st.add(v)
+            out[spec.name] = st.as_dict()
+        return out
+
+
+def _latlon_names(ds: Any) -> Tuple[str, str]:
+    names = set(ds.variables)
+    lat = next((n for n in ("lat", "latitude") if n in names), None)
+    lon = next((n for n in ("lon", "longitude") if n in names), None)
+    if lat is None or lon is None:
+        raise ValueError(f"no lat/lon (or latitude/longitude) variables among {sorted(names)}")
+    return lat, lon
+
+
+def _box_slices(lat: np.ndarray, lon: np.ndarray, box: Tuple[float, float, float, float]) -> Tuple[slice, slice]:
+    """Rows and columns of a regular lat/lon grid covering box = (lat_min, lat_max, lon_min, lon_max)."""
+    lat_min, lat_max, lon_min, lon_max = box
+    if float(np.nanmax(lon)) > 180:  # 0..360 source
+        lon_min, lon_max = lon_min % 360, lon_max % 360
+        if lon_min > lon_max:
+            raise ValueError("the grid crosses the source's 0/360 longitude seam, which is not supported")
+    rows = np.nonzero((lat >= lat_min) & (lat <= lat_max))[0]
+    cols = np.nonzero((lon >= lon_min) & (lon <= lon_max))[0]
+    if rows.size < 2 or cols.size < 2:
+        raise ValueError(f"the source does not cover lat {lat_min:.1f}..{lat_max:.1f}, lon {box[2]:.1f}..{box[3]:.1f}")
+    return slice(int(rows[0]), int(rows[-1]) + 1), slice(int(cols[0]), int(cols[-1]) + 1)
+
+
+def static_source_path(cfg: FeatureConfig, spec: StaticSpec) -> str:
+    if spec.file:
+        return spec.file
+    name = os.path.basename(urllib.parse.urlparse(spec.url).path)
+    name = name[:-3] if name.endswith(".gz") else name
+    if "/dodsC/" in spec.url:  # OPeNDAP: only a subset is saved
+        name = os.path.splitext(name)[0] + "_subset.nc"
+    return os.path.join(cfg.static_cache_dir, name)
+
+
+def fetch_static_source(url: str, path: str, variable: str, box: Tuple[float, float, float, float]) -> None:
+    """
+    Saves a lat/lon source locally: OPeNDAP URLs (".../dodsC/...") are read over the network for the
+    box only and saved as NetCDF; anything else is downloaded whole (and gunzipped if it ends in .gz).
+    """
+    import netCDF4 as nc
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    dr.log(f"downloading static source {url}")
+    if "/dodsC/" in url:
+        with nc.Dataset(url) as src:
+            lat_name, lon_name = _latlon_names(src)
+            lat, lon = src[lat_name][:], src[lon_name][:]
+            rows, cols = _box_slices(np.asarray(lat), np.asarray(lon), box)
+            values = np.ma.filled(np.ma.asarray(src[variable][rows, cols], dtype=np.float32), np.nan)
+            with nc.Dataset(tmp, "w") as out:
+                out.source_url = url
+                out.createDimension("lat", values.shape[0])
+                out.createDimension("lon", values.shape[1])
+                out.createVariable("lat", "f8", ("lat",))[:] = lat[rows]
+                out.createVariable("lon", "f8", ("lon",))[:] = lon[cols]
+                var = out.createVariable(variable, "f4", ("lat", "lon"), zlib=True, fill_value=np.float32(np.nan))
+                with warnings.catch_warnings():  # netCDF4 sets an array's shape, which NumPy >= 2.5 deprecates
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    var[:] = values
+    else:
+        request = urllib.request.Request(url, headers={"User-Agent": "goes_downloader"})
+        with urllib.request.urlopen(request, timeout=300) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(gzip.GzipFile(fileobj=r) if url.endswith(".gz") else r, f)
+    os.replace(tmp, path)
+
+
+def read_static_source(path: str, variable: str, box: Tuple[float, float, float, float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(lat, lon, values[lat, lon]) of a regular lat/lon source over the box; fill values become NaN."""
+    import netCDF4 as nc
+
+    with nc.Dataset(path) as ds:
+        lat_name, lon_name = _latlon_names(ds)
+        lat, lon = np.asarray(ds[lat_name][:], np.float64), np.asarray(ds[lon_name][:], np.float64)
+        rows, cols = _box_slices(lat, lon, box)
+        var = ds[variable]
+        if var.dimensions == (lon_name, lat_name):
+            values = var[cols, rows].T
+        elif var.dimensions == (lat_name, lon_name):
+            values = var[rows, cols]
+        else:
+            raise ValueError(f"{path}: {variable} has dimensions {var.dimensions}, expected ({lat_name}, {lon_name})")
+        return lat[rows], lon[cols], np.ma.filled(np.ma.asarray(values, dtype=np.float32), np.nan)
+
+
+def _covers(lat: np.ndarray, lon: np.ndarray, box: Tuple[float, float, float, float]) -> bool:
+    lon180 = (lon + 180) % 360 - 180
+    return lat.min() <= box[0] + 0.1 and lat.max() >= box[1] - 0.1 and lon180.min() <= box[2] + 0.1 and lon180.max() >= box[3] - 0.1
+
+
+def _bilinear(lat: np.ndarray, lon: np.ndarray, values: np.ndarray, qlat: np.ndarray, qlon: np.ndarray) -> np.ndarray:
+    """Bilinear interpolation on a regular lat/lon grid, ignoring NaN corners; NaN outside the grid."""
+    if lon.max() > 180:
+        qlon = qlon % 360
+    fi = (qlat - lat[0]) / (lat[1] - lat[0])
+    fj = (qlon - lon[0]) / (lon[1] - lon[0])
+    inside = (fi >= 0) & (fi <= len(lat) - 1) & (fj >= 0) & (fj <= len(lon) - 1)
+    i0 = np.clip(np.floor(np.nan_to_num(fi)), 0, len(lat) - 2).astype(np.int64)
+    j0 = np.clip(np.floor(np.nan_to_num(fj)), 0, len(lon) - 2).astype(np.int64)
+    wi, wj = np.clip(np.nan_to_num(fi) - i0, 0, 1), np.clip(np.nan_to_num(fj) - j0, 0, 1)
+    total = np.zeros(qlat.shape)
+    weight = np.zeros(qlat.shape)
+    for di, dj, w in ((0, 0, (1 - wi) * (1 - wj)), (0, 1, (1 - wi) * wj), (1, 0, wi * (1 - wj)), (1, 1, wi * wj)):
+        v = values[i0 + di, j0 + dj]
+        ok = np.isfinite(v)
+        total += np.where(ok, v * w, 0.0)
+        weight += np.where(ok, w, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = total / weight
+    out[~inside | (weight == 0)] = np.nan
+    return out
+
+
+def regrid_static_source(specs: List[StaticSpec], lat: np.ndarray, lon: np.ndarray, values: np.ndarray,
+                         grid: TargetGrid, cell_lat: np.ndarray, cell_lon: np.ndarray) -> List[np.ndarray]:
+    """
+    Puts one lat/lon source on the grid for each spec (which may differ in aggregation, clip, scale).
+    A source finer than the cells is aggregated over the source pixels whose centres fall in each cell;
+    a coarser one is interpolated bilinearly at the cell centres.
+    """
+    n_cells = grid.ny * grid.nx
+    lon180 = (lon + 180) % 360 - 180
+
+    def transform(spec: StaticSpec, v: np.ndarray) -> np.ndarray:
+        v = v.astype(np.float64) * spec.scale + spec.offset
+        low, high = spec.clip
+        return np.clip(v, -np.inf if low is None else low, np.inf if high is None else high)
+
+    n_pixels = np.zeros(n_cells)
+    acc = [dict(n=np.zeros(n_cells), s=np.zeros(n_cells), ss=np.zeros(n_cells),
+                mn=np.full(n_cells, np.inf), mx=np.full(n_cells, -np.inf)) for _ in specs]
+    chunk = max(1, 2_000_000 // len(lon))
+    for r0 in range(0, len(lat), chunk):
+        la, lo = np.meshgrid(lat[r0 : r0 + chunk], lon180, indexing="ij")
+        x, y = dr.latlon_to_scan_angle(la.ravel(), lo.ravel(), grid.projection)
+        cells = grid.cells_of(np.asarray(x), np.asarray(y))
+        inside = cells >= 0
+        c = cells[inside]
+        n_pixels += np.bincount(c, minlength=n_cells)
+        raw = values[r0 : r0 + chunk].ravel()[inside]
+        for spec, a in zip(specs, acc):
+            v = transform(spec, raw)
+            ok = np.isfinite(v)
+            a["n"] += np.bincount(c[ok], minlength=n_cells)
+            a["s"] += np.bincount(c[ok], weights=v[ok], minlength=n_cells)
+            a["ss"] += np.bincount(c[ok], weights=v[ok] * v[ok], minlength=n_cells)
+            if spec.aggregation in ("min", "max"):
+                np.fmin.at(a["mn"], c[ok], v[ok]) if spec.aggregation == "min" else np.fmax.at(a["mx"], c[ok], v[ok])
+
+    on_earth = np.isfinite(cell_lat).ravel()
+    fine = (n_pixels[on_earth] > 0).mean() >= 0.99 if on_earth.any() else False
+    out = []
+    for spec, a in zip(specs, acc):
+        interp = transform(spec, _bilinear(lat, lon, values, cell_lat.ravel().astype(np.float64), cell_lon.ravel().astype(np.float64)))
+        if not fine:
+            if spec.aggregation != "mean":
+                raise ValueError(f"static field {spec.name!r}: the source is coarser than the grid, so only aggregation \"mean\" (interpolation) works")
+            field = interp
+        else:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mean = a["s"] / a["n"]
+                field = {
+                    "mean": mean,
+                    "std": np.sqrt(np.maximum(a["ss"] / a["n"] - mean * mean, 0.0)),
+                    "min": np.where(np.isfinite(a["mn"]), a["mn"], np.nan),
+                    "max": np.where(np.isfinite(a["mx"]), a["mx"], np.nan),
+                }[spec.aggregation]
+            if spec.aggregation == "mean":  # the odd cell without a source pixel
+                field = np.where(a["n"] > 0, field, interp)
+        field = np.where(on_earth, field, np.nan)
+        out.append(field.reshape(grid.ny, grid.nx).astype(np.float32))
+    return out
+
+
+def make_static(cfg: FeatureConfig, grid: TargetGrid) -> Optional[StaticFields]:
+    if not cfg.static:
+        return None
+    lat, lon = grid_latlon(grid)
+    ok = np.isfinite(lat)
+    box = (float(lat[ok].min()) - 1, float(lat[ok].max()) + 1, float(lon[ok].min()) - 1, float(lon[ok].max()) + 1)
+    fields: Dict[str, np.ndarray] = {}
+
+    by_source: Dict[Tuple[str, str], List[StaticSpec]] = {}
+    for spec in cfg.static:
+        if spec.geometry == "satellite_zenith":
+            fields[spec.name] = satellite_zenith_deg(lat, lon, grid.projection)
+        elif spec.geometry in ("latitude", "longitude"):
+            fields[spec.name] = (lat if spec.geometry == "latitude" else lon).astype(np.float32)
+        else:
+            by_source.setdefault((static_source_path(cfg, spec), spec.variable), []).append(spec)
+
+    for (path, variable), specs in by_source.items():
+        url = next((s.url for s in specs if s.url), None)
+        if not os.path.exists(path):
+            if url is None:
+                raise ValueError(f"static source {path} does not exist and no url is configured")
+            fetch_static_source(url, path, variable, box)
+        src_lat, src_lon, values = read_static_source(path, variable, box)
+        if not _covers(src_lat, src_lon, box) and url is not None and "/dodsC/" in url:
+            fetch_static_source(url, path, variable, box)  # a subset saved for a smaller grid
+            src_lat, src_lon, values = read_static_source(path, variable, box)
+        for spec, field in zip(specs, regrid_static_source(specs, src_lat, src_lon, values, grid, lat, lon)):
+            fields[spec.name] = field
+
+    return StaticFields(cfg.static, np.stack([fields[s.name] for s in cfg.static]))
+
+
+def static_attrs(f: StaticSpec) -> Dict[str, Any]:
+    if f.geometry:
+        d: Dict[str, Any] = {"name": f.name, "geometry": f.geometry}
+    else:
+        d = {"name": f.name, "url": f.url, "file": f.file, "variable": f.variable, "aggregation": f.aggregation,
+             "clip": list(f.clip), "scale": f.scale, "offset": f.offset}
+        d = {k: v for k, v in d.items() if v is not None}
+    return {**d, "description": f.description} if f.description else d
+
+
+# =============================================================================
 # Per-day build
 # =============================================================================
 
@@ -939,6 +1324,8 @@ def channel_attrs(c: ChannelSpec) -> Dict[str, Any]:
                  fill_gaps_minutes=c.fill_gaps_slots * SLOT_MINUTES)
     elif c.kind == "glm":
         d = {"name": c.name, "glm": c.glm_stat}
+    elif c.kind == "solar":
+        d = {"name": c.name, "solar": c.solar}
     else:
         d = {"name": c.name, "expr": c.expr}
     return {**d, "description": c.description} if c.description else d
@@ -950,8 +1337,8 @@ def label_attrs(l: LabelSpec) -> Dict[str, Any]:
     return {**d, "description": l.description} if l.description else d
 
 
-def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, Any]:
-    """Builds one day's feature store. Runs in a worker process."""
+def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str, static: Optional[StaticFields] = None) -> Dict[str, Any]:
+    """Builds one day's feature store. Runs in a worker process; static comes from make_static (computed if None)."""
     t_start = time.monotonic()
     day = datetime.strptime(day_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     out_path = features_day_path(cfg, day)
@@ -960,9 +1347,13 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     if raw.day(s_day // SLOTS_PER_DAY).root is None:
         return {"day": day_iso, "status": "no raw store", "complete": False}
 
+    if static is None and cfg.static:
+        static = make_static(cfg, grid)
     plan = make_plan(cfg)
     step = cfg.time_step_slots
     shape = (grid.ny, grid.nx)
+    lat, lon = grid_latlon(grid)
+    solar = SolarGeometry(lat, lon) if any(c.kind == "solar" for c in cfg.channels) else None
     s0 = s_day - plan.lookback
     out_slots = list(range(s_day, s_day + SLOTS_PER_DAY, step))
     outputs = [c for c in cfg.channels if c.output]
@@ -1046,6 +1437,10 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
                 frame = product_frame(ch, s, per_slot)
                 if ch.fill_gaps_slots:
                     frame = fill_gaps(ch, s, frame)
+            elif ch.kind == "solar":
+                if "solar" not in per_slot:  # at the middle of the slot, close to the scan time
+                    per_slot["solar"] = solar.frames(s * SLOT_NS + SLOT_NS // 2)
+                frame = per_slot["solar"][ch.solar]
             elif ch.kind == "glm":
                 if glm.coverage_mean(s, s + 1) < cfg.glm_min_coverage:
                     frame = np.full(shape, np.nan, dtype=np.float32)
@@ -1099,7 +1494,6 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     dr._write_array(root, "channel", np.array([c.name for c in outputs]), ["channel"])
     dr._write_array(root, "x", grid.x(), ["x"], units="rad", long_name="ABI fixed grid E/W scan angle")
     dr._write_array(root, "y", grid.y(), ["y"], units="rad", long_name="ABI fixed grid N/S scan angle")
-    lat, lon = grid_latlon(grid)
     dr._write_array(root, "lat", lat, ["y", "x"], units="degrees_north")
     dr._write_array(root, "lon", lon, ["y", "x"], units="degrees_east")
     dr._write_array(root, "channel_valid_fraction", valid_fraction, ["time", "channel"])
@@ -1107,6 +1501,10 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         dr._write_array(root, "label", np.array([l.name for l in cfg.labels]), ["label"])
     if glm is not None:
         dr._write_array(root, "glm_coverage", glm_coverage, ["time"])
+    if static is not None:
+        dr._write_array(root, "static", static.values, ["static_channel", "y", "x"], coordinates="lat lon",
+                        zarr=dict(chunks=(1, cy, cx), compressor=dr.COMPRESSOR))
+        dr._write_array(root, "static_channel", np.array([f.name for f in static.specs]), ["static_channel"])
 
     raw_days = {}
     for d, rd in sorted(raw.days.items()):
@@ -1128,9 +1526,11 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "channels": [channel_attrs(c) for c in outputs],
             "helper_channels": [channel_attrs(c) for c in cfg.channels if not c.output],
             "labels": [label_attrs(l) for l in cfg.labels],
+            "static": [static_attrs(f) for f in cfg.static],
             "glm": {"quality_flags": cfg.glm_quality_flags, "lightning_ellipsoid_km": cfg.glm_ellipsoid_km, "min_coverage": cfg.glm_min_coverage},
             "channel_stats": {name: st.as_dict() for name, st in stats.items()},
             "label_stats": {name: {"n_known": n, "n_positive": p} for name, (n, p) in label_counts.items()},
+            "static_stats": static.stats() if static is not None else {},
             "n_cells_per_time": grid.ny * grid.nx,
             "n_flashes": n_flashes,
             "float16_overflow": {k: v for k, v in n_overflow.items() if v},
@@ -1156,6 +1556,18 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
 # Runner
 # =============================================================================
 
+_WORKER_STATIC: Optional[StaticFields] = None
+
+
+def _init_worker(static: Optional[StaticFields]) -> None:
+    global _WORKER_STATIC
+    _WORKER_STATIC = static
+
+
+def _build_day_in_worker(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, Any]:
+    return build_day(cfg, grid, day_iso, _WORKER_STATIC)
+
+
 def run_build(cfg: FeatureConfig) -> None:
     days = [d.date().isoformat() for d in dr.iter_days_utc(cfg.start_date_utc, cfg.end_date_utc)]
     grid = make_grid(cfg)
@@ -1179,12 +1591,18 @@ def run_build(cfg: FeatureConfig) -> None:
             continue
         todo.append(d)
     dr.log(f"{len(days) - len(todo)} of {len(days)} days already complete; building {len(todo)}")
+    static = make_static(cfg, grid) if todo else None
+    if static is not None:
+        summary = ", ".join(f"{f.name} {np.nanmin(v):.4g}..{np.nanmax(v):.4g}" for f, v in zip(static.specs, static.values))
+        dr.log(f"static fields: {summary}")
 
     ok, failed, total_bytes, t0 = [], [], 0, time.monotonic()
     workers = min(cfg.max_workers, max(1, len(todo)))
     # Workers start fresh (spawn) so no zarr/numpy thread state is inherited from this process
-    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
-        futures = {pool.submit(build_day, cfg, grid, d): d for d in todo}
+    # The static fields go to each worker once, not with every day
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                             initializer=_init_worker, initargs=(static,)) as pool:
+        futures = {pool.submit(_build_day_in_worker, cfg, grid, d): d for d in todo}
         for i, fut in enumerate(as_completed(futures), 1):
             d = futures[fut]
             try:
@@ -1214,8 +1632,9 @@ def run_build(cfg: FeatureConfig) -> None:
 def run_stats(cfg: FeatureConfig) -> None:
     """Combines the per-day sums into mean/std per channel and positive rates per label."""
     sums: Dict[str, Dict[str, float]] = {}
+    static_sums: Dict[str, Dict[str, float]] = {}
     labels: Dict[str, List[int]] = {}
-    used, incomplete, missing, cells = [], [], [], 0
+    used, incomplete, missing, cells, cells_per_day = [], [], [], 0, 0
     for day in dr.iter_days_utc(cfg.start_date_utc, cfg.end_date_utc):
         path = features_day_path(cfg, day)
         if not os.path.exists(os.path.join(path, ".zgroup")):
@@ -1224,13 +1643,15 @@ def run_stats(cfg: FeatureConfig) -> None:
         attrs = zarr.open_consolidated(path, mode="r").attrs
         (used if attrs.get("complete") else incomplete).append(day.date().isoformat())
         cells += attrs["n_cells_per_time"] * len(range(0, SLOTS_PER_DAY, attrs["time_step_minutes"] // SLOT_MINUTES))
-        for name, st in attrs["channel_stats"].items():
-            acc = sums.setdefault(name, {"count": 0, "sum": 0.0, "sum_sq": 0.0, "min": math.inf, "max": -math.inf})
-            acc["count"] += st["count"]
-            acc["sum"] += st["sum"]
-            acc["sum_sq"] += st["sum_sq"]
-            if st["count"]:
-                acc["min"], acc["max"] = min(acc["min"], st["min"]), max(acc["max"], st["max"])
+        cells_per_day = attrs["n_cells_per_time"]
+        for target, day_stats in ((sums, attrs["channel_stats"]), (static_sums, attrs.get("static_stats", {}))):
+            for name, st in day_stats.items():
+                acc = target.setdefault(name, {"count": 0, "sum": 0.0, "sum_sq": 0.0, "min": math.inf, "max": -math.inf})
+                acc["count"] += st["count"]
+                acc["sum"] += st["sum"]
+                acc["sum_sq"] += st["sum_sq"]
+                if st["count"]:
+                    acc["min"], acc["max"] = min(acc["min"], st["min"]), max(acc["max"], st["max"])
         for name, st in attrs["label_stats"].items():
             acc_l = labels.setdefault(name, [0, 0])
             acc_l[0] += st["n_known"]
@@ -1238,13 +1659,17 @@ def run_stats(cfg: FeatureConfig) -> None:
 
     if not used and not incomplete:
         raise SystemExit(f"no feature stores between {cfg.start_date_utc} and {cfg.end_date_utc}")
-    channels = {}
-    for name, a in sums.items():
+    def summarise(a: Dict[str, float], total: int) -> Dict[str, Any]:
         n = a["count"]
         mean = a["sum"] / n if n else None
         std = math.sqrt(max(a["sum_sq"] / n - mean * mean, 0.0)) if n else None
-        channels[name] = {"mean": mean, "std": std, "min": a["min"] if n else None, "max": a["max"] if n else None,
-                          "valid_fraction": n / cells if cells else None}
+        return {"mean": mean, "std": std, "min": a["min"] if n else None, "max": a["max"] if n else None,
+                "valid_fraction": n / total if total else None}
+
+    n_days = len(used) + len(incomplete)
+    channels = {name: summarise(a, cells) for name, a in sums.items()}
+    # Every day holds the same static fields, so their valid fraction is per day
+    static = {name: summarise(a, cells_per_day * n_days) for name, a in static_sums.items()}
     result = {
         "start_date_utc": cfg.start_date_utc,
         "end_date_utc": cfg.end_date_utc,
@@ -1252,6 +1677,7 @@ def run_stats(cfg: FeatureConfig) -> None:
         "days_incomplete": incomplete,
         "days_missing": missing,
         "channels": channels,
+        "static": static,
         "labels": {name: {"positive_fraction": p / n if n else None, "known_fraction": n / cells if cells else None}
                    for name, (n, p) in labels.items()},
     }
@@ -1260,7 +1686,7 @@ def run_stats(cfg: FeatureConfig) -> None:
         json.dump(result, f, indent=2)
 
     print(f"{'channel':24s} {'mean':>12s} {'std':>12s} {'min':>12s} {'max':>12s} {'valid':>6s}")
-    for name, c in channels.items():
+    for name, c in list(channels.items()) + [(f"{n} (static)", c) for n, c in static.items()]:
         if c["mean"] is None:
             print(f"{name:24s} {'(no data)':>12s}")
             continue

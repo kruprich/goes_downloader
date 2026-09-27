@@ -95,6 +95,9 @@ grids. `build_day` (one worker process per day, spawn) evaluates every channel s
 keeping only the slots `lag`/`*_past` still need (`Plan.depth`). `RawTimeline` maps global slots
 (5-min slots since 1970) to raw day stores; `GlmTimeline` holds the quality-filtered flashes on the
 grid plus per-slot coverage for the lookback through the label lookahead (the next day's store).
+`make_static` computes the static fields once per run in the main process (sources cached in
+`static_cache_dir`, OPeNDAP ones re-fetched if a larger grid needs more area); the pool initializer
+hands them to each worker once.
 
 **Feature invariants:**
 - Per-axis `AxisMap`: sources at least as fine as a cell are reduced over the pixels whose centres
@@ -111,6 +114,10 @@ grid plus per-slot coverage for the lookback through the label lookahead (the ne
   and anything reading them must convert to float32 before summing.
 - A feature day is `complete` only if its raw day and every neighbouring raw day it read are
   complete, except neighbours outside the download date range, which never arrive.
+- Solar channels use NOAA's solar-calculator (Meeus) algorithm at the slot middle; checked against
+  astropy to 0.014 deg and 3 s. NOAA's shorter Spencer-style formula is 0.4 deg off near equinoxes.
+- `static` has no time dimension. Readers must open days with `data_vars="minimal",
+  coords="minimal", compat="override"`, or xarray adds a time dimension to it.
 
 ## Conventions
 
@@ -121,5 +128,6 @@ grid plus per-slot coverage for the lookback through the label lookahead (the ne
 - Raw output goes to `raw_output_root_dir` (default `./goes_raw`, git-ignored). Current config: about
   2.1 GB/day stored with the NOAA CONUS bounds (~700 GB over the date range) and 6–8 GB/day
   downloaded, since whole files are fetched regardless of bounds.
-- Features go to `features.output_root_dir` (default `./goes_features`, git-ignored). Current
-  config: about 0.5 GB/day (~160 GB over the date range), ~35 s per day per worker.
+- Features go to `features.output_root_dir` (default `./goes_features`, git-ignored), static
+  sources to `features.static_cache_dir` (`./goes_static`, git-ignored, ~35 MB). Current config:
+  about 0.55 GB/day (~180 GB over the date range), ~40 s per day per worker.

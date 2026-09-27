@@ -315,11 +315,21 @@
       {"name": "lifted_index", "product": "dsi_li", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
       {"name": "k_index", "product": "dsi_ki", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
       {"name": "flashes", "glm": "count", "output": false, "description": "flashes starting in each 5-min slot (helper)"},
-      {"name": "flashes_past_15min", "expr": "sum_past(flashes, 15)", "description": "flashes in the 15 min before the issue time"}
+      {"name": "flashes_past_15min", "expr": "sum_past(flashes, 15)", "description": "flashes in the 15 min before the issue time"},
+      {"name": "cos_sza", "solar": "cos_zenith", "description": "cosine of the solar zenith angle at the scan: 1 with the sun overhead, below 0 at night"},
+      {"name": "local_hour_sin", "solar": "local_hour_sin", "description": "sin of 2 pi x local solar time / 24 h"},
+      {"name": "local_hour_cos", "solar": "local_hour_cos", "description": "cos of 2 pi x local solar time / 24 h: -1 at solar noon, 1 at midnight"}
     ],
     "labels": [
       {"name": "lightning_next_30min", "start_minutes": 0, "end_minutes": 30, "radius_cells": 2, "description": "a flash within 2 cells in the 30 min after the issue time"},
       {"name": "lightning_next_60min", "start_minutes": 0, "end_minutes": 60, "radius_cells": 2, "description": "a flash within 2 cells in the 60 min after the issue time"}
+    ],
+    "static_cache_dir": "./goes_static",
+    "static": [
+      {"name": "elevation", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "clip": [0, null], "description": "m, mean of NOAA ETOPO 2022 (1.85 km) over the cell; sea is 0, large lakes show their floor"},
+      {"name": "elevation_std", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "aggregation": "std", "clip": [0, null], "description": "terrain roughness (m): standard deviation of elevation within the cell"},
+      {"name": "land_fraction", "url": "https://gpm.nasa.gov/sites/default/files/downloads/IMERG_land_sea_mask.nc.gz", "variable": "landseamask", "scale": -0.01, "offset": 1.0, "clip": [0, 1], "description": "1 land, 0 water (ocean and lakes), from NASA's 0.1 degree IMERG mask, interpolated"},
+      {"name": "satellite_zenith", "geometry": "satellite_zenith", "description": "deg between the local vertical and the direction to GOES"}
     ]
   }
 }

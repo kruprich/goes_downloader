@@ -1,6 +1,7 @@
 # Pipeline output
 goes_raw/
 goes_features/
+goes_static/
 goes_abi_glm/
 *.zarr
 *.zarr.tmp

@@ -158,8 +158,8 @@ python build_features.py --config config.json --start 2025-10-16 --end 2026-05-3
 
 `--start`, `--end`, `--workers` and `--overwrite` override the config for one run. `--stats` builds
 nothing: it combines the per-day sums of the days in the range into
-`goes_features/stats_<start>_<end>.json` (mean, std, min, max and valid fraction per channel, positive
-fraction per label). Run it over the training days only, so normalisation doesn't see the test period.
+`goes_features/stats_<start>_<end>.json` (mean, std, min, max and valid fraction per channel and static
+field, positive fraction per label). Run it over the training days only, so normalisation doesn't see the test period.
 
 A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
 before for lags and gap filling, the day after for labels. Neighbours outside the download date range
@@ -203,6 +203,12 @@ values from exactly one of:
 - **`glm`**: GLM flashes starting in each 5-minute slot, per cell: `count`, `energy_fj` (total optical
   energy, femtojoules) or `area_km2` (total flash area). Missing when GLM covered less than
   `glm.min_coverage` of the slot.
+- **`solar`**: the sun's position per cell at the middle of the 5-minute slot: `cos_zenith` (1 with the
+  sun overhead, 0 at sunrise and sunset, negative at night), or local solar time as `local_hour_sin` and
+  `local_hour_cos` (sin and cos of 2π × solar time / 24 h, so noon is (0, −1), midnight (0, 1), and
+  there is no jump at midnight). Both follow each cell's longitude, which UTC time can't: CONUS spans
+  about 4 hours of local time. cos(zenith) alone can't tell morning from afternoon, hence the solar time
+  too. Computed with the algorithm of NOAA's solar calculator, within 0.02° of astropy.
 - **`expr`**: an expression over other channels with `+ - * / **`, numbers and these functions:
   `lag(x, minutes)` (the value `minutes` earlier), `sum_past`, `mean_past`, `min_past`, `max_past(x, minutes)`
   (over the slots of the last `minutes`, the current one included), `abs`, `sqrt`, `log1p`, `exp`,
@@ -210,7 +216,8 @@ values from exactly one of:
 
 The default channels are the four IR bands, the coldest pixel of band 13 in each cell, the 6.2 − 10.3 µm
 difference, the 15-minute change of band 13, cloud-top height, TPW, CAPE, lifted index, K-index (gap-filled
-up to 60 minutes) and the flashes of the last 15 minutes.
+up to 60 minutes), the flashes of the last 15 minutes, and the sun's position (cos zenith and local solar
+time).
 
 Other options: `dtype` (`float16`, or `float32`; float16 keeps about 3 significant digits and overflows
 above 65504, so sums such as `energy_fj` should go through `log1p` or use `float32`; values that overflow
@@ -239,12 +246,43 @@ direction ABI, on the same satellite, views the cloud top from. `null` reads the
 instead, which moves flashes about 2 km (up to 4 km) over CONUS; the shift is small because the lightning
 ellipsoid is flatter, which moves a given latitude south and cancels most of the height's parallax.
 
+### Static fields
+
+`features.static` lists fields that don't change with time. They are computed once per run and stored in
+every day store as `static[static_channel, y, x]` (float32), not repeated for each time step. Each entry
+has a `name`, an optional `description`, and either:
+
+- **`geometry`**: `satellite_zenith` (degrees between the local vertical and the direction to GOES;
+  infrared temperatures read a little colder and pixels are larger at high angles), `latitude` or
+  `longitude`.
+- **a lat/lon source**: `variable` of a NetCDF file on a regular lat/lon grid, from a local `file` and/or
+  a `url`. A `url` is downloaded once into `static_cache_dir` (`./goes_static`); OPeNDAP URLs
+  (`.../dodsC/...`) are read for the grid's area only. A source finer than the cells is aggregated over
+  the source pixels in each cell (`aggregation`: `mean`, `std`, `min` or `max`); a coarser one is
+  interpolated bilinearly at the cell centres. `scale` and `offset` (value × scale + offset), then `clip`
+  (`[low, high]`, `null` for no limit), apply to the source values first.
+
+The defaults:
+
+| Field | Source | Notes |
+|---|---|---|
+| `elevation` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model), 60 arc-seconds (1.85 km), about 30 MB | Cell mean (m). Clipped at 0, so the sea is 0 rather than its depth. Large lakes show their floor, since ETOPO includes lake bathymetry (Lake Superior reads about 30 m); `land_fraction` tells them apart. |
+| `elevation_std` | the same | Terrain roughness (m): standard deviation of the elevation within the cell. |
+| `land_fraction` | [NASA IMERG land/sea mask](https://gpm.nasa.gov/data/directory/imerg-land-sea-mask-netcdf), 0.1°, 4.8 MB | 1 land, 0 water (ocean and lakes). Interpolated, so coasts are fractional. |
+| `satellite_zenith` | grid geometry | About 26° in the south-east corner to 90° in the far north-west. |
+
+`latitude` and `longitude` are available but not configured: with one year of data they let a model learn
+where lightning happened rather than why. If you try them, split training and test data by blocks of time
+(whole weeks or months), since neighbouring samples are nearly identical.
+
 ### Reading features for training
 
-`xarray.open_mfdataset` combines days into one time axis (see [Reading the data](#reading-the-data)).
-Features are float16 on disk: convert to float32 before any arithmetic, since float16 sums overflow.
-A PyTorch dataset that stacks the channels at `t`, `t - 15` and `t - 30` minutes and returns one label as
-the target:
+`xarray.open_mfdataset` combines days into one time axis. Pass `data_vars="minimal", coords="minimal",
+compat="override"`, so that only arrays with a time dimension are joined and `static`, `lat` and `lon`
+are read once from the first day (otherwise xarray gives `static` a time dimension too). Features are
+float16 on disk: convert to float32 before any arithmetic, since float16 sums overflow. A PyTorch dataset
+that stacks the channels at `t`, `t - 15` and `t - 30` minutes, adds the static fields, and returns one
+label as the target:
 
 ```python
 import glob, json
@@ -252,18 +290,24 @@ import numpy as np
 import torch
 import xarray as xr
 
-stats = json.load(open("goes_features/stats_2025-10-16_2026-05-31.json"))["channels"]
+stats = json.load(open("goes_features/stats_2025-10-16_2026-05-31.json"))
+
+
+def normalise(values, names, section):
+    mean = np.array([stats[section][n]["mean"] for n in names], np.float32)[:, None, None]
+    std = np.array([stats[section][n]["std"] for n in names], np.float32)[:, None, None]
+    return (values.astype(np.float32) - mean) / std
 
 
 class LightningDataset(torch.utils.data.Dataset):
-    """Channels at t, t-15 and t-30 min stacked as the input, one label at t as the target, random patches."""
+    """Channels at t, t-15 and t-30 min plus the static fields as the input, one label at t as the target."""
 
     def __init__(self, days, label="lightning_next_60min", history=(0, 1, 2), patch=256, min_valid=0.9):
-        ds = xr.open_mfdataset(days, engine="zarr", combine="by_coords", mask_and_scale=False)
+        ds = xr.open_mfdataset(days, engine="zarr", combine="by_coords", mask_and_scale=False,
+                               data_vars="minimal", coords="minimal", compat="override")
         self.x, self.y, self.patch = ds.features, ds.labels.sel(label=label), patch
-        names = list(ds.channel.values)
-        self.mean = np.array([stats[c]["mean"] for c in names], np.float32)[:, None, None]
-        self.std = np.array([stats[c]["std"] for c in names], np.float32)[:, None, None]
+        self.names = list(ds.channel.values)
+        self.static = np.nan_to_num(normalise(ds.static.values, list(ds.static_channel.values), "static"), nan=0.0)
         # Samples whose history steps all exist (a missing day leaves a gap in time) and have their ABI scan;
         # c13 is NaN only where the scan is missing, unlike cloud height or the clear-sky products
         step = np.timedelta64(int(ds.attrs["time_step_minutes"]), "m")
@@ -284,9 +328,10 @@ class LightningDataset(torch.utils.data.Dataset):
         y0 = np.random.randint(0, self.x.sizes["y"] - self.patch + 1)
         x0 = np.random.randint(0, self.x.sizes["x"] - self.patch + 1)
         win = dict(y=slice(y0, y0 + self.patch), x=slice(x0, x0 + self.patch))
-        # float16 on disk: convert before any arithmetic
-        frames = [(self.x.isel(time=t, **win).values.astype(np.float32) - self.mean) / self.std for t in steps]
-        x = np.nan_to_num(np.concatenate(frames), nan=0.0)  # missing -> the channel mean
+        # float16 on disk: normalise() converts to float32 before any arithmetic
+        frames = [normalise(self.x.isel(time=t, **win).values, self.names, "channels") for t in steps]
+        static = self.static[:, win["y"], win["x"]]
+        x = np.nan_to_num(np.concatenate(frames + [static]), nan=0.0)  # missing -> the channel mean
         y = self.y.isel(time=steps[0], **win).values  # uint8: 1 lightning, 0 none, 255 unknown (mask in the loss)
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -299,7 +344,8 @@ into memory or read the Zarr arrays directly (`zarr.open_consolidated(day)["feat
 
 ### Size and speed
 
-With the default channels (13 channels, 4 km, every 15 minutes, float16) a day takes about 0.5 GB,
-about 160 GB for the configured date range. Size grows with channels, samples per day and cells:
-5-minute steps triple it, 8 km cells divide it by four. A day builds in about 35 seconds per worker, so
-4 workers get through the range in about an hour. Both numbers are extrapolated from 5 hours of one day.
+With the default configuration (16 channels, 4 km, every 15 minutes, float16) a day takes about 0.55 GB,
+about 180 GB for the configured date range; the static fields add 5 MB per day. Size grows with channels,
+samples per day and cells: 5-minute steps triple it, 8 km cells divide it by four. A day builds in about
+40 seconds per worker, so 4 workers take roughly an hour for the range. Both numbers are extrapolated
+from 5 hours of one day. The first run also downloads about 35 MB of static sources.

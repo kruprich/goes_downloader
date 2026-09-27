@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Optional
 
 import zarr
 
@@ -50,9 +50,12 @@ def problems(row: Dict[str, Any]) -> List[str]:
     if row["status"] != "complete":
         return [row["status"]]
     out = []
-    for key, n in row.items():
-        if key.startswith("scans_") and n < MIN_ABI_SCAN_SHARE * SLOTS_PER_DAY:
-            out.append(f"{key[6:]} {n}/{SLOTS_PER_DAY} scans")
+    scans = {key[6:]: n for key, n in row.items() if key.startswith("scans_")}
+    low = {key: n for key, n in scans.items() if n < MIN_ABI_SCAN_SHARE * SLOTS_PER_DAY}
+    if len(low) > 1 and len(low) == len(scans) and len(set(low.values())) == 1:
+        out.append(f"every ABI product {next(iter(low.values()))}/{SLOTS_PER_DAY} scans")  # e.g. an outage
+    else:
+        out += [f"{key} {n}/{SLOTS_PER_DAY} scans" for key, n in low.items()]
     missing = row.get("glm_windows_missing")
     if missing is not None and missing > (1 - MIN_GLM_COVERAGE) * GLM_WINDOWS_PER_DAY:
         out.append(f"GLM {100 * missing / GLM_WINDOWS_PER_DAY:.1f}% of windows missing")
@@ -88,15 +91,18 @@ def main() -> None:
     p.add_argument("--all", action="store_true", help="List every day, not only those needing attention")
     p.add_argument("--csv", help="Also write every day's numbers to this CSV file")
     args = p.parse_args()
+    print_report(load_config(args.config), show_all=args.all, csv_path=args.csv)
 
-    cfg = load_config(args.config)
+
+def print_report(cfg: RawConfig, show_all: bool = False, csv_path: Optional[str] = None) -> None:
+    """The summary and the days needing attention (every day with show_all); optionally a CSV."""
     rows = list(day_rows(cfg))
     print("\n".join(summary(rows)))
     listed = [(r, problems(r)) for r in rows]
-    if not args.all:
+    if not show_all:
         listed = [(r, why) for r, why in listed if why]
     if listed:
-        title = "Every day" if args.all else (
+        title = "Every day" if show_all else (
             f"Days needing attention (not complete, an ABI product under {MIN_ABI_SCAN_SHARE:.0%} of its scans, "
             f"or GLM under {MIN_GLM_COVERAGE:.0%} coverage)"
         )
@@ -107,12 +113,12 @@ def main() -> None:
     else:
         print("\nNo days need attention.")
 
-    if args.csv:
+    if csv_path:
         columns: List[str] = []
         for r in rows:
             columns += [k for k in r if k not in columns]
-        with open(args.csv, "w", newline="") as f:
+        with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=columns)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\nWrote {len(rows)} days to {args.csv}")
+        print(f"\nWrote {len(rows)} days to {csv_path}")

@@ -18,6 +18,7 @@ from .config import RawConfig, load_config
 from .day import process_single_day
 from .decode import DecodePool
 from .progress import Progress, format_duration, log
+from .report import print_report
 
 
 async def run_all_days(cfg: RawConfig) -> None:
@@ -91,9 +92,15 @@ async def run_all_days(cfg: RawConfig) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Download GOES ABI + GLM into per-day raw Zarr stores.")
     p.add_argument("--config", default="config.json", help="Path to JSON config file")
+    p.add_argument("--no-report", action="store_true", help="Don't print the data report when the run finishes")
     args = p.parse_args()
+    cfg = load_config(args.config)
     try:
-        asyncio.run(run_all_days(load_config(args.config)))
+        asyncio.run(run_all_days(cfg))
     except KeyboardInterrupt:
         print("\nInterrupted. Finished days are kept; run the same command again to continue.", file=sys.stderr)
         sys.exit(130)
+    if not args.no_report:
+        # The whole date range, including days finished by earlier runs (same as report.py)
+        print(f"\nData report for {cfg.start_date_utc} to {cfg.end_date_utc} (also: python report.py --config ...):")
+        print_report(cfg)

@@ -72,7 +72,8 @@ if __name__ == "__main__":
 
 - The usual reference hour is 2025-10-27 18 UTC (~5 s, 228 files). Days that ended less than 24 h
   ago are never marked complete, so test with past dates.
-- Write test output to scratch dirs, never `goes_raw/`: a store built from a few hours is still
+- Write test output to scratch dirs, never the configured output (`goes_raw2/`) or the older
+  `goes_raw/`: a store built from a few hours is still
   marked complete, so the real run would skip that day (`report.py` would flag it).
 - For changes to fetching or decoding, compare against the previous version's store array by
   array and run both `download_method` values; the stores must be identical.
@@ -168,7 +169,10 @@ the product/bounds key sets) as well as read.
   behaviour changes and say what was measured. Assumptions that only matter for interpreting the
   data belong in the future feature step, not the README.
 - Behaviour changes come with tests; keep `pytest` and pyflakes clean.
-- Output goes to `raw_output_root_dir` (default `./goes_raw`, git-ignored). Current config: about
-  2.1 GB/day stored with the NOAA CONUS bounds (~675 GB over the date range). With
-  `"byte_ranges"` a day downloads 4.9 GB and takes 95–110 s on a ~60 MB/s connection (8.5–10 h
-  for the range); `"whole_files"` would download 16.1 GB/day because of the MCMIPC files.
+- Output goes to `raw_output_root_dir` (default `./goes_raw`; the config uses `./goes_raw2`;
+  `goes_raw*/` is git-ignored). `goes_raw/` holds 28 days from an older product list (bands 8, 11,
+  13, 15; no GLM events) that the user kept; don't mix it with `goes_raw2/`. Current config:
+  2025-04-07 (GOES-19 operational as GOES-East) to 2026-09-25, 537 days, about 2.1 GB/day stored
+  with the NOAA CONUS bounds (~1.13–1.25 TB). With `"byte_ranges"` a day downloads 4.9 GB and
+  takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
+  16.1 GB/day because of the MCMIPC files.

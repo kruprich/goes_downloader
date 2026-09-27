@@ -14,7 +14,7 @@ For each UTC day it:
 3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and every event (lat/lon
    and the flash it belongs to), plus a coverage flag for every 20-second window, so outages
    (including files NOAA never published) show up as gaps rather than as "no lightning".
-4. Writes `goes_raw/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and file
+4. Writes `<raw_output_root_dir>/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and file
    succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
    Incomplete days are rebuilt on the next run.
 
@@ -51,8 +51,9 @@ take effect without reinstalling.
 
 What a run needs, with the current config (measured on 2025-10-27, 12 CPU cores, ~60 MB/s):
 
-- **Disk:** about 2.1 GB per day stored, so ~675 GB for the 321 days of the configured range.
-- **Network:** about 4.9 GB per day downloaded. A day takes 95–110 s, so the range takes 8.5–10 h.
+- **Disk:** about 2.1 GB per day stored (measured on an October day; summer days hold more
+  daylight imagery), so ~1.13–1.25 TB for the 537 days of the configured range.
+- **Network:** about 4.9 GB per day downloaded. A day takes 95–110 s, so the range takes 14–16 h.
 - **Memory:** about 10 GB: 7.2–7.7 GB for the 48 byte-range workers and up to 1.9 GB for the main
   process, which holds a day's GLM events until the day is written. Lower `byte_range_processes`
   to use less.
@@ -103,9 +104,13 @@ python report.py --config config.json --all --csv days.csv
 ## Config basics
 
 - `gcs_bucket`: the public bucket to read (`gcp-public-data-goes-19`).
-- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included.
+- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included. The
+  config starts on 2025-04-07, when NOAA declared GOES-19 operational as GOES-East; its data is on
+  the operational 75.0°W grid from 2025-04-02, and before 2025-03-20 it came from the 89.5°W test
+  position (don't mix the two). It ends on the latest day that had ended 24 hours before the last
+  update; move the end date forward and run again to add newer days.
 - `raw_output_root_dir` (default `./goes_raw`, relative to where you run the command): where the
-  day stores go. `goes_raw/` is git-ignored.
+  day stores go. The config uses `./goes_raw2`; `goes_raw*/` folders are git-ignored.
 - `overwrite_existing` (default `false`): rebuild days that are already complete, e.g. after
   changing the products or `bounds`.
 - `download`: the product keys to fetch (see below).
@@ -152,7 +157,7 @@ continuous time series:
 ```python
 import glob, xarray as xr
 
-days = sorted(glob.glob("goes_raw/*/*.zarr"))
+days = sorted(glob.glob("goes_raw2/*/*.zarr"))  # the config's raw_output_root_dir
 c13 = xr.open_mfdataset(days, engine="zarr", group="abi/mcmip_c13", combine="by_coords")
 flashes = xr.open_mfdataset(days, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
 coverage = xr.open_mfdataset(days, engine="zarr", group="glm/coverage", combine="by_coords")

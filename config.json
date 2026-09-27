@@ -1,8 +1,8 @@
 {
   "gcs_bucket": "gcp-public-data-goes-19",
-  "start_date_utc": "2025-10-16",
-  "end_date_utc": "2026-09-01",
-  "raw_output_root_dir": "./goes_raw",
+  "start_date_utc": "2025-04-07",
+  "end_date_utc": "2026-09-25",
+  "raw_output_root_dir": "./goes_raw2",
   "overwrite_existing": false,
   "download_method": "byte_ranges",
   "byte_range_processes": 48,

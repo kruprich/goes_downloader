@@ -5,16 +5,12 @@ marked `network` download real files and only run with `pytest --network`.
 """
 
 import os
-import sys
 
 import netCDF4 as nc
 import numpy as np
 import pytest
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO)
-
-from goes_downloader import ranges  # noqa: E402
+from goes_downloader import ranges
 
 
 def pytest_addoption(parser):

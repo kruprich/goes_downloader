@@ -15,11 +15,12 @@ usage, reading, assumptions about the source data, and measured sizes and speeds
 
 ## Commands
 
-Shells here don't activate the virtual environment, so call its Python directly. Python 3.11–3.13
-only: 3.14 can't install the pins (`numcodecs<0.16` has no 3.14 wheel).
+Shells here don't activate the virtual environment, so call its Python directly. Python 3.12–3.13
+only (`requires-python` in pyproject.toml): the locked numpy and pyproj need 3.12, and 3.14 can't
+install `numcodecs<0.16`.
 
 ```bash
-.venv/bin/python -m pip install -r requirements-dev.txt   # requirements.lock alone to only run it
+.venv/bin/python -m pip install -e ".[dev]" -c requirements.lock   # without [dev] to only run it
 .venv/bin/python download_raw.py --config config.json     # a full run; prints a data report at the end
 .venv/bin/python report.py --config config.json           # which days are complete / need attention
 .venv/bin/python -m pytest                                # offline tests, under a second
@@ -27,8 +28,12 @@ only: 3.14 can't install the pins (`numcodecs<0.16` has no 3.14 wheel).
 .venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py   # the only linter
 ```
 
-`requirements.lock` holds the tested versions; regenerate it from the environment's installed
-versions (runtime packages only) when a dependency changes.
+`pyproject.toml` holds the package definition, `requires-python`, the direct dependencies and the
+pytest settings; `requirements.lock` pins the tested versions and is used as constraints (`-c`).
+When a dependency changes, regenerate the lock from the environment's installed versions (runtime
+packages only) and run the tests on 3.12 and 3.13, as `.github/workflows/tests.yml` does on every
+push. There are deliberately no console-script entry points: generated scripts import the package
+at top level, and spawned workers re-run the main script, so they would load aiohttp and zarr.
 
 ## Testing and verifying changes
 
@@ -51,14 +56,14 @@ serve them to the byte-range code through a fake remote whose buffers start as r
 product both ways and run the reference hour through the whole pipeline with both
 `download_method` values, requiring identical stores.
 
-For a short real download, write a harness script that sets `remote.LIST_HOURS`. It must be a
-file: the pool uses spawn (Linux would otherwise fork) and spawned workers re-run the main script,
-so code fed through stdin (`python3 - <<EOF`) fails in every worker.
+For a short real download, write a harness script that sets `remote.LIST_HOURS` and run it with
+`.venv/bin/python` (the package is installed in `.venv`, so the script can live anywhere). It must
+be a file: the pool uses spawn (Linux would otherwise fork) and spawned workers re-run the main
+script, so code fed through stdin (`python3 - <<EOF`) fails in every worker.
 
 ```python
 # run_test.py: one hour into a scratch dir (copy config.json, override dates/output/overwrite)
 import sys, asyncio
-sys.path.insert(0, "/path/to/goes_downloader")  # not needed when the script is in the repo root
 from goes_downloader import config, remote, runner
 if __name__ == "__main__":
     remote.LIST_HOURS = [18]

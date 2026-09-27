@@ -40,10 +40,13 @@ that ended less than 24 h ago are never marked complete, so test with past dates
 ## Architecture
 
 **Config (`config.json`).** `abi_products` and `glm_product` define every available product (all
-16 CMIP bands plus single-variable CONUS L2 products, each with a `description`). The `download`
-list selects which to fetch. `cmip_precision` applies to infrared CMIP bands 7–16 (detected from
-the band number in `filename_must_contain`); a product's own `precision` overrides it. `bounds`
-crops ABI only.
+16 CMIP bands twice, plus single-variable CONUS L2 products, each with a `description`): `cmip_*`
+read each band's own file, `mcmip_*` read one band from the all-band MCMIPC file at 2 km, which
+is only practical with `"byte_ranges"` (~59 MB per whole file). The `download` list selects which
+to fetch; it currently holds LightningCast's bands 2, 5, 13 and 15 (`mcmip_*`). `cmip_precision`
+applies to infrared CMIP bands 7–16 (band number from `filename_must_contain`, or from the
+`CMI_Cnn` data variable for MCMIPC); a product's own `precision` overrides it. `bounds` crops ABI
+only.
 
 **Per-day flow (`process_single_day`).**
 1. List each distinct `gcs_product_prefix` once (24 hourly prefixes). `select_files` filters by
@@ -59,8 +62,11 @@ crops ABI only.
    `_RangeFile`, only the chunks that are decoded are fetched (ABI: those overlapping the crop),
    and the unchanged NetCDF decoders read the resulting file-sized buffer. Files start in scan-time
    order so latency-bound GLM fetches overlap bandwidth-bound ABI ones.
-4. GLM flashes accumulate in memory and are written at the end with per-file rows and a
-   `glm/coverage` flag per 20-second window.
+4. GLM flashes and events (~70 M events/day, ~1.9 GB peak memory in the main process) accumulate
+   in memory and are written at the end with per-file rows and a `glm/coverage` flag per
+   20-second window. `decode_glm_file` links each event to its flash through the file's
+   event → group → flash ids (`_parent_rows`, a missing parent is a file error); `write_glm_tables`
+   turns that into `flash_index`, the row in the day's time-sorted `glm/flashes`.
 5. Build in `<day>.zarr.tmp`, consolidate metadata, then move into place. `complete` is true only
    if no listing/file errors occurred and the day ended ≥24 h ago; incomplete days are rebuilt
    from scratch on the next run.
@@ -73,14 +79,16 @@ crops ABI only.
 - Values stay packed (`physical = value * scale_factor + add_offset`, stored per slot). The user
   decided against storing physical values or CF packing attributes.
 - The `bounds` rectangle comes from the first ABI scan decoded each day (all ABI products share
-  the GOES-East fixed grid). GLM is deliberately never cropped (~36 MB/day).
+  the GOES-East fixed grid). GLM is deliberately never cropped (~240 MB/day with events).
 - `DecodePool` replaces the process pool when a worker dies, and closes the dead pool's call-queue
   reader to avoid CPython gh-94777, a hang at exit on Python < 3.12.
 - With byte ranges, every byte that is not fetched is zero, so a decoder must read only what the
-  ranged functions fetch: GLM only the variables in `GLM_SOURCE_VARIABLES`, ABI only `x`, `y` and
-  the data/DQF variables inside the window. Reading anything else fails for compressed variables
-  and silently gives zeros for uncompressed ones such as the GLM flash variables. Test changes
-  with the unfetched bytes filled with random data instead of zeros.
+  ranged functions fetch: GLM only `GLM_READ_VARIABLES`, ABI only `x`, `y` and the data/DQF
+  variables inside the window. Reading anything else fails for compressed variables and silently
+  gives zeros for uncompressed ones such as the GLM variables. Test changes with the unfetched
+  bytes filled with random data instead of zeros. `_RangeFile` keeps a list of fetched ranges and
+  an anonymous `mmap`, never per-byte arrays: MCMIPC files are ~59 MB, and file-sized numpy
+  bookkeeping made a day 2.5× slower and took 19 GB across the workers.
 - Missing data is explicit: ABI `present` = 0 and GLM `covered` = 0. In a complete day these mean
   NOAA never published the file.
 
@@ -92,6 +100,6 @@ crops ABI only.
   module docstring (store layout) in sync with behaviour changes. Assumptions that only matter for
   interpreting the data belong in the future feature step, not the README.
 - Output goes to `raw_output_root_dir` (default `./goes_raw`, git-ignored). Current config: about
-  2.1 GB/day stored with the NOAA CONUS bounds (~700 GB over the date range). Downloads are
-  6–8 GB/day with `"whole_files"`, since whole files are fetched regardless of bounds, and about
-  4.7 GB/day with `"byte_ranges"`.
+  2.1 GB/day stored with the NOAA CONUS bounds (~675 GB over the date range). With
+  `"byte_ranges"` a day downloads 4.9 GB and takes ~95 s on a ~60 MB/s connection (~8.5 h for the
+  range); `"whole_files"` would download 16.1 GB/day because of the MCMIPC files.

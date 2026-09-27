@@ -13,7 +13,9 @@ Every array names its dimensions and each day's metadata is consolidated, so xar
 stores (see "Reading with xarray" below).
 
 ABI: one group per configured product, one slot per 5-min CONUS scan (288 per day).
-Each product keeps its native grid (CMIP bands, ACM, ACTP: 2 km, 1500x2500; ACHA, TPW, DSI: 10 km, 300x500).
+Each product keeps its source grid (CMIP bands 1, 3, 5: 1 km and band 2: 0.5 km in their own files, every
+other band and every band of the all-band MCMIP file: 2 km, 1500x2500; ACM, ACTP: 2 km; ACHA, TPW, DSI: 10 km,
+300x500).
   abi/<key>/time[slot]               datetime64 start of each 5-min slot (the xarray "time" coordinate)
   abi/<key>/value[slot, y, x]        uint16   packed values as in the file, rounded to the product's
                                               configured "precision" (physical units) if one is set
@@ -32,12 +34,16 @@ Each product keeps its native grid (CMIP bands, ACM, ACTP: 2 km, 1500x2500; ACHA
   abi/<key>/x_scan_angle_rad[x]      float64
   abi/<key>/y_scan_angle_rad[y]      float64
 
-GLM (only if "glm" is in the config's "download" list): every flash from every 20 s file whose start
-falls in the day, all quality flags kept.
-  glm/files/{start_ns,end_ns,ok,n_flashes}[file]    one row per file NOAA published for the day
+GLM (only if "glm" is in the config's "download" list): every flash and event from every 20 s file whose
+start falls in the day, all quality flags kept.
+  glm/files/{start_ns,end_ns,ok,n_flashes,n_events}[file]    one row per file NOAA published for the day
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
                                        file_index is the row in the same day's glm/files; it is not
                                        unique once several days are combined
+  glm/events/{lat,lon,flash_index}[event]   every event (one lit sensor pixel at one moment), in file
+                                       order; flash_index is the row of its flash in the same day's
+                                       glm/flashes. Events give each flash's footprint, which a
+                                       flash-extent density needs
   glm/coverage/time[window]            datetime64 start of each 20 s window (4320 per day)
   glm/coverage/covered[window]         uint8  1 if a GLM file for the window was published and decoded
   Windows with covered=0 are gaps (NOAA published no file, or it failed): no flashes there does NOT
@@ -47,7 +53,7 @@ Optional "bounds" crop (lat/lon box in config), ABI only:
   The box is turned into the smallest scan-angle rectangle that contains it, shared by all ABI
   products. Each ABI product keeps the pixels whose cell overlaps that rectangle (attrs crop_y0/crop_x0
   give the offset into the uncropped grid; x/y_scan_angle_rad are the cropped coordinates). GLM is not
-  cropped: every flash is kept (~36 MB/day), and the feature step selects the ones its grid needs.
+  cropped: every flash and event is kept (~240 MB/day), and the feature step selects what its grid needs.
   Days already complete are not re-cropped when the bounds change; delete them or set
   overwrite_existing.
 
@@ -57,7 +63,7 @@ Root attrs:
   from scratch on the next run.
 
 Reading with xarray (one product or GLM table across several days):
-  xr.open_mfdataset(day_paths, engine="zarr", group="abi/cmip_c13", combine="by_coords")
+  xr.open_mfdataset(day_paths, engine="zarr", group="abi/mcmip_c13", combine="by_coords")
   xr.open_mfdataset(day_paths, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
   xarray turns value/dqf fill values into NaN (floats); pass mask_and_scale=False for the stored integers
   and apply scale_factor/add_offset yourself.
@@ -68,16 +74,19 @@ Config:
   Products that read different variables from the same files (e.g. the dsi_* indices) share one
   download per scan, and each bucket prefix is listed once per day.
   download_method "byte_ranges" fetches only the HDF5 metadata and the chunks that are decoded
-  (ABI chunks inside the crop) instead of whole files; the stored data is the same.
+  (ABI chunks inside the crop) instead of whole files; the stored data is the same. The mcmip_*
+  products read single bands from the ~59 MB all-band files and are only practical this way.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import http.client
 import io
 import json
+import mmap
 import multiprocessing
 import os
 import random
@@ -162,12 +171,15 @@ def _require(d: Dict[str, Any], k: str, typ: Any):
     return v
 
 
-CMIP_BAND_PATTERN = re.compile(r"CMIP\w*-M\d+C(\d{2})")
+CMIP_BAND_PATTERN = re.compile(r"CMIP\w*-M\d+C(\d{2})")  # single-band files: ...-CMIPC-M6C13
+MCMIP_BAND_VARIABLE = re.compile(r"CMI_C(\d{2})")  # the all-band MCMIP files hold one CMI_Cnn per band
 
 
 def is_cmip_ir_band(product: Dict[str, Any]) -> bool:
     """CMIP bands 7-16 hold brightness temperature (K); bands 1-6 are reflectance (0-1)."""
-    m = CMIP_BAND_PATTERN.search(str(product.get("filename_must_contain", "")))
+    m = CMIP_BAND_PATTERN.search(str(product.get("filename_must_contain", ""))) or MCMIP_BAND_VARIABLE.fullmatch(
+        str(product.get("data_variable", ""))
+    )
     return bool(m) and int(m.group(1)) >= 7
 
 
@@ -703,8 +715,8 @@ def _offset_seconds_to_ns(var: Any) -> np.ndarray:
     return out
 
 
-# Flash column -> GLM file variable. decode_glm_file reads only these, and byte-range downloads fetch only these.
-GLM_SOURCE_VARIABLES = {
+# GLM file variables. decode_glm_file reads only GLM_READ_VARIABLES, and byte-range downloads fetch only those.
+GLM_FLASH_VARIABLES = {  # flash column -> variable
     "time_first_ns": "flash_time_offset_of_first_event",
     "time_last_ns": "flash_time_offset_of_last_event",
     "lat": "flash_lat",
@@ -713,25 +725,53 @@ GLM_SOURCE_VARIABLES = {
     "energy_j": "flash_energy",
     "quality_flag": "flash_quality_flag",
 }
+GLM_EVENT_VARIABLES = ("event_lat", "event_lon")
+# Each event's flash: event -> parent group -> parent flash
+GLM_LINK_VARIABLES = ("event_parent_group_id", "group_id", "group_parent_flash_id", "flash_id")
+GLM_READ_VARIABLES = [*GLM_FLASH_VARIABLES.values(), *GLM_EVENT_VARIABLES, *GLM_LINK_VARIABLES]
+
+
+def _parent_rows(parent_ids: np.ndarray, ids: np.ndarray, what: str) -> np.ndarray:
+    """Row in `ids` of each parent id; every id must be unique and every parent present."""
+    order = np.argsort(ids, kind="stable")
+    sorted_ids = ids[order]
+    if np.any(sorted_ids[1:] == sorted_ids[:-1]):
+        raise ValueError(f"{what}: duplicate ids")
+    if len(parent_ids) == 0:
+        return np.zeros(0, dtype=np.int32)
+    pos = np.minimum(np.searchsorted(sorted_ids, parent_ids), max(len(ids) - 1, 0))
+    if len(ids) == 0 or np.any(sorted_ids[pos] != parent_ids):
+        raise ValueError(f"{what}: parent id missing from the file")
+    return order[pos].astype(np.int32)
 
 
 def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
+    """The flash columns, plus event_lat, event_lon and event_flash (row of the event's flash in this file)."""
     import netCDF4 as nc
 
     def floats(var: Any) -> np.ndarray:
         return np.ma.filled(np.ma.asarray(var[:], dtype=np.float32), np.nan).reshape(-1)
 
+    def ids(var: Any) -> np.ndarray:
+        return np.ma.getdata(var[:]).astype(np.int64).reshape(-1)
+
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
-        var = {column: ds.variables[name] for column, name in GLM_SOURCE_VARIABLES.items()}
-        quality = np.ma.filled(np.ma.asarray(var["quality_flag"][:], dtype=np.int16), 255)
+        var = {name: ds.variables[name] for name in GLM_READ_VARIABLES}
+        flash = {column: var[name] for column, name in GLM_FLASH_VARIABLES.items()}
+        quality = np.ma.filled(np.ma.asarray(flash["quality_flag"][:], dtype=np.int16), 255)
+        event_group = _parent_rows(ids(var["event_parent_group_id"]), ids(var["group_id"]), "event_parent_group_id")
+        group_flash = _parent_rows(ids(var["group_parent_flash_id"]), ids(var["flash_id"]), "group_parent_flash_id")
         return {
-            "time_first_ns": _offset_seconds_to_ns(var["time_first_ns"]),
-            "time_last_ns": _offset_seconds_to_ns(var["time_last_ns"]),
-            "lat": floats(var["lat"]),
-            "lon": floats(var["lon"]),
-            "area_m2": floats(var["area_m2"]),
-            "energy_j": floats(var["energy_j"]),
+            "time_first_ns": _offset_seconds_to_ns(flash["time_first_ns"]),
+            "time_last_ns": _offset_seconds_to_ns(flash["time_last_ns"]),
+            "lat": floats(flash["lat"]),
+            "lon": floats(flash["lon"]),
+            "area_m2": floats(flash["area_m2"]),
+            "energy_j": floats(flash["energy_j"]),
             "quality_flag": quality.astype(np.uint8).reshape(-1),
+            "event_lat": floats(var["event_lat"]),
+            "event_lon": floats(var["event_lon"]),
+            "event_flash": group_flash[event_group],
         }
 
 
@@ -897,32 +937,65 @@ def _range_executor() -> ThreadPoolExecutor:
 
 
 class _RangeFile(io.RawIOBase):
-    """A remote file for h5py: reads come from a file-sized buffer, fetching missing bytes in aligned blocks."""
+    """
+    A remote file for h5py and the NetCDF decoders: a file-sized buffer holding the byte ranges fetched
+    so far, with everything else zero. Reads fetch missing bytes in aligned blocks. The buffer is an
+    anonymous memory map, so only fetched pages use memory; call release() when done.
+    """
 
     def __init__(self, path: str, size: int, timeout: int, retries: int):
         if size <= 0:
             raise ValueError(f"{path}: size unknown")
         self.path, self.size, self.timeout, self.retries = path, size, timeout, retries
-        self.buf = bytearray(size)
-        self.have = np.zeros(size, dtype=bool)
+        self.buf = mmap.mmap(-1, size)
+        # Fetched ranges [starts[i], ends[i]), sorted, neither overlapping nor touching
+        self.starts: List[int] = []
+        self.ends: List[int] = []
         self.pos = 0
         self.downloaded = 0
 
+    def release(self) -> None:
+        self.buf.close()
+
+    def _missing(self, start: int, end: int) -> List[Tuple[int, int]]:
+        """The parts of [start, end) not fetched yet."""
+        pos, end = max(0, start), min(self.size, end)
+        out = []
+        i = max(0, bisect.bisect_right(self.starts, pos) - 1)
+        while pos < end and i < len(self.starts) and self.starts[i] < end:
+            if self.ends[i] > pos:
+                if self.starts[i] > pos:
+                    out.append((pos, self.starts[i]))
+                pos = self.ends[i]
+            i += 1
+        if pos < end:
+            out.append((pos, end))
+        return out
+
+    def _add(self, start: int, end: int) -> None:
+        i = bisect.bisect_left(self.starts, start)
+        self.starts.insert(i, start)
+        self.ends.insert(i, end)
+        starts: List[int] = []
+        ends: List[int] = []
+        for s, e in zip(self.starts, self.ends):
+            if ends and s <= ends[-1]:
+                ends[-1] = max(ends[-1], e)
+            else:
+                starts.append(s)
+                ends.append(e)
+        self.starts, self.ends = starts, ends
+
     def fetch(self, ranges: List[Tuple[int, int]], merge_gap: int = RANGE_MERGE_GAP_BYTES) -> None:
         """Fetches whatever is missing of the [start, end) ranges, merging close ones, in parallel."""
-        need = np.zeros(self.size, dtype=bool)
-        for start, end in ranges:
-            need[max(0, start):min(self.size, end)] = True
-        need &= ~self.have
-        if not need.any():
-            return
-        edges = np.flatnonzero(np.diff(np.concatenate(([0], need.view(np.int8), [0]))))
         spans: List[List[int]] = []
-        for start, end in edges.reshape(-1, 2).tolist():
+        for start, end in sorted(part for r in ranges for part in self._missing(*r)):
             if spans and start - spans[-1][1] < merge_gap:
-                spans[-1][1] = end
+                spans[-1][1] = max(spans[-1][1], end)
             else:
                 spans.append([start, end])
+        if not spans:
+            return
 
         def get(span: List[int]) -> bytes:
             return _get_range(self.path, span[0], span[1], self.timeout, self.retries)
@@ -930,7 +1003,7 @@ class _RangeFile(io.RawIOBase):
         bodies = [get(spans[0])] if len(spans) == 1 else list(_range_executor().map(get, spans))
         for (start, end), body in zip(spans, bodies):
             self.buf[start:end] = body
-            self.have[start:end] = True
+            self._add(start, end)
             self.downloaded += len(body)
 
     def readable(self) -> bool:
@@ -950,7 +1023,7 @@ class _RangeFile(io.RawIOBase):
         n = min(len(b), self.size - self.pos)
         if n <= 0:
             return 0
-        if not self.have[self.pos:self.pos + n].all():
+        if self._missing(self.pos, self.pos + n):
             block = RANGE_BLOCK_BYTES
             self.fetch([(self.pos // block * block, -(-(self.pos + n) // block) * block)], merge_gap=block)
         b[:n] = self.buf[self.pos:self.pos + n]
@@ -1013,35 +1086,41 @@ def ranged_decode_abi_file(
 
     data_names = sorted({name for dv, qv, _ in variables for name in (dv, qv)})
     rf, chunks = _open_remote(path, size, ["x", "y", *data_names], timeout, retries)
-    grid = [(offset, offset + n) for name in ("x", "y") for _, offset, n in chunks[name][1]]
-    window = None
-    if bounds is not None:
-        rf.fetch(grid)
-        with nc.Dataset("inmem", mode="r", memory=bytes(rf.buf)) as ds:
-            x, y, projection = _abi_grid(ds)
-        window = _crop_window(bounds, projection, x, y)
-    needed = list(grid)
-    for name in data_names:
-        chunk_shape, stored = chunks[name]
-        for first, offset, n in stored:
-            if window is not None and chunk_shape is not None:
-                (cy, cx), (chy, chx) = first[-2:], chunk_shape[-2:]
-                if not (cy < window[1] and cy + chy > window[0] and cx < window[3] and cx + chx > window[2]):
-                    continue
-            needed.append((offset, offset + n))
-    rf.fetch(needed)
-    decoded = decode_abi_file(bytes(rf.buf), variables, window)
+    try:
+        grid = [(offset, offset + n) for name in ("x", "y") for _, offset, n in chunks[name][1]]
+        window = None
+        if bounds is not None:
+            rf.fetch(grid)
+            with nc.Dataset("inmem", mode="r", memory=rf.buf) as ds:
+                x, y, projection = _abi_grid(ds)
+            window = _crop_window(bounds, projection, x, y)
+        needed = list(grid)
+        for name in data_names:
+            chunk_shape, stored = chunks[name]
+            for first, offset, n in stored:
+                if window is not None and chunk_shape is not None:
+                    (cy, cx), (chy, chx) = first[-2:], chunk_shape[-2:]
+                    if not (cy < window[1] and cy + chy > window[0] and cx < window[3] and cx + chx > window[2]):
+                        continue
+                needed.append((offset, offset + n))
+        rf.fetch(needed)
+        decoded = decode_abi_file(rf.buf, variables, window)
+    finally:
+        rf.release()
     for dec in decoded:
         dec["window"] = window
     return decoded, rf.downloaded
 
 
 def ranged_decode_glm_file(path: str, size: int, timeout: int, retries: int) -> Tuple[Dict[str, np.ndarray], int]:
-    """decode_glm_file on a remote file, fetching only metadata and the flash variables. Returns (decoded, bytes downloaded)."""
-    names = list(GLM_SOURCE_VARIABLES.values())
-    rf, chunks = _open_remote(path, size, names, timeout, retries)
-    rf.fetch([(offset, offset + n) for name in names for _, offset, n in chunks[name][1]])
-    return decode_glm_file(bytes(rf.buf)), rf.downloaded
+    """decode_glm_file on a remote file, fetching only metadata and GLM_READ_VARIABLES. Returns (decoded, bytes downloaded)."""
+    rf, chunks = _open_remote(path, size, GLM_READ_VARIABLES, timeout, retries)
+    try:
+        rf.fetch([(offset, offset + n) for name in GLM_READ_VARIABLES for _, offset, n in chunks[name][1]])
+        decoded = decode_glm_file(rf.buf)
+    finally:
+        rf.release()
+    return decoded, rf.downloaded
 
 
 # =============================================================================
@@ -1070,6 +1149,7 @@ GLM_FLASH_COLUMNS = {
     "quality_flag": np.uint8,
     "file_index": np.int32,
 }
+GLM_EVENT_COLUMNS = {"lat": np.float32, "lon": np.float32, "flash_index": np.int32}
 
 
 @dataclass
@@ -1180,8 +1260,8 @@ def write_abi_frame(state: AbiProductState, slot: int, dec: Dict[str, Any]) -> N
 
 def write_glm_tables(
     root: Any, day_start: datetime, files: List[RemoteFile], file_ok: np.ndarray, tables: Dict[int, Dict[str, np.ndarray]]
-) -> Tuple[int, int]:
-    """Writes the file, flash and coverage tables; returns (n_flashes, n_windows_covered)."""
+) -> Tuple[int, int, int]:
+    """Writes the file, flash, event and coverage tables; returns (n_flashes, n_events, n_windows_covered)."""
     g = root.require_group("glm")
 
     # Coverage per 20 s window, so outages where NOAA published no file show up as gaps too
@@ -1195,14 +1275,21 @@ def write_glm_tables(
     _write_array(cg, "covered", covered, ["time"])
 
     n_flashes = np.array([len(tables[i]["lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
+    n_events = np.array([len(tables[i]["event_lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
     fg = g.require_group("files")
     _write_array(fg, "start_ns", np.array([to_ns(f.start) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
     _write_array(fg, "end_ns", np.array([to_ns(f.end) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
     _write_array(fg, "ok", file_ok.astype(np.uint8), ["file"])
     _write_array(fg, "n_flashes", n_flashes, ["file"])
+    _write_array(fg, "n_events", n_events, ["file"])
 
+    def write_column(group: Any, name: str, arr: np.ndarray, dim: str, **attrs: Any) -> None:
+        _write_array(group, name, arr, [dim], **attrs, zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR))
+
+    # Flashes, sorted by the time of their first event
+    file_indices = sorted(tables)
     cols: Dict[str, List[np.ndarray]] = {k: [] for k in GLM_FLASH_COLUMNS}
-    for i in sorted(tables):
+    for i in file_indices:
         t = tables[i]
         for k in GLM_FLASH_COLUMNS:
             cols[k].append(np.full(len(t["lat"]), i, dtype=np.int32) if k == "file_index" else t[k])
@@ -1211,12 +1298,20 @@ def write_glm_tables(
     merged = {k: np.concatenate(v).astype(GLM_FLASH_COLUMNS[k]) if v else np.zeros(0, GLM_FLASH_COLUMNS[k]) for k, v in cols.items()}
     order = np.argsort(merged["time_first_ns"], kind="stable")
     for k, arr in merged.items():
-        arr = arr[order]
-        _write_array(
-            flash_group, k, arr, ["flash"], **(TIME_ATTRS if k.startswith("time_") else {}),
-            zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR),
-        )
-    return int(n_flashes.sum()), int(covered.sum())
+        write_column(flash_group, k, arr[order], "flash", **(TIME_ATTRS if k.startswith("time_") else {}))
+
+    # Events in file order; flash_index is the row of the event's flash in glm/flashes
+    sorted_row = np.empty(len(order), dtype=np.int32)
+    sorted_row[order] = np.arange(len(order), dtype=np.int32)
+    first_row = np.concatenate(([0], np.cumsum([len(tables[i]["lat"]) for i in file_indices]))).astype(np.int64)
+    event_group = g.require_group("events")
+    for k, dtype in GLM_EVENT_COLUMNS.items():
+        if k == "flash_index":
+            parts = [sorted_row[first_row[j] + tables[i]["event_flash"]] for j, i in enumerate(file_indices)]
+        else:
+            parts = [tables[i][f"event_{k}"] for i in file_indices]
+        write_column(event_group, k, np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype), "event")
+    return int(n_flashes.sum()), int(n_events.sum()), int(covered.sum())
 
 
 # =============================================================================
@@ -1378,9 +1473,9 @@ async def process_single_day(
     if crop is not None and crop.rect is not None:
         root.attrs["crop_scan_angle_rect"] = list(crop.rect)
 
-    n_flashes, n_windows_covered = 0, 0
+    n_flashes, n_events, n_windows_covered = 0, 0, 0
     if cfg.glm_product is not None:
-        n_flashes, n_windows_covered = write_glm_tables(root, day_start, glm_files, glm_ok, glm_tables)
+        n_flashes, n_events, n_windows_covered = write_glm_tables(root, day_start, glm_files, glm_ok, glm_tables)
 
     too_recent = datetime.now(timezone.utc) < day_end + MIN_AGE_FOR_COMPLETE
     complete = n_listing_errors == 0 and not errors and not too_recent
@@ -1391,6 +1486,7 @@ async def process_single_day(
             "n_abi_slot_collisions": n_slot_collisions,
             "n_glm_files": len(glm_files),
             "n_glm_flashes": n_flashes,
+            "n_glm_events": n_events,
             "n_glm_windows_missing": GLM_WINDOWS_PER_DAY - n_windows_covered if cfg.glm_product is not None else None,
             "too_recent": too_recent,
             "complete": complete,
@@ -1413,7 +1509,7 @@ async def process_single_day(
     else:
         status = f"INCOMPLETE (listing errors={n_listing_errors}, file errors={len(errors)}; rerun to retry)"
     gaps = f"  GLM windows missing={GLM_WINDOWS_PER_DAY - n_windows_covered}" if cfg.glm_product is not None else ""
-    log(f"-> {day_label} {status}: {out_path}  flashes={n_flashes}{gaps}")
+    log(f"-> {day_label} {status}: {out_path}  flashes={n_flashes} events={n_events}{gaps}")
     return complete
 
 
@@ -1424,6 +1520,8 @@ async def process_single_day(
 async def run_all_days(cfg: RawConfig) -> None:
     days = list(iter_days_utc(cfg.start_date_utc, cfg.end_date_utc))
     os.makedirs(cfg.raw_output_root_dir, exist_ok=True)
+    if cfg.download_method == "whole_files" and any("MCMIP" in p.gcs_product_prefix for p in cfg.abi_products):
+        log("!! whole_files downloads each all-band MCMIP file in full (~59 MB per scan); byte_ranges fetches only the bands used")
 
     connector = aiohttp.TCPConnector(
         limit=cfg.max_concurrent_http_requests,

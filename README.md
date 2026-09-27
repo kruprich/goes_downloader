@@ -8,12 +8,12 @@ here; that belongs in a separate feature-building step.
 For each UTC day it:
 
 1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
-2. ABI: stores every 5-min scan on the product's native grid (CMIP bands 8, 11, 13 and 15 at
-   2 km; ACHA cloud height, TPW and the DSI stability indices at 10 km) as the file's packed
-   integers plus its DQF flags.
-3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) plus a coverage flag for
-   every 20-second window, so outages (including files NOAA never published) show up as gaps
-   rather than as "no lightning".
+2. ABI: stores every 5-min scan on the product's grid (bands 2, 5, 13 and 15 at 2 km, read from
+   the all-band MCMIPC files; ACHA cloud height, TPW and the DSI stability indices at 10 km) as the
+   file's packed integers plus its DQF flags.
+3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and every event (lat/lon
+   and the flash it belongs to), plus a coverage flag for every 20-second window, so outages
+   (including files NOAA never published) show up as gaps rather than as "no lightning".
 4. Writes `goes_raw/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and file
    succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
    Incomplete days are rebuilt on the next run.
@@ -41,13 +41,22 @@ bands plus the CONUS L2 products), each with a `description`. Only the keys
 listed in `download` are fetched, for example:
 
 ```json
-"download": ["cmip_c08", "cmip_c11", "cmip_c13", "cmip_c15", "acha", "tpw", "actp", "glm"]
+"download": ["mcmip_c02", "mcmip_c05", "mcmip_c13", "mcmip_c15", "acha", "tpw", "dsi_cape", "dsi_li", "dsi_ki", "glm"]
 ```
 
-Products that read different variables from the same files, like the five `dsi_*` stability
-indices (CAPE, lifted index, K-index, Showalter index, total totals), share one download per
-scan. Leave out `"glm"` to skip lightning. Changing the list does not touch days already marked
-complete; delete them or set `overwrite_existing` to rebuild them with the new products.
+The 16 CMIP bands come in two sets. `cmip_c01`–`cmip_c16` read each band's own file at its native
+resolution (0.5 km for band 2, 1 km for bands 1, 3 and 5, 2 km for the rest). `mcmip_c01`–
+`mcmip_c16` read the band from the all-band MCMIPC file, where every band is at 2 km. With
+`"download_method": "byte_ranges"` only the chosen bands are fetched from it (about 1–4 MB per band
+per scan inside `bounds`); with `"whole_files"` every ~59 MB file is downloaded in full. Band 2 at
+native resolution is ~19.5 GB/day to download, so the MCMIPC set is the practical way to get the
+visible and near-infrared bands. For bands 13 and 15 both sets give identical data.
+
+Products that read different variables from the same files, like the `mcmip_*` bands or the five
+`dsi_*` stability indices (CAPE, lifted index, K-index, Showalter index, total totals), share one
+download per scan. Leave out `"glm"` to skip lightning. Changing the list does not touch days
+already marked complete; delete them or set `overwrite_existing` to rebuild them with the new
+products.
 
 ## Reading the data
 
@@ -58,9 +67,10 @@ combine into one continuous time series:
 import glob, xarray as xr
 
 days = sorted(glob.glob("goes_raw/*/*.zarr"))
-c13 = xr.open_mfdataset(days, engine="zarr", group="abi/cmip_c13", combine="by_coords")
+c13 = xr.open_mfdataset(days, engine="zarr", group="abi/mcmip_c13", combine="by_coords")
 flashes = xr.open_mfdataset(days, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
 coverage = xr.open_mfdataset(days, engine="zarr", group="glm/coverage", combine="by_coords")
+events = xr.open_zarr(days[0], group="glm/events")  # one day: flash_index refers to that day's flashes
 ```
 
 `coverage.covered` has one entry per 20-second window: 0 means there is no GLM data for that
@@ -68,6 +78,11 @@ window, so no flashes there does not mean no lightning. NOAA misses a few GLM fi
 and on 2026-07-15 published no GLM data from 20:22:40 UTC to midnight. A flash's `file_index` is
 its row in the same day's `glm/files`, so it no longer identifies a file once several days are
 combined; use the flash times instead.
+
+`glm/events` holds every GLM event (one lit pixel of the lightning sensor at one moment) with its
+`lat`, `lon` and `flash_index`, the row of its flash in the same day's `glm/flashes`. Events are
+what shows how far each flash spread, which a flash-extent density needs; the flash table only has
+each flash's centre and area. Like `file_index`, `flash_index` only works within one day's store.
 
 ABI values are the file's packed numbers, not physical units: the physical value is
 `value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
@@ -81,6 +96,8 @@ day incomplete so it is retried and visible in the log:
 - Within a day, each product's grid (shape and x/y scan angles), fill value and quality-flag data
   type stay the same as in its first scan.
 - Data values are packed integers that fit in 16 bits; quality flags fit in 8 or 16 bits.
+- In each GLM file, event, group and flash ids are unique, and every event's parent group and
+  every group's parent flash are in the same file.
 
 **Recorded, but expected to stay constant.** `scale_factor` and `add_offset` are stored for every
 scan, so a change would be captured. For GOES-19 they have never changed: one file per month for
@@ -117,25 +134,27 @@ constant per product but should check.
   product, or rounds any other product. Categorical products such as cloud top phase must not set it.
 - `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): **applies to ABI only.** Crops every ABI
   product to the smallest scan-angle rectangle containing the box; `null` keeps the full CONUS
-  sector. GLM is never cropped: every flash in GLM's field of view is kept (about 36 MB/day), and
-  the feature step selects the flashes its grid needs.
+  sector. GLM is never cropped: every flash and event in GLM's field of view is kept (about
+  240 MB/day, mostly events), and the feature step selects what its grid needs.
   The config uses 24–50°N, 125–66°W, the contiguous-US bounding box NOAA NCEI publishes for its
-  nClimGrid-Daily dataset.
+  nClimGrid-Daily dataset. That box keeps about 65% of the ABI pixels.
 
-Measured on one hour of data with the current products: about 3.3 GB/day for full CONUS.
-That box keeps about 65% of the ABI pixels.
+Measured on 2025-10-27 with the current products and that box: 2.1 GB/day. Bands 13 and 15 take
+0.46 GB each, bands 2 and 5 0.37 GB each and GLM 0.24 GB. Bands 2 and 5 are reflectance, so they
+shrink to about a tenth at night; days with more daylight store more.
 
 ## Config options for speed
 
 - `download_method` (`"whole_files"`): how files are fetched.
   - `"whole_files"` downloads every file in full and decodes it in `max_decode_processes` processes.
   - `"byte_ranges"` downloads only the parts that are used: each file's internal HDF5 index, the
-    GLM flash variables (not the events and groups that make up most of a GLM file), and for ABI
-    only the image blocks that overlap `bounds`. This fetches about 68% of the bytes
-    (4.7 instead of 6.9 GB per day). Each file then takes a few requests in a row, so the requests
-    run in `byte_range_processes` worker processes. The stored data is identical either way.
+    variables that are stored (for GLM the flash and event variables and the ids linking them, not
+    the rest of the group data), and for ABI only the bands and image blocks that overlap
+    `bounds`. With the current products that is 4.9 GB per day out of 16.1 GB of source files.
+    Each file then takes a few requests in a row, so the requests run in `byte_range_processes`
+    worker processes. The stored data is identical either way.
 - `byte_range_processes` (48): with `"byte_ranges"`, worker processes that each fetch and decode
-  one file at a time. Each uses about 200 MB of memory.
+  one file at a time. Together they peaked at 7.7 GB of memory with the current products.
 - `max_concurrent_http_requests` (32): open connections shared by all days, for listing and, with
   `"whole_files"`, downloads. Byte-range workers use their own connections.
 - `http_timeout_seconds` (60): time limit for one request, including reading the whole file. With
@@ -153,7 +172,10 @@ Download speed is usually limited by the internet connection. On a connection th
 60 MB/s, 64 connections with 8 decode processes was no faster than the defaults, 128 connections
 was slower, and decoding used only about 1.3 CPU cores.
 
-Measured on one full day (2025-10-27) on that connection with 12 CPU cores:
+Measured on one full day (2025-10-27) on that connection with 12 CPU cores. With the current
+products, `"byte_ranges"` with 48 processes took 95 s, downloaded 4.9 GB, used 288 s of CPU and
+7.7 GB for the workers; `"whole_files"` would download 16.1 GB. An earlier comparison, with
+single-band files for bands 8, 11, 13 and 15 and GLM flashes only:
 
 | `download_method` | Time per day | Downloaded | CPU time | Worker memory |
 |---|---|---|---|---|

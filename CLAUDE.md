@@ -54,8 +54,8 @@ a few hours is still marked complete, and the real run would then skip that day.
 **Modules (`goes_downloader/`).** `config` (settings), `remote` (file names, listing, whole-file
 downloads with aiohttp), `decode` (NetCDF → packed arrays and flash/event tables; `DecodePool`),
 `crop` (bounds → ABI window), `ranges` (byte-range fetching in the workers), `store` (layout
-docstring, Zarr writing), `day` (`process_single_day`), `runner` (`run_all_days`, `main`, Ctrl-C),
-`report`, plus `common` (constants) and `progress` (`log`, the progress line; `progress.current`).
+docstring, Zarr writing), `day` (`process_single_day`), `runner` (`run_all_days`; `main` handles
+Ctrl-C and prints `report.print_report` after a finished run unless `--no-report`), `report`, plus `common` (constants) and `progress` (`log`, the progress line; `progress.current`).
 Pool workers import only `ranges`/`decode` and what they need: `download_raw.py` keeps its imports
 inside the main guard, and `remote` imports aiohttp inside `http_get`, so workers skip aiohttp and
 zarr (~146 MB each). Keep it that way (`test_entry_script_imports_nothing_outside_its_main_guard`).

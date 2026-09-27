@@ -45,7 +45,9 @@ left as `.zarr.tmp` folders, and running the same command again rebuilds those d
 
 `report.py` reads every day store in the config's date range and lists the days that need
 attention: not complete (or missing, or interrupted), an ABI product with less than 98% of its
-scans, or less than 99% GLM coverage.
+scans, or less than 99% GLM coverage. The download prints the same report when a run finishes,
+covering the whole date range including days done by earlier runs (not after Ctrl-C);
+`--no-report` skips it.
 
 ```bash
 python report.py --config config.json                  # summary and days needing attention

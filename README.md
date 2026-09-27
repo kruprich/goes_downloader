@@ -106,6 +106,10 @@ python report.py --config config.json --all --csv days.csv
   changing the products or `bounds`.
 - `download`: the product keys to fetch (see below).
 
+A key the downloader doesn't know is reported when the run starts (`!! ... ignoring keys the
+downloader doesn't use`), since a misspelled setting would otherwise silently fall back to its
+default. Keys starting with `_`, such as `"_comment"`, are for notes and are skipped silently.
+
 Days that ended less than 24 hours before the run are stored but not marked complete (the report
 shows them as "too recent"); any later run rebuilds them, and marks them complete once the
 24 hours have passed.

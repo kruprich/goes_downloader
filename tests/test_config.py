@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from goes_downloader.config import load_config
+from goes_downloader.config import load_config, unknown_keys
 from goes_downloader.crop import crop_slice
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +25,23 @@ def write_config(tmp_path, **changes):
 def test_repo_config_loads():
     cfg = load_config(os.path.join(REPO, "config.json"))
     assert cfg.abi_products and cfg.glm_product is not None
+    assert unknown_keys(json.load(open(os.path.join(REPO, "config.json")))) == []
+
+
+def test_unknown_keys_are_reported(tmp_path, capsys):
+    raw = json.load(open(os.path.join(REPO, "config.json")))
+    raw["byte_range_process"] = 32  # typo for byte_range_processes
+    raw["_comment"] = "keys starting with _ are notes"
+    raw["bounds"]["lat_mn"] = 20.0
+    raw["abi_products"][0]["precison"] = 0.5
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    cfg = load_config(str(path))  # still loads
+    out = capsys.readouterr().out
+    for key in ("byte_range_process", "bounds.lat_mn", "abi_products[cmip_c01].precison"):
+        assert key in out
+    assert "_comment" not in out
+    assert cfg.byte_range_processes == 48  # the typo fell back to the default, hence the warning
 
 
 def test_infrared_bands_get_cmip_precision_in_both_band_sets(tmp_path):

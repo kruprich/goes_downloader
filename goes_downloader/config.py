@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from .progress import log
+
 @dataclass(frozen=True)
 class ProductSpec:
     key: str
@@ -80,10 +82,42 @@ def is_cmip_ir_band(product: Dict[str, Any]) -> bool:
     return bool(m) and int(m.group(1)) >= 7
 
 
+# Every key the downloader reads. Others are reported (they are usually typos, which would
+# silently fall back to a default); keys starting with "_" are skipped silently, e.g. "_comment".
+TOP_LEVEL_KEYS = {
+    "gcs_bucket", "start_date_utc", "end_date_utc", "raw_output_root_dir", "overwrite_existing",
+    "download_method", "byte_range_processes", "max_concurrent_http_requests", "http_timeout_seconds",
+    "http_retries", "max_decode_processes", "max_days_in_flight", "max_inflight_payloads",
+    "bounds", "cmip_precision", "download", "abi_products", "glm_product",
+}
+ABI_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain", "data_variable", "dqf_variable", "precision"}
+GLM_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain"}
+BOUNDS_KEYS = {"lat_min", "lat_max", "lon_min", "lon_max"}
+
+
+def unknown_keys(raw: Dict[str, Any]) -> List[str]:
+    """Keys in a loaded config that the downloader doesn't read, as dotted paths."""
+    def check(d: Any, known: set, where: str) -> List[str]:
+        if not isinstance(d, dict):
+            return []
+        return [f"{where}{k}" for k in d if k not in known and not str(k).startswith("_")]
+
+    out = check(raw, TOP_LEVEL_KEYS, "")
+    for i, p in enumerate(raw.get("abi_products") or []):
+        name = p.get("key", i) if isinstance(p, dict) else i
+        out += check(p, ABI_PRODUCT_KEYS, f"abi_products[{name}].")
+    out += check(raw.get("glm_product"), GLM_PRODUCT_KEYS, "glm_product.")
+    out += check(raw.get("bounds"), BOUNDS_KEYS, "bounds.")
+    return out
+
+
 def load_config(config_path: str) -> RawConfig:
-    """Reads the shared config.json; keys only used by the feature step are ignored."""
+    """Reads config.json; logs any key it doesn't use (see TOP_LEVEL_KEYS)."""
     with open(config_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+    unknown = unknown_keys(raw)
+    if unknown:
+        log(f"!! {config_path}: ignoring keys the downloader doesn't use (typos?): {', '.join(unknown)}")
 
     # One precision (K) for every infrared CMIP band; a product's own "precision" overrides it
     cmip_precision = raw.get("cmip_precision")

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goes-downloader"
+version = "0.1.0"
+description = "Mirror GOES-19 ABI and GLM data into one raw Zarr store per UTC day"
+readme = "README.md"
+# The tested versions in requirements.lock need 3.12 (numpy 2.5, pyproj 3.8), and 3.14 is excluded
+# because zarr<3 needs numcodecs<0.16, which has no Python 3.14 wheel
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "aiohttp",
+    "h5py",
+    "netCDF4",
+    "numpy",
+    "pyproj",
+    "zarr>=2.18,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pyflakes", "pytest"]
+
+# No console scripts: generated entry scripts import the package at top level, and the spawned
+# pool workers re-run the main script, so they would load aiohttp and zarr (see download_raw.py).
+[tool.setuptools]
+packages = ["goes_downloader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["network: downloads real GOES files from the public bucket (run with --network)"]
+filterwarnings = [
+    # netCDF4 writing the synthetic test files, with NumPy 2.5
+    "ignore:Setting the shape on a NumPy array:DeprecationWarning",
+]

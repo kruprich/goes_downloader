@@ -30,20 +30,24 @@ The full store layout, including every attribute, is described in the docstring 
 | `config.json` | Date range, output folder, products to download and all settings |
 | `goes_downloader/` | The code; `store.py` documents the store layout |
 | `tests/` | The test suite (see [Tests](#tests)) |
-| `requirements.txt`, `requirements.lock`, `requirements-dev.txt` | Dependencies; exact tested versions; test tools |
+| `pyproject.toml` | The package, supported Python versions, dependencies and test settings |
+| `requirements.lock` | The exact dependency versions it was tested with |
+| `.github/workflows/tests.yml` | Runs the offline tests on GitHub for every push |
 
 ## Setup
 
-Use Python 3.11–3.13 (tested with 3.13). Python 3.14 does not work: the `zarr<3` pin needs
-`numcodecs<0.16`, which has no 3.14 wheel, so installing tries to compile it.
+Use Python 3.12 or 3.13 (both tested). The tested versions in `requirements.lock` need 3.12 or
+newer, and Python 3.14 does not work: the `zarr<3` pin needs `numcodecs<0.16`, which has no 3.14
+wheel. Installing on another version stops with "requires a different Python".
 
 ```bash
 uv venv --python 3.13 .venv && source .venv/bin/activate   # or: python3.13 -m venv .venv
-uv pip install -r requirements.lock                        # or: pip install -r requirements.lock
+uv pip install -e . -c requirements.lock                   # or: pip install -e . -c requirements.lock
 ```
 
-`requirements.lock` holds the exact versions the downloader was tested with; `requirements.txt`
-lists the direct dependencies without pins.
+`pyproject.toml` lists the direct dependencies; `-c requirements.lock` holds them to the exact
+versions the downloader was tested with. `-e` installs the package in place, so edits to the code
+take effect without reinstalling.
 
 What a run needs, with the current config (measured on 2025-10-27, 12 CPU cores, ~60 MB/s):
 
@@ -277,14 +281,17 @@ bandwidth-bound ABI files only because files start in scan-time order.
 ## Tests
 
 ```bash
-uv pip install -r requirements-dev.txt
+uv pip install -e ".[dev]" -c requirements.lock
 pytest              # offline, under a second: small synthetic files stand in for the GOES ones
 pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
 ```
 
+GitHub runs pyflakes and the offline tests on Python 3.12 and 3.13 for every push and pull
+request (`.github/workflows/tests.yml`); the network tests are run by hand.
+
 ## Troubleshooting
 
-- **Installing fails while building `numcodecs`:** you are on Python 3.14; use 3.11–3.13.
+- **"requires a different Python" when installing:** use Python 3.12 or 3.13.
 - **A day stays incomplete:** run the same command again; failed files are retried. The `!!` log
   lines and `report.py` show which days and files failed. A file that fails on every run points
   to a problem with that file at the source.

@@ -1,6 +1,0 @@
-aiohttp
-h5py
-netCDF4
-numpy
-pyproj
-zarr>=2.18,<3

@@ -52,7 +52,7 @@ take effect without reinstalling.
 What a run needs, with the current config (measured on 2025-10-27, 12 CPU cores, ~60 MB/s):
 
 - **Disk:** about 2.1 GB per day stored (measured on an October day; summer days hold more
-  daylight imagery), so ~1.13–1.25 TB for the 537 days of the configured range.
+  daylight imagery), so ~1.12–1.24 TB for the 534 days of the configured range.
 - **Network:** about 4.9 GB per day downloaded. A day takes 95–110 s, so the range takes 14–16 h.
 - **Memory:** about 10 GB: 7.2–7.7 GB for the 48 byte-range workers and up to 1.9 GB for the main
   process, which holds a day's GLM events until the day is written. Lower `byte_range_processes`
@@ -105,10 +105,10 @@ python report.py --config config.json --all --csv days.csv
 
 - `gcs_bucket`: the public bucket to read (`gcp-public-data-goes-19`).
 - `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included. The
-  config starts on 2025-04-07, when NOAA declared GOES-19 operational as GOES-East; its data is on
-  the operational 75.0°W grid from 2025-04-02, and before 2025-03-20 it came from the 89.5°W test
-  position (don't mix the two). It ends on the latest day that had ended 24 hours before the last
-  update; move the end date forward and run again to add newer days.
+  config starts on 2025-04-10, just after NOAA declared GOES-19 operational as GOES-East on
+  2025-04-07. Its data is on the operational 75.0°W grid from 2025-04-02, and before 2025-03-20 it
+  came from the 89.5°W test position (don't mix the two). It ends on the latest day that had ended
+  24 hours before the last update; move the end date forward and run again to add newer days.
 - `raw_output_root_dir` (default `./goes_raw`, relative to where you run the command): where the
   day stores go. The config uses `./goes_raw2`; `goes_raw*/` folders are git-ignored.
 - `overwrite_existing` (default `false`): rebuild days that are already complete, e.g. after

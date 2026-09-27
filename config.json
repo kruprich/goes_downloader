@@ -1,6 +1,6 @@
 {
   "gcs_bucket": "gcp-public-data-goes-19",
-  "start_date_utc": "2025-04-07",
+  "start_date_utc": "2025-04-10",
   "end_date_utc": "2026-09-25",
   "raw_output_root_dir": "./goes_raw2",
   "overwrite_existing": false,

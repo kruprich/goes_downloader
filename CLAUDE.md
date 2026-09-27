@@ -172,7 +172,8 @@ the product/bounds key sets) as well as read.
 - Output goes to `raw_output_root_dir` (default `./goes_raw`; the config uses `./goes_raw2`;
   `goes_raw*/` is git-ignored). `goes_raw/` holds 28 days from an older product list (bands 8, 11,
   13, 15; no GLM events) that the user kept; don't mix it with `goes_raw2/`. Current config:
-  2025-04-07 (GOES-19 operational as GOES-East) to 2026-09-25, 537 days, about 2.1 GB/day stored
-  with the NOAA CONUS bounds (~1.13–1.25 TB). With `"byte_ranges"` a day downloads 4.9 GB and
+  2025-04-10 (GOES-19 became operational as GOES-East on 2025-04-07) to 2026-09-25, 534 days, about
+  2.1 GB/day stored
+  with the NOAA CONUS bounds (~1.12–1.24 TB). With `"byte_ranges"` a day downloads 4.9 GB and
   takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
   16.1 GB/day because of the MCMIPC files.

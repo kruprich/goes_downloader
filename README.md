@@ -18,12 +18,16 @@ For each UTC day it:
    succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
    Incomplete days are rebuilt on the next run.
 
-The full layout is described in the docstring at the top of `download_raw.py`.
+The full layout is described in the docstring at the top of `goes_downloader/store.py`.
 
 ## Usage
 
+Use Python 3.11–3.13: the `zarr<3` pin needs `numcodecs<0.16`, which has no Python 3.14 wheel.
+`requirements.lock` holds the exact versions the downloader was tested with.
+
 ```bash
-pip install -r requirements.txt
+uv venv --python 3.13 .venv && source .venv/bin/activate
+uv pip install -r requirements.lock        # or: pip install -r requirements.lock
 python download_raw.py --config config.json
 ```
 
@@ -33,6 +37,28 @@ While it runs, the last line shows a progress bar, days done, data downloaded, d
 disk (added as each day finishes), download speed (last 30 s) and an ETA. The ETA uses each
 day's exact size once the day is listed and the average listed day for days not reached yet.
 When output is redirected to a file, a progress line is printed once a minute instead.
+
+Ctrl-C stops the run within a few seconds: files being decoded finish, the days in progress are
+left as `.zarr.tmp` folders, and running the same command again rebuilds those days and continues.
+
+## Checking the data
+
+`report.py` reads every day store in the config's date range and lists the days that need
+attention: not complete (or missing, or interrupted), an ABI product with less than 98% of its
+scans, or less than 99% GLM coverage.
+
+```bash
+python report.py --config config.json                  # summary and days needing attention
+python report.py --config config.json --all --csv days.csv
+```
+
+## Tests
+
+```bash
+uv pip install -r requirements-dev.txt
+pytest              # offline, in seconds: small synthetic files stand in for the GOES ones
+pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
+```
 
 ## Choosing products
 

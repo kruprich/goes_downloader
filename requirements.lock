@@ -1,0 +1,24 @@
+# Exact versions the downloader was tested with (Python 3.13, Linux, September 2026).
+# Install with: uv pip install -r requirements.lock   (or: pip install -r requirements.lock)
+# requirements.txt lists the direct dependencies without pins.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+asciitree==0.3.3
+attrs==26.1.0
+certifi==2026.7.22
+cftime==1.6.5
+deprecated==3.0.0
+fasteners==0.20
+frozenlist==1.8.0
+h5py==3.16.0
+idna==3.20
+multidict==6.9.1
+netcdf4==1.7.4
+numcodecs==0.15.1
+numpy==2.5.3
+propcache==0.5.4
+pyproj==3.8.0
+wrapt==2.4.1
+yarl==1.25.1
+zarr==2.18.7

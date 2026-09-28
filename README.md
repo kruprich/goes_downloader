@@ -322,6 +322,10 @@ on the next run. Changing the `features` config doesn't touch days already compl
 - `grid.bounds`: lat/lon box of the grid; left out, the download `bounds`; `null`, everything stored.
 - `time_step_minutes` (15): how often a sample is written. Channels are always computed on the
   5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5 minutes whatever the step.
+- `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc `codec`,
+  `level`, `shuffle`; default LZ4HC 5 with byte shuffle): how the frames are stored. Training reads
+  whole frames, and in one chunk with LZ4HC a frame reads in 1.7 ms, against 9.8 ms with zstd 3,
+  bit shuffle and 256x256 chunks, for 5% more disk; building costs the same.
 
 Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends
 there, and every label window starts there.
@@ -405,11 +409,12 @@ repo's evaluation area and coastal band), not model inputs.
 
 ### Size and speed
 
-Measured on 10-13 April 2025 with the default config (11 stored channels, 4 km, every 15 minutes,
-float16), while the download ran: about 0.30 GB per day, so about 160 GB for the 534-day range, and
-52-56 s per day with 3 days built in parallel (about 2.6 hours for the range). The geography store
-takes about 16 s once its sources are cached, 14 s of it for the borders. Mapping a day's ~50 million GLM events to cells
-takes about 6 s of that.
+With the default config (11 stored channels, 4 km, every 15 minutes, float16, LZ4HC): about 0.33 GB
+per day for Apr 10 – May 9 2025, so about 176 GB for the 534-day range. On an otherwise idle machine
+a day takes about 33 s and 130 CPU-seconds (a build uses about 4 cores), of which mapping the day's
+~50 million GLM events to cells is about 6 s. While a download runs, 3 days in parallel took 52–116 s
+each: build with fewer `--workers`, or while the download is stopped. The geography store takes about
+16 s once its sources are cached, 14 s of it for the borders.
 
 ## Tests
 

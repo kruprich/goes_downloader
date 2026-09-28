@@ -206,6 +206,21 @@ def test_channels_match_the_raw_pixels(built, tmp_path):
     assert np.isfinite(F["features"][34, 0]).any()
 
 
+def test_frames_are_stored_whole_with_the_configured_compression(built, tmp_path):
+    cfg, grid = built
+    build_day(cfg, grid, DAY1)
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
+    for name in ("features", "labels", "flash_count", "flash_extent"):
+        a = F[name]
+        assert a.chunks == (1, *a.shape[1:]) and (a.compressor.cname, a.compressor.clevel, a.compressor.shuffle) == ("lz4hc", 5, 1)
+    other = load_feature_config(config(tmp_path, chunk_yx=[8, 8], compression={"codec": "zstd", "level": 3, "shuffle": "bit"},
+                                       output_root_dir=str(tmp_path / "other")))
+    build_day(other, grid, DAY1)
+    G = zarr.open_consolidated(str(tmp_path / "other/2025/2025152.zarr"), mode="r")
+    assert G["features"].chunks[2:] == (8, 8) and (G["features"].compressor.cname, G["features"].compressor.shuffle) == ("zstd", 2)
+    np.testing.assert_array_equal(G["features"][:], F["features"][:])
+
+
 def test_lag_reads_the_previous_day_and_mask_follows_the_sun(built, tmp_path):
     cfg, grid = built
     build_day(cfg, grid, DAY2)
@@ -409,6 +424,9 @@ def test_glm_mapping_round_trips_through_the_grid(built):
     ({"labels": [{"name": "l", "end_minutes": 30, "source": "density"}]}, "source must be"),
     ({"grid": {"resolution_km": 4, "bound": None}}, "unknown keys"),
     ({"geography": {"fields": [{"name": "d", "borders": "distance_km", "file": "b.geojson"}]}}, "distance_km needs countries"),
+    ({"compression": {"codec": "snappy"}}, "codec must be one of"),
+    ({"compression": {"level": 12}}, "level must be"),
+    ({"chunk_yx": [256]}, "chunk_yx must be"),
     ({"geography": {"fields": [{"name": "d", "borders": "area", "file": "b.geojson"}]}}, "borders must be one of"),
     ({"geography": {"fields": [{"name": "d", "borders": "fraction", "file": "b.geojson", "within": [50, 20, 0, 1]}]}}, "within must be"),
 ])

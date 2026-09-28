@@ -425,7 +425,8 @@
     },
     "time_step_minutes": 15,
     "dtype": "float16",
-    "chunk_yx": [256, 256],
+    "chunk_yx": null,
+    "compression": {"codec": "lz4hc", "level": 5, "shuffle": "byte"},
     "glm": {
       "quality_flags": null,
       "lightning_ellipsoid_km": {"equatorial": 14.0, "polar": 6.0},

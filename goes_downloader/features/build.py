@@ -79,7 +79,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     """Builds one day's feature store. Runs in a worker process."""
     import zarr
 
-    from ..store import COMPRESSOR, _write_array, directory_size
+    from ..store import _write_array, directory_size
 
     t_start = time.monotonic()
     day = datetime.strptime(day_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -110,11 +110,14 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     shutil.rmtree(tmp_path, ignore_errors=True)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     root = zarr.open_group(zarr.DirectoryStore(tmp_path), mode="w")
-    n_t, cy, cx = len(out_slots), min(cfg.chunk_yx[0], grid.ny), min(cfg.chunk_yx[1], grid.nx)
+    n_t = len(out_slots)
+    cy, cx = (grid.ny, grid.nx) if cfg.chunk_yx is None else (min(cfg.chunk_yx[0], grid.ny), min(cfg.chunk_yx[1], grid.nx))
+    codec, level, shuffle = cfg.compression
+    compressor = zarr.Blosc(cname=codec, clevel=level, shuffle={"byte": zarr.Blosc.SHUFFLE, "bit": zarr.Blosc.BITSHUFFLE, "none": zarr.Blosc.NOSHUFFLE}[shuffle])
 
     def frames(name: str, lead: List[int], dtype: Any, fill: Any, dims: List[str]) -> Any:
         a = root.create_dataset(name, shape=(n_t, *lead, *shape), chunks=(1, *lead, cy, cx), dtype=dtype,
-                                fill_value=fill, compressor=COMPRESSOR, overwrite=True)
+                                fill_value=fill, compressor=compressor, overwrite=True)
         a.attrs.update({"_ARRAY_DIMENSIONS": dims, "coordinates": "lat lon"})
         return a
 

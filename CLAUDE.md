@@ -220,5 +220,6 @@ from `lookback` slots before the day to its end, keeping only the slots `lag`/`*
   takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
   16.1 GB/day because of the MCMIPC files.
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
-  in it; geography sources are cached in `./goes_static`. Current config: about 0.30 GB/day
-  (~160 GB for the range), 52–56 s per day with 3 workers.
+  in it; geography sources are cached in `./goes_static`. Current config: about 0.33 GB/day
+  (~176 GB for the range), stored as whole-frame LZ4HC chunks (reads 5.8x faster than zstd in
+  256x256 chunks); a day takes ~33 s and ~4 cores on an idle machine, much longer next to a download.

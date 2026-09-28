@@ -21,6 +21,8 @@ SOLAR_VALUES = ("cos_zenith", "local_hour_sin", "local_hour_cos")
 GEOMETRY_VALUES = ("satellite_zenith", "latitude", "longitude")
 GEOGRAPHY_AGGREGATIONS = ("mean", "std", "min", "max")
 BORDERS_VALUES = ("fraction", "distance_km")
+COMPRESSION_CODECS = ("lz4hc", "lz4", "zstd", "zlib", "blosclz")
+COMPRESSION_SHUFFLES = ("byte", "bit", "none")
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,8 @@ class FeatureConfig:
     reference_product: Optional[str]
     time_step_slots: int
     dtype: str
-    chunk_yx: Tuple[int, int]
+    chunk_yx: Optional[Tuple[int, int]]  # None: one chunk per time step (whole frames are what gets read)
+    compression: Tuple[str, int, str]  # Blosc (codec, level, shuffle) of the frame arrays
     glm_quality_flags: Optional[Tuple[int, ...]]
     glm_ellipsoid_km: Optional[Tuple[float, float]]  # (equatorial, polar) heights above the ground ellipsoid
     glm_min_coverage: float
@@ -120,7 +123,7 @@ LABEL_KEYS = {"name", "description", "start_minutes", "end_minutes", "min_flashe
 GEOGRAPHY_FIELD_KEYS = {"name", "description", "geometry", "url", "file", "variable", "aggregation", "clip", "scale", "offset",
                         "borders", "countries", "within"}
 FEATURE_KEYS = {"output_root_dir", "start_date_utc", "end_date_utc", "overwrite_existing", "max_workers", "grid",
-                "time_step_minutes", "dtype", "chunk_yx", "glm", "channels", "labels", "geography"}
+                "time_step_minutes", "dtype", "chunk_yx", "compression", "glm", "channels", "labels", "geography"}
 
 
 def minutes_to_slots(v: Any, what: str, positive: bool = False) -> int:
@@ -332,9 +335,20 @@ def load_feature_config(config_path: str) -> FeatureConfig:
     dtype = section.get("dtype", "float16")
     if dtype not in ("float16", "float32"):
         raise ValueError("features.dtype must be \"float16\" or \"float32\"")
-    chunk_yx = section.get("chunk_yx", [256, 256])
-    if not (isinstance(chunk_yx, list) and len(chunk_yx) == 2 and all(isinstance(v, int) and v > 0 for v in chunk_yx)):
-        raise ValueError("features.chunk_yx must be two positive integers")
+    chunk_yx = section.get("chunk_yx")
+    if chunk_yx is not None and not (isinstance(chunk_yx, list) and len(chunk_yx) == 2 and all(isinstance(v, int) and v > 0 for v in chunk_yx)):
+        raise ValueError("features.chunk_yx must be two positive integers, or null for whole frames")
+    compression = section.get("compression", {})
+    if not isinstance(compression, dict):
+        raise ValueError("features.compression must be an object")
+    _unknown(compression, {"codec", "level", "shuffle"}, "features.compression")
+    codec, level, shuffle = compression.get("codec", "lz4hc"), compression.get("level", 5), compression.get("shuffle", "byte")
+    if codec not in COMPRESSION_CODECS:
+        raise ValueError(f"features.compression.codec must be one of {COMPRESSION_CODECS}, got {codec!r}")
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 9:
+        raise ValueError("features.compression.level must be an integer from 0 to 9")
+    if shuffle not in COMPRESSION_SHUFFLES:
+        raise ValueError(f"features.compression.shuffle must be one of {COMPRESSION_SHUFFLES}, got {shuffle!r}")
 
     glm = section.get("glm", {})
     _unknown(glm, {"quality_flags", "lightning_ellipsoid_km", "min_coverage"}, "features.glm")
@@ -361,7 +375,8 @@ def load_feature_config(config_path: str) -> FeatureConfig:
         reference_product=reference_product,
         time_step_slots=step,
         dtype=dtype,
-        chunk_yx=(chunk_yx[0], chunk_yx[1]),
+        chunk_yx=None if chunk_yx is None else (chunk_yx[0], chunk_yx[1]),
+        compression=(codec, level, shuffle),
         glm_quality_flags=None if flags is None else _int_list(flags, "features.glm.quality_flags"),
         glm_ellipsoid_km=None if ellipsoid is None else (float(ellipsoid["equatorial"]), float(ellipsoid["polar"])),
         glm_min_coverage=_fraction(glm.get("min_coverage", 0.95), "features.glm.min_coverage"),

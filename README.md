@@ -171,7 +171,10 @@ its row in the same day's `glm/files`, so it no longer identifies a file once se
 combined; use the flash times instead.
 
 `glm/events` holds every GLM event (one lit pixel of the lightning sensor at one moment) with its
-`lat`, `lon` and `flash_index`, the row of its flash in the same day's `glm/flashes`. Events are
+`lat`, `lon` and `flash_index`, the row of its flash in the same day's `glm/flashes`. NOAA's files
+contain some orphan events whose group or flash isn't in the file (e.g. 64 of 2,410 events in one
+file on 2025-04-22); they are kept with `flash_index` -1 and counted in `glm/files/n_orphan_events`
+and the day's `n_glm_orphan_events`. Events are
 what shows how far each flash spread, which a flash-extent density needs; the flash table only has
 each flash's centre and area. Like `file_index`, `flash_index` only works within one day's store.
 
@@ -189,8 +192,7 @@ day incomplete so it is retried and visible in the log:
 - Within a day, each product's grid (shape and x/y scan angles), fill value and quality-flag data
   type stay the same as in its first scan.
 - Data values are packed integers that fit in 16 bits; quality flags fit in 8 or 16 bits.
-- In each GLM file, event, group and flash ids are unique, and every event's parent group and
-  every group's parent flash are in the same file.
+- In each GLM file, group and flash ids are unique.
 
 **Recorded, but expected to stay constant.** `scale_factor` and `add_offset` are stored for every
 scan, so a change would be captured. For GOES-19 they have never changed: one file per month for

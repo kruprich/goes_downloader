@@ -172,21 +172,26 @@ GLM_READ_VARIABLES = [*GLM_FLASH_VARIABLES.values(), *GLM_EVENT_VARIABLES, *GLM_
 
 
 def _parent_rows(parent_ids: np.ndarray, ids: np.ndarray, what: str) -> np.ndarray:
-    """Row in `ids` of each parent id; every id must be unique and every parent present."""
+    """
+    Row in `ids` of each parent id, or -1 where the parent is not in the file. NOAA's files have such
+    orphans (e.g. 64 of 2410 events on 2025-04-22 16:08:20 pointed at groups the file doesn't hold),
+    so they are kept rather than failing the file. Duplicate ids are an error.
+    """
     order = np.argsort(ids, kind="stable")
     sorted_ids = ids[order]
     if np.any(sorted_ids[1:] == sorted_ids[:-1]):
         raise ValueError(f"{what}: duplicate ids")
-    if len(parent_ids) == 0:
-        return np.zeros(0, dtype=np.int32)
-    pos = np.minimum(np.searchsorted(sorted_ids, parent_ids), max(len(ids) - 1, 0))
-    if len(ids) == 0 or np.any(sorted_ids[pos] != parent_ids):
-        raise ValueError(f"{what}: parent id missing from the file")
-    return order[pos].astype(np.int32)
+    if len(parent_ids) == 0 or len(ids) == 0:
+        return np.full(len(parent_ids), -1, dtype=np.int32)
+    pos = np.minimum(np.searchsorted(sorted_ids, parent_ids), len(ids) - 1)
+    return np.where(sorted_ids[pos] == parent_ids, order[pos], -1).astype(np.int32)
 
 
 def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
-    """The flash columns, plus event_lat, event_lon and event_flash (row of the event's flash in this file)."""
+    """
+    The flash columns, plus event_lat, event_lon and event_flash: the row of the event's flash in this
+    file, or -1 for an orphan (its group, or its group's flash, is not in the file).
+    """
     import netCDF4 as nc
 
     def floats(var: Any) -> np.ndarray:
@@ -211,7 +216,7 @@ def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
             "quality_flag": quality.astype(np.uint8).reshape(-1),
             "event_lat": floats(var["event_lat"]),
             "event_lon": floats(var["event_lon"]),
-            "event_flash": group_flash[event_group],
+            "event_flash": np.where(event_group >= 0, group_flash[event_group], -1).astype(np.int32),
         }
 
 

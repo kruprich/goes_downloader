@@ -33,10 +33,9 @@ def test_parent_rows():
     ids = np.array([30, 10, 20])
     assert _parent_rows(np.array([20, 30, 30, 10]), ids, "x").tolist() == [2, 0, 0, 1]
     assert _parent_rows(np.array([], dtype=np.int64), ids, "x").tolist() == []
-    with pytest.raises(ValueError, match="missing"):
-        _parent_rows(np.array([40]), ids, "x")
-    with pytest.raises(ValueError, match="missing"):
-        _parent_rows(np.array([1]), np.array([], dtype=np.int64), "x")
+    # Parents not in the file (NOAA's orphans) give -1
+    assert _parent_rows(np.array([40, 10]), ids, "x").tolist() == [-1, 1]
+    assert _parent_rows(np.array([1]), np.array([], dtype=np.int64), "x").tolist() == [-1]
     with pytest.raises(ValueError, match="duplicate"):
         _parent_rows(np.array([10]), np.array([10, 10]), "x")
 
@@ -53,15 +52,25 @@ def test_glm_events_link_to_their_flash(glm_file):
     assert (decoded["time_first_ns"] > np.datetime64("2025-10-27T17:59", "ns").astype(np.int64)).all()
 
 
-def test_glm_file_with_a_missing_parent_is_an_error(tmp_path):
+def test_orphan_events_are_kept_without_a_flash(tmp_path):
     import netCDF4 as nc
     from conftest import make_glm_file
 
     path = tmp_path / "glm.nc"
-    make_glm_file(path)
+    _, expected = make_glm_file(path)
     with nc.Dataset(path, "a") as ds:
-        v = ds["group_parent_flash_id"]
-        v.set_auto_maskandscale(False)
-        v[0] = 32000  # no such flash
-    with pytest.raises(ValueError, match="group_parent_flash_id"):
-        decode_glm_file(path.read_bytes())
+        groups = ds["group_id"]
+        groups.set_auto_maskandscale(False)
+        events = ds["event_parent_group_id"]
+        events.set_auto_maskandscale(False)
+        parents = events[:]
+        events[0] = 999_999  # a group that isn't in the file
+        flash_of_group = ds["group_parent_flash_id"]
+        flash_of_group.set_auto_maskandscale(False)
+        flash_of_group[0] = 32000  # a flash that isn't in the file
+        orphaned_group = groups[0]
+    decoded = decode_glm_file(path.read_bytes())
+    want = expected.copy()
+    want[0] = -1
+    want[parents == orphaned_group] = -1
+    assert decoded["event_flash"].tolist() == want.tolist() and (want == -1).sum() >= 2

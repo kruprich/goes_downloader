@@ -23,7 +23,7 @@ def glm_table(first_seconds, lats, event_flash):
         "area_m2": np.ones(n, np.float32),
         "energy_j": np.ones(n, np.float32),
         "quality_flag": np.zeros(n, np.uint8),
-        "event_lat": np.array([lats[i] for i in event_flash], dtype=np.float32),  # an event sits on its flash here
+        "event_lat": np.array([lats[i] if i >= 0 else -99.0 for i in event_flash], dtype=np.float32),  # on its flash
         "event_lon": np.zeros(len(event_flash), np.float32),
         "event_flash": np.array(event_flash, dtype=np.int32),
     }
@@ -37,12 +37,12 @@ def test_events_point_at_their_flash_after_sorting(tmp_path):
     ]
     # File 1 failed; flashes are out of time order within and across files
     tables = {
-        0: glm_table([15.0, 2.0, 9.0], [10.0, 11.0, 12.0], [0, 0, 2, 1, 2]),
+        0: glm_table([15.0, 2.0, 9.0], [10.0, 11.0, 12.0], [0, 0, 2, 1, 2, -1]),  # the last is an orphan
         2: glm_table([41.0, 40.5], [20.0, 21.0], [1, 1, 0]),
     }
     root = zarr.open_group(str(tmp_path / "day.zarr"), mode="w")
     n_flashes, n_events, n_covered = write_glm_tables(root, DAY, files, np.array([True, False, True]), tables)
-    assert (n_flashes, n_events, n_covered) == (5, 8, 2)
+    assert (n_flashes, n_events, n_covered) == (5, 9, 2)
 
     flashes, events = root["glm/flashes"], root["glm/events"]
     times = flashes["time_first_ns"][:]
@@ -50,8 +50,11 @@ def test_events_point_at_their_flash_after_sorting(tmp_path):
     assert flashes["lat"][:].tolist() == [11.0, 12.0, 10.0, 21.0, 20.0]
     assert flashes["file_index"][:].tolist() == [0, 0, 0, 2, 2]
     # Every event still points at its own flash (same latitude) after the flashes were sorted
-    assert (flashes["lat"][:][events["flash_index"][:]] == events["lat"][:]).all()
+    index = events["flash_index"][:]
+    assert index.tolist().count(-1) == 1 and events["lat"][:][index == -1].tolist() == [-99.0]
+    assert (flashes["lat"][:][index[index >= 0]] == events["lat"][:][index >= 0]).all()
     assert root["glm/files/n_flashes"][:].tolist() == [3, 0, 2]
-    assert root["glm/files/n_events"][:].tolist() == [5, 0, 3]
+    assert root["glm/files/n_events"][:].tolist() == [6, 0, 3]
+    assert root["glm/files/n_orphan_events"][:].tolist() == [1, 0, 0] and root.attrs["n_glm_orphan_events"] == 1
     covered = root["glm/coverage/covered"][:]
     assert len(covered) == GLM_WINDOWS_PER_DAY and covered[:3].tolist() == [1, 0, 1] and covered.sum() == 2

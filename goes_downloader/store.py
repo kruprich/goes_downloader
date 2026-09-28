@@ -36,14 +36,15 @@ other band and every band of the all-band MCMIP file: 2 km, 1500x2500; ACM, ACTP
 
 GLM (only if "glm" is in the config's "download" list): every flash and event from every 20 s file whose
 start falls in the day, all quality flags kept.
-  glm/files/{start_ns,end_ns,ok,n_flashes,n_events}[file]    one row per file NOAA published for the day
+  glm/files/{start_ns,end_ns,ok,n_flashes,n_events,n_orphan_events}[file]    one row per file NOAA published
   glm/flashes/{time_first_ns,time_last_ns,lat,lon,area_m2,energy_j,quality_flag,file_index}[flash]
                                        file_index is the row in the same day's glm/files; it is not
                                        unique once several days are combined
   glm/events/{lat,lon,flash_index}[event]   every event (one lit sensor pixel at one moment), in file
                                        order; flash_index is the row of its flash in the same day's
-                                       glm/flashes. Events give each flash's footprint, which a
-                                       flash-extent density needs
+                                       glm/flashes, or -1 for an orphan event whose group or flash
+                                       isn't in its file (NOAA's files have some). Events give each
+                                       flash's footprint, which a flash-extent density needs
   glm/coverage/time[window]            datetime64 start of each 20 s window (4320 per day)
   glm/coverage/covered[window]         uint8  1 if a GLM file for the window was published and decoded
   Windows with covered=0 are gaps (NOAA published no file, or it failed): no flashes there does NOT
@@ -65,6 +66,7 @@ Root attrs:
   completed_utc          when a complete store was written (null otherwise)
   n_listing_errors, n_file_errors, n_abi_slot_collisions (extra scans in an already filled slot)
   n_glm_files, n_glm_flashes, n_glm_events, n_glm_windows_missing (null without GLM)
+  n_glm_orphan_events    events stored with flash_index -1 (their group or flash isn't in the file)
   day_utc, year, julian_day, slots_per_day, slot_seconds, slot_rule, time_encoding
   source_gcs_bucket, source_satellite_label, abi_product_keys, glm_included
   bounds                 the configured lat/lon box (null for none); crop_scan_angle_rect is the
@@ -266,12 +268,14 @@ def write_glm_tables(
 
     n_flashes = np.array([len(tables[i]["lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
     n_events = np.array([len(tables[i]["event_lat"]) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
+    n_orphans = np.array([int((tables[i]["event_flash"] < 0).sum()) if i in tables else 0 for i in range(len(files))], dtype=np.int32)
     fg = g.require_group("files")
     _write_array(fg, "start_ns", np.array([to_ns(f.start) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
     _write_array(fg, "end_ns", np.array([to_ns(f.end) for f in files], dtype=np.int64), ["file"], **TIME_ATTRS)
     _write_array(fg, "ok", file_ok.astype(np.uint8), ["file"])
     _write_array(fg, "n_flashes", n_flashes, ["file"])
     _write_array(fg, "n_events", n_events, ["file"])
+    _write_array(fg, "n_orphan_events", n_orphans, ["file"])
 
     def write_column(group: Any, name: str, arr: np.ndarray, dim: str, **attrs: Any) -> None:
         _write_array(group, name, arr, [dim], **attrs, zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR))
@@ -290,15 +294,19 @@ def write_glm_tables(
     for k, arr in merged.items():
         write_column(flash_group, k, arr[order], "flash", **(TIME_ATTRS if k.startswith("time_") else {}))
 
-    # Events in file order; flash_index is the row of the event's flash in glm/flashes
+    # Events in file order; flash_index is the row of the event's flash in glm/flashes, -1 for orphans
     sorted_row = np.empty(len(order), dtype=np.int32)
     sorted_row[order] = np.arange(len(order), dtype=np.int32)
     first_row = np.concatenate(([0], np.cumsum([len(tables[i]["lat"]) for i in file_indices]))).astype(np.int64)
     event_group = g.require_group("events")
     for k, dtype in GLM_EVENT_COLUMNS.items():
         if k == "flash_index":
-            parts = [sorted_row[first_row[j] + tables[i]["event_flash"]] for j, i in enumerate(file_indices)]
+            parts = [
+                np.where(t >= 0, sorted_row[first_row[j] + np.maximum(t, 0)], -1)
+                for j, t in ((j, tables[i]["event_flash"]) for j, i in enumerate(file_indices))
+            ]
         else:
             parts = [tables[i][f"event_{k}"] for i in file_indices]
         write_column(event_group, k, np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype), "event")
+    root.attrs["n_glm_orphan_events"] = int(n_orphans.sum())
     return int(n_flashes.sum()), int(n_events.sum()), int(covered.sum())

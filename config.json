@@ -459,7 +459,10 @@
         {"name": "elevation", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "clip": [0, null], "description": "m, mean of NOAA ETOPO 2022 (1.85 km) over the cell; sea is 0, large lakes show their floor"},
         {"name": "elevation_std", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "aggregation": "std", "clip": [0, null], "description": "terrain roughness (m): standard deviation of elevation within the cell"},
         {"name": "land_fraction", "url": "https://gpm.nasa.gov/sites/default/files/downloads/IMERG_land_sea_mask.nc.gz", "variable": "landseamask", "scale": -0.01, "offset": 1.0, "clip": [0, 1], "description": "1 land, 0 water (ocean and lakes), from NASA's 0.1 degree IMERG mask, interpolated"},
-        {"name": "satellite_zenith", "geometry": "satellite_zenith", "description": "deg between the local vertical and the direction to GOES"}
+        {"name": "satellite_zenith", "geometry": "satellite_zenith", "description": "deg between the local vertical and the direction to GOES"},
+        {"name": "conus_land", "borders": "fraction", "countries": ["USA"], "within": [24, 50, -126, -66], "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries_lakes.geojson", "description": "share of the cell on the contiguous US's land (Natural Earth 1:10m borders; the Great Lakes and other large lakes are water); for choosing where to score, not a model input"},
+        {"name": "conus_distance_km", "borders": "distance_km", "countries": ["USA"], "within": [24, 50, -126, -66], "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries_lakes.geojson", "description": "km from the cell centre to the nearest cell at least half on contiguous-US land (0 on it); for coastal bands"},
+        {"name": "any_land", "borders": "fraction", "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries_lakes.geojson", "description": "share of the cell on any country's land (Natural Earth 1:10m; large lakes are water)"}
       ]
     }
   }

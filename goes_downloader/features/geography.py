@@ -1,5 +1,5 @@
 """
-Geography: fields that don't change with time (terrain, land/water, viewing angle), put on the feature grid once.
+Geography: fields that don't change with time (terrain, land/water, viewing angle, country borders), put on the feature grid once.
 
   python build_geography.py --config config.json
 
@@ -8,6 +8,13 @@ day that defines the grid. Lat/lon sources are downloaded once into features.geo
 OPeNDAP URLs (.../dodsC/...) are read for the grid's area only. A source finer than the cells is aggregated
 over the source pixels whose centres fall in each cell; a coarser one is interpolated bilinearly. Rebuild
 (--overwrite) only when the grid or the fields change; build_features.py checks that its grid matches.
+
+Borders fields come from a GeoJSON file of country polygons (Natural Earth's admin-0 countries, keyed by
+ADM0_A3). The polygons are rasterized at BORDERS_RESOLUTION_DEG (even-odd rule, so holes such as the
+large lakes stay water) and aggregated like any fine source: "fraction" is the share of the cell on the
+chosen countries' land; "distance_km" is the great-circle distance from the cell centre to the nearest
+centre of a cell at least half on that land (0 for those cells). "within" keeps only polygons with a
+vertex in a lat/lon box, e.g. the contiguous US without Alaska and Hawaii.
 
 Layout of geography.zarr
   <field>[y, x]      float32 one array per configured field, in config order (NaN off the Earth's disk)
@@ -35,6 +42,9 @@ from ..crop import latlon_to_scan_angle
 from ..progress import log
 from .grid import TargetGrid, grid_latlon, satellite_zenith_deg
 from .settings import FeatureConfig, GeographySpec, geography_store_path
+
+BORDERS_RESOLUTION_DEG = 0.01  # the raster that country polygons are drawn on before aggregating to cells
+EARTH_RADIUS_KM = 6371.0
 
 
 def _latlon_names(ds: Any) -> Tuple[str, str]:
@@ -210,6 +220,96 @@ def regrid_source(specs: List[GeographySpec], lat: np.ndarray, lon: np.ndarray, 
     return out
 
 
+def read_borders(path: str, countries: Any, within: Any) -> List[np.ndarray]:
+    """Rings ([n, 2] lon/lat, closed) of the countries' polygons (every country if None), outer and holes alike."""
+    import json
+
+    with open(path, "r", encoding="utf-8") as f:
+        features = json.load(f)["features"]
+    rings = []
+    for feature in features:
+        if countries is not None and feature["properties"].get("ADM0_A3") not in countries:
+            continue
+        geometry = feature["geometry"]
+        polygons = geometry["coordinates"] if geometry["type"] == "MultiPolygon" else [geometry["coordinates"]]
+        for polygon in polygons:
+            parts = [np.asarray(r, dtype=np.float64)[:, :2] for r in polygon]
+            if within is not None:
+                lat_min, lat_max, lon_min, lon_max = within
+                outer = parts[0]
+                if not ((outer[:, 1] >= lat_min) & (outer[:, 1] <= lat_max) & (outer[:, 0] >= lon_min) & (outer[:, 0] <= lon_max)).any():
+                    continue
+            rings += parts
+    return rings
+
+
+def rasterize_rings(rings: List[np.ndarray], lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """
+    uint8 [lat, lon], 1 where the pixel centre is inside the rings by the even-odd rule, on the regular
+    ascending grid lat x lon: every edge's crossings with the pixel-centre rows, sorted, filled in pairs.
+    """
+    n_rows, n_cols = len(lat), len(lon)
+    x1 = np.concatenate([r[:-1, 0] for r in rings]) if rings else np.zeros(0)
+    y1 = np.concatenate([r[:-1, 1] for r in rings]) if rings else np.zeros(0)
+    x2 = np.concatenate([r[1:, 0] for r in rings]) if rings else np.zeros(0)
+    y2 = np.concatenate([r[1:, 1] for r in rings]) if rings else np.zeros(0)
+    # Rows whose centre v satisfies min(y1, y2) <= v < max(y1, y2): the same half-open rule at every vertex,
+    # so each closed ring crosses each row an even number of times
+    first = np.searchsorted(lat, np.minimum(y1, y2), "left")
+    stop = np.searchsorted(lat, np.maximum(y1, y2), "left")
+    count = stop - first
+    edge = np.repeat(np.arange(len(x1)), count)
+    row = first[edge] + (np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count))
+    v = lat[row]
+    x = x1[edge] + (v - y1[edge]) * (x2[edge] - x1[edge]) / (y2[edge] - y1[edge])
+    order = np.lexsort((x, row))
+    row, x = row[order], x[order]
+    if len(row) % 2 or np.any(row[0::2] != row[1::2]):
+        raise ValueError("country polygons are not closed rings")
+    start = np.searchsorted(lon, x[0::2], "left")  # pixels with start <= centre < end
+    end = np.searchsorted(lon, x[1::2], "left")
+    diff = np.zeros((n_rows, n_cols + 1), np.int32)
+    np.add.at(diff, (row[0::2], start), 1)
+    np.add.at(diff, (row[0::2], end), -1)
+    return (np.cumsum(diff[:, :-1], axis=1) > 0).astype(np.uint8)
+
+
+def distance_to_km(member: np.ndarray, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """Great-circle distance (km) from each cell centre to the nearest member cell's centre; 0 for members."""
+    on_earth = np.isfinite(lat)
+    member = member & on_earth
+    out = np.full(lat.shape, np.nan, np.float32)
+    if not member.any():
+        return out
+    padded = np.pad(member, 1)
+    inner = padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
+    edge = member & ~inner  # the nearest member of any other cell is on the members' edge
+
+    def unit(mask: np.ndarray) -> np.ndarray:
+        phi, lam = np.radians(lat[mask].astype(np.float64)), np.radians(lon[mask].astype(np.float64))
+        return np.stack([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)], axis=1)
+
+    targets = unit(edge).T
+    others = on_earth & ~member
+    points = unit(others)
+    nearest = np.empty(len(points))
+    for a in range(0, len(points), 2048):
+        nearest[a : a + 2048] = (points[a : a + 2048] @ targets).max(axis=1)
+    out[member] = 0.0
+    out[others] = 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip((1 - nearest) / 2, 0, 1)))
+    return out
+
+
+def border_fields(specs: List[GeographySpec], path: str, grid: TargetGrid, cell_lat: np.ndarray, cell_lon: np.ndarray,
+                  box: Tuple[float, float, float, float]) -> List[np.ndarray]:
+    """The borders fields of one (file, countries, within): the land fraction per cell, and distances from it."""
+    res = BORDERS_RESOLUTION_DEG
+    lat = np.arange(box[0] + res / 2, box[1], res)
+    lon = np.arange(box[2] + res / 2, box[3], res)
+    inside = rasterize_rings(read_borders(path, specs[0].countries, specs[0].within), lat, lon)
+    (fraction,) = regrid_source([GeographySpec("fraction", variable="inside")], lat, lon, inside.astype(np.float32), grid, cell_lat, cell_lon)
+    distance = distance_to_km(fraction >= 0.5, cell_lat, cell_lon) if any(s.borders == "distance_km" for s in specs) else None
+    return [fraction if s.borders == "fraction" else distance for s in specs]
 
 
 def compute_fields(cfg: FeatureConfig, grid: TargetGrid) -> Dict[str, np.ndarray]:
@@ -219,8 +319,11 @@ def compute_fields(cfg: FeatureConfig, grid: TargetGrid) -> Dict[str, np.ndarray
     box = (float(lat[ok].min()) - 1, float(lat[ok].max()) + 1, float(lon[ok].min()) - 1, float(lon[ok].max()) + 1)
     fields: Dict[str, np.ndarray] = {}
     by_source: Dict[Tuple[str, str], List[GeographySpec]] = {}
+    by_borders: Dict[Tuple[str, Any, Any], List[GeographySpec]] = {}
     for spec in cfg.geography:
-        if spec.geometry == "satellite_zenith":
+        if spec.borders:
+            by_borders.setdefault((source_path(cfg, spec), spec.countries, spec.within), []).append(spec)
+        elif spec.geometry == "satellite_zenith":
             fields[spec.name] = satellite_zenith_deg(lat, lon, grid.projection)
         elif spec.geometry in ("latitude", "longitude"):
             fields[spec.name] = (lat if spec.geometry == "latitude" else lon).astype(np.float32)
@@ -239,6 +342,15 @@ def compute_fields(cfg: FeatureConfig, grid: TargetGrid) -> Dict[str, np.ndarray
             src_lat, src_lon, values = read_source(path, variable, box)
         for spec, field in zip(specs, regrid_source(specs, src_lat, src_lon, values, grid, lat, lon)):
             fields[spec.name] = field
+
+    for (path, _, _), specs in by_borders.items():
+        if not os.path.exists(path):
+            url = next((s.url for s in specs if s.url), None)
+            if url is None:
+                raise ValueError(f"geography source {path} does not exist and no url is configured")
+            fetch_source(url, path, "", box)
+        for spec, field in zip(specs, border_fields(specs, path, grid, lat, lon, box)):
+            fields[spec.name] = field
     return {s.name: fields[s.name] for s in cfg.geography}
 
 
@@ -253,6 +365,10 @@ def definition(f: GeographySpec) -> Dict[str, Any]:
     """A field's definition in config.json terms."""
     if f.geometry:
         d: Dict[str, Any] = {"name": f.name, "geometry": f.geometry}
+    elif f.borders:
+        d = {"name": f.name, "borders": f.borders, "countries": None if f.countries is None else list(f.countries),
+             "within": None if f.within is None else list(f.within), "url": f.url, "file": f.file}
+        d = {k: v for k, v in d.items() if v is not None or k == "countries"}
     else:
         d = {"name": f.name, "url": f.url, "file": f.file, "variable": f.variable, "aggregation": f.aggregation,
              "clip": list(f.clip), "scale": f.scale, "offset": f.offset}

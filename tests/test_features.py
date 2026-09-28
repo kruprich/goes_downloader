@@ -18,7 +18,7 @@ import zarr
 from goes_downloader.common import SLOTS_PER_DAY
 from goes_downloader.crop import latlon_to_scan_angle
 from goes_downloader.features.build import build_day, check_geography
-from goes_downloader.features.geography import build_geography, regrid_source
+from goes_downloader.features.geography import EARTH_RADIUS_KM, build_geography, rasterize_rings, regrid_source
 from goes_downloader.features.grid import SolarGeometry, grid_latlon, make_grid, satellite_zenith_deg
 from goes_downloader.features.settings import GeographySpec, load_feature_config
 
@@ -302,6 +302,78 @@ def test_geography_regridding_aggregates_fine_and_interpolates_coarse_sources(bu
     assert ((0 < mean) & (mean < 1)).any() and (std[(mean == 0) | (mean == 1)] == 0).all()
 
 
+def test_rings_fill_by_the_even_odd_rule():
+    centres = np.arange(10) + 0.5
+    square = np.array([[1, 1], [8, 1], [8, 8], [1, 8], [1, 1]], float)  # [lon, lat]
+    hole = np.array([[3, 3], [3, 5], [5, 5], [5, 3], [3, 3]], float)
+    diamond = np.array([[9.5, 0.5], [9.9, 1.5], [9.5, 2.5], [9.1, 1.5], [9.5, 0.5]])  # vertices on pixel centres
+    got = rasterize_rings([square, hole, diamond], centres, centres)
+    want = np.zeros((10, 10), np.uint8)
+    want[1:8, 1:8] = 1  # centres 1.5..7.5
+    want[3:5, 3:5] = 0
+    want[1, 9] = 1  # the diamond holds the centre (9.5, 1.5) only
+    np.testing.assert_array_equal(got, want)
+
+
+def test_borders_fields_rasterize_countries_and_measure_distance(built, tmp_path):
+    cfg, grid = built
+    lat, lon = grid_latlon(grid)
+    d_lat, d_lon = float(np.mean(lat[:-1] - lat[1:])), float(np.mean(lon[:, 1:] - lon[:, :-1]))
+
+    def box(r0, r1, c0, c1):
+        """A closed lat/lon ring around cells rows r0..r1, cols c0..c1 (edges half a cell outside their centres)."""
+        n, s_ = float(lat[r0, (c0 + c1) // 2]) + d_lat / 2, float(lat[r1, (c0 + c1) // 2]) - d_lat / 2
+        w, e = float(lon[(r0 + r1) // 2, c0]) - d_lon / 2, float(lon[(r0 + r1) // 2, c1]) + d_lon / 2
+        return [[w, s_], [e, s_], [e, n], [w, n], [w, s_]]
+
+    def around(r, c, half):
+        la, lo = float(lat[r, c]), float(lon[r, c])
+        return [[lo - half * d_lon, la - half * d_lat], [lo - half * d_lon, la + half * d_lat], [lo + half * d_lon, la + half * d_lat],
+                [lo + half * d_lon, la - half * d_lat], [lo - half * d_lon, la - half * d_lat]]
+
+    near = [float(np.nanmin(lat)), float(np.nanmax(lat)), float(np.nanmin(lon)), float(np.nanmax(lon))]
+    far_lat = near[1] + 5.0  # a second polygon of AAA whose only vertices are outside "within"
+    geojson = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"ADM0_A3": "AAA"}, "geometry": {"type": "MultiPolygon", "coordinates": [
+            [box(2, 8, 3, 11), around(5, 7, 0.9)],  # with a lake over cell (5, 7)
+            [[[near[2], far_lat], [near[3], far_lat], [near[3], far_lat + 1], [near[2], far_lat + 1], [near[2], far_lat]]]]}},
+        {"type": "Feature", "properties": {"ADM0_A3": "AAA"}, "geometry": {"type": "Polygon", "coordinates": [box(11, 13, 15, 18)]}},
+        {"type": "Feature", "properties": {"ADM0_A3": "BBB"}, "geometry": {"type": "Polygon", "coordinates": [box(10, 14, 0, 5)]}},
+    ]}
+    (tmp_path / "borders.geojson").write_text(json.dumps(geojson))
+    src = str(tmp_path / "borders.geojson")
+    within = [float(lat[9, 0]), near[1] + 0.01, near[2] - 1, near[3] + 1]  # AAA polygons reaching north of row 9 only
+    fields = [
+        {"name": "aaa", "borders": "fraction", "countries": ["AAA"], "within": within, "file": src},
+        {"name": "aaa_km", "borders": "distance_km", "countries": ["AAA"], "within": within, "file": src},
+        {"name": "land", "borders": "fraction", "file": src},
+    ]
+    cfg = load_feature_config(config(tmp_path, geography={"path": "geo.zarr", "cache_dir": str(tmp_path / "static"), "fields": fields}))
+    G = zarr.open_consolidated(build_geography(cfg, make_grid(cfg)), mode="r")
+    aaa, km, land = G["aaa"][:], G["aaa_km"][:], G["land"][:]
+    assert G.attrs["definitions"][0]["countries"] == ["AAA"] and G.attrs["definitions"][2]["countries"] is None
+    inside = np.zeros(aaa.shape, bool)
+    inside[3:8, 4:11] = True  # a cell in from the box's edge
+    lake = np.zeros(aaa.shape, bool)
+    lake[4:7, 6:9] = True
+    np.testing.assert_array_equal(aaa[inside & ~lake], 1.0)
+    assert aaa[5, 7] == 0 and land[5, 7] == 0  # the lake is a hole
+    assert (aaa[11:14, 15:19] == 0).all() and (land[12, 16:18] == 1).all()  # left out by "within", still land
+    assert (aaa[11:15, 0:6] == 0).all() and (land[11:14, 1:5] == 1).all()  # BBB
+    assert aaa[0, 19] == 0 and land[0, 19] == 0
+    # Distance: 0 on AAA, else the great circle to the nearest cell at least half on it
+    member = aaa >= 0.5
+    phi, lam = np.radians(lat.astype(np.float64)), np.radians(lon.astype(np.float64))
+    for r, c in [(0, 19), (5, 7), (12, 16), (14, 0), (9, 12)]:
+        if member[r, c]:
+            assert km[r, c] == 0
+            continue
+        hav = (np.sin((phi[member] - phi[r, c]) / 2) ** 2
+               + np.cos(phi[r, c]) * np.cos(phi[member]) * np.sin((lam[member] - lam[r, c]) / 2) ** 2)
+        np.testing.assert_allclose(km[r, c], (2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(hav))).min(), rtol=1e-5)
+    np.testing.assert_array_equal(km[member], 0.0)
+
+
 @pytest.mark.parametrize("when, lat, lon, cos_zenith", [
     # astropy (apparent sun, no refraction)
     ("2026-06-21T18:00:00", 40.0, -100.0, 0.94681),
@@ -336,6 +408,9 @@ def test_glm_mapping_round_trips_through_the_grid(built):
     ({"channels": [{"name": "a", "product": "p2", "aggregaton": "min"}]}, "unknown keys"),
     ({"labels": [{"name": "l", "end_minutes": 30, "source": "density"}]}, "source must be"),
     ({"grid": {"resolution_km": 4, "bound": None}}, "unknown keys"),
+    ({"geography": {"fields": [{"name": "d", "borders": "distance_km", "file": "b.geojson"}]}}, "distance_km needs countries"),
+    ({"geography": {"fields": [{"name": "d", "borders": "area", "file": "b.geojson"}]}}, "borders must be one of"),
+    ({"geography": {"fields": [{"name": "d", "borders": "fraction", "file": "b.geojson", "within": [50, 20, 0, 1]}]}}, "within must be"),
 ])
 def test_bad_feature_settings_are_rejected(tmp_path, change, match):
     with pytest.raises(ValueError, match=match):

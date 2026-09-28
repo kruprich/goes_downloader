@@ -20,6 +20,7 @@ LABEL_SOURCES = ("extent", "centroid")
 SOLAR_VALUES = ("cos_zenith", "local_hour_sin", "local_hour_cos")
 GEOMETRY_VALUES = ("satellite_zenith", "latitude", "longitude")
 GEOGRAPHY_AGGREGATIONS = ("mean", "std", "min", "max")
+BORDERS_VALUES = ("fraction", "distance_km")
 
 
 @dataclass(frozen=True)
@@ -56,11 +57,17 @@ class LabelSpec:
 
 @dataclass(frozen=True)
 class GeographySpec:
-    """A field that doesn't change with time: computed from the grid, or regridded from a lat/lon file."""
+    """
+    A field that doesn't change with time: computed from the grid, regridded from a lat/lon file, or from
+    country borders (a GeoJSON file of country polygons such as Natural Earth's).
+    """
 
     name: str
     description: str = ""
     geometry: Optional[str] = None
+    borders: Optional[str] = None  # "fraction" of the cell on these countries' land, or "distance_km" to it
+    countries: Optional[Tuple[str, ...]] = None  # ADM0_A3 codes; None = every country
+    within: Optional[Tuple[float, float, float, float]] = None  # keep polygons with a vertex in (lat_min, lat_max, lon_min, lon_max)
     url: Optional[str] = None
     file: Optional[str] = None
     variable: Optional[str] = None
@@ -110,7 +117,8 @@ CHANNEL_KEYS = {
     "expr": {"expr"},
 }
 LABEL_KEYS = {"name", "description", "start_minutes", "end_minutes", "min_flashes", "radius_cells", "source"}
-GEOGRAPHY_FIELD_KEYS = {"name", "description", "geometry", "url", "file", "variable", "aggregation", "clip", "scale", "offset"}
+GEOGRAPHY_FIELD_KEYS = {"name", "description", "geometry", "url", "file", "variable", "aggregation", "clip", "scale", "offset",
+                        "borders", "countries", "within"}
 FEATURE_KEYS = {"output_root_dir", "start_date_utc", "end_date_utc", "overwrite_existing", "max_workers", "grid",
                 "time_step_minutes", "dtype", "chunk_yx", "glm", "channels", "labels", "geography"}
 
@@ -234,8 +242,27 @@ def parse_geography_field(i: int, f: Any) -> GeographySpec:
         if f["geometry"] not in GEOMETRY_VALUES:
             raise ValueError(f"{where}: geometry must be one of {GEOMETRY_VALUES}, got {f['geometry']!r}")
         return GeographySpec(name, description, geometry=f["geometry"])
+    if "borders" in f:
+        extra = set(f) - {"name", "description", "borders", "countries", "within", "url", "file"}
+        if extra:
+            raise ValueError(f"{where}: a borders field takes no {sorted(extra)}")
+        if f["borders"] not in BORDERS_VALUES:
+            raise ValueError(f"{where}: borders must be one of {BORDERS_VALUES}, got {f['borders']!r}")
+        if not (f.get("url") or f.get("file")):
+            raise ValueError(f"{where}: a borders field needs the \"url\" and/or \"file\" of a GeoJSON file of country polygons")
+        countries = f.get("countries")
+        if countries is not None and (not isinstance(countries, list) or not countries or not all(isinstance(c, str) and c for c in countries)):
+            raise ValueError(f"{where}: countries must be a non-empty list of ADM0_A3 codes (e.g. [\"USA\"]) or null for every country")
+        within = f.get("within")
+        if within is not None and not (isinstance(within, list) and len(within) == 4 and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in within)
+                                       and within[0] < within[1] and within[2] < within[3]):
+            raise ValueError(f"{where}: within must be [lat_min, lat_max, lon_min, lon_max]")
+        if f["borders"] == "distance_km" and countries is None:
+            raise ValueError(f"{where}: distance_km needs countries")
+        return GeographySpec(name, description, borders=f["borders"], countries=None if countries is None else tuple(countries),
+                             within=None if within is None else tuple(float(v) for v in within), url=f.get("url"), file=f.get("file"))
     if not (f.get("url") or f.get("file")) or not isinstance(f.get("variable"), str):
-        raise ValueError(f"{where} needs \"geometry\", or a \"variable\" with a \"url\" and/or \"file\"")
+        raise ValueError(f"{where} needs \"geometry\", \"borders\", or a \"variable\" with a \"url\" and/or \"file\"")
     aggregation = f.get("aggregation", "mean")
     if aggregation not in GEOGRAPHY_AGGREGATIONS:
         raise ValueError(f"{where}: aggregation must be one of {GEOGRAPHY_AGGREGATIONS}, got {aggregation!r}")

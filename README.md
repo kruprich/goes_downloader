@@ -28,7 +28,7 @@ The full store layout, including every attribute, is described in the docstring 
 |---|---|
 | `download_raw.py` | Runs the download (`python download_raw.py --config config.json`) |
 | `report.py` | Shows which days the stores hold and how complete they are |
-| `build_geography.py` | Puts terrain, land/water and viewing angle on the feature grid, once |
+| `build_geography.py` | Puts terrain, land/water, viewing angle and country borders on the feature grid, once |
 | `build_features.py` | Builds the per-day feature stores (CNN inputs and lightning labels) |
 | `config.json` | Date range, output folder, products to download and all settings |
 | `goes_downloader/` | The code; `store.py` documents the raw store layout, `features/__init__.py` the feature stores |
@@ -297,7 +297,7 @@ download settings (`raw_output_root_dir`, dates, products). The layout is in the
 `goes_downloader/features/__init__.py`.
 
 ```bash
-.venv/bin/python build_geography.py --config config.json    # once: terrain, land/water, viewing angle
+.venv/bin/python build_geography.py --config config.json    # once: terrain, land/water, viewing angle, borders
 .venv/bin/python build_features.py --config config.json     # every day in the range
 .venv/bin/python build_features.py --config config.json --start 2025-04-10 --end 2025-12-31 --stats
 ```
@@ -379,9 +379,17 @@ tops ABI sees from the same satellite. `null` uses the ground ellipsoid (a ~2 km
 
 `build_geography.py` writes `goes_features/geography.zarr` once: the `features.geography.fields` on
 the feature grid, one array per field, with their statistics for normalisation. Sources are
-downloaded once into `geography.cache_dir` (`./goes_static`, about 35 MB); OPeNDAP URLs are read for
+downloaded once into `geography.cache_dir` (`./goes_static`, about 66 MB); OPeNDAP URLs are read for
 the grid's area only. A source finer than the cells is aggregated (`mean`, `std`, `min`, `max`), a
 coarser one interpolated. `scale`, `offset` and `clip` apply to the source values first.
+
+Borders fields (`"borders"`) come from a GeoJSON file of country polygons keyed by `ADM0_A3`: the
+polygons of `countries` (all, if omitted) are drawn on a 0.01° raster, where holes such as the Great
+Lakes stay water, and aggregated to cells. `"fraction"` is the share of the cell on that land;
+`"distance_km"` is the great-circle distance from the cell centre to the nearest cell at least half on
+it (0 on it). `within` keeps only polygons with a vertex in a lat/lon box, which is how Alaska and
+Hawaii are left out of the contiguous US. They are for choosing where to score forecasts (the model
+repo's evaluation area and coastal band), not model inputs.
 `build_features.py` stops if the geography store is on a different grid (rebuild it with
 `--overwrite`).
 
@@ -391,13 +399,16 @@ coarser one interpolated. `scale`, `offset` and `clip` apply to the source value
 | `elevation_std` | the same | Terrain roughness (m). |
 | `land_fraction` | [NASA IMERG land/sea mask](https://gpm.nasa.gov/data/directory/imerg-land-sea-mask-netcdf), 0.1° | 1 land, 0 water; interpolated. |
 | `satellite_zenith` | grid geometry | Degrees between the local vertical and the direction to GOES. |
+| `conus_land` | [Natural Earth](https://www.naturalearthdata.com/) 1:10m countries with large lakes removed (public domain) | Share of the cell on US land within 24–50° N, 126–66° W. |
+| `conus_distance_km` | the same | km to the nearest cell at least half on that land, 0 on it: coastal bands are water within some distance of it. |
+| `any_land` | the same | Share of the cell on any country's land. |
 
 ### Size and speed
 
 Measured on 10-13 April 2025 with the default config (11 stored channels, 4 km, every 15 minutes,
 float16), while the download ran: about 0.30 GB per day, so about 160 GB for the 534-day range, and
 52-56 s per day with 3 days built in parallel (about 2.6 hours for the range). The geography store
-takes about a second once its sources are cached. Mapping a day's ~50 million GLM events to cells
+takes about 16 s once its sources are cached, 14 s of it for the borders. Mapping a day's ~50 million GLM events to cells
 takes about 6 s of that.
 
 ## Tests

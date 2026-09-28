@@ -61,7 +61,8 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   and a 10 km product with bad-DQF, fill and missing scans; hand-placed flashes and events): block
   aggregation and nearest-pixel sampling against the pixels, `lag` across midnight, `mask` against
   the sun, flash centroids and footprints, labels (including a flash stored in the next day's first
-  file and a GLM gap), completeness, geography regridding, sun and satellite geometry against
+  file and a GLM gap), completeness, geography regridding, borders rasterized by the even-odd rule
+  (holes, a `within` filter) and their distances against brute force, sun and satellite geometry against
   astropy/spherical values, config errors, the entry scripts' imports.
 
 For changes to the feature step, also build a few real days (with 2–3 `--workers` while a download
@@ -157,7 +158,8 @@ the product/bounds key sets) as well as read.
 errors), `expressions` (derived channels and the evaluation `Plan`), `grid` (`TargetGrid`,
 `make_grid`, `axis_map`/`reduce2d`/`aggregate`, `SolarGeometry`, `satellite_zenith_deg`), `raw`
 (`RawTimeline`: raw frames by global 5-min slot across days), `glm` (`GlmTimeline`: centroids,
-footprints from events, coverage), `geography` (the one-time static fields), `build` (`build_day` in
+footprints from events, coverage), `geography` (the one-time static fields, including country borders
+rasterized from GeoJSON by scanline: `rasterize_rings`, `distance_to_km`), `build` (`build_day` in
 spawn workers, `run_build`, `run_stats`, the CLIs). `build_day` evaluates every channel slot by slot
 from `lookback` slots before the day to its end, keeping only the slots `lag`/`*_past` still need.
 

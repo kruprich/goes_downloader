@@ -82,13 +82,14 @@ def is_cmip_ir_band(product: Dict[str, Any]) -> bool:
     return bool(m) and int(m.group(1)) >= 7
 
 
-# Every key the downloader reads. Others are reported (they are usually typos, which would
+# Every key the downloader or the feature step reads. Others are reported (they are usually typos, which would
 # silently fall back to a default); keys starting with "_" are skipped silently, e.g. "_comment".
 TOP_LEVEL_KEYS = {
     "gcs_bucket", "start_date_utc", "end_date_utc", "raw_output_root_dir", "overwrite_existing",
     "download_method", "byte_range_processes", "max_concurrent_http_requests", "http_timeout_seconds",
     "http_retries", "max_decode_processes", "max_days_in_flight", "max_inflight_payloads",
     "bounds", "cmip_precision", "download", "abi_products", "glm_product",
+    "features",  # read by the feature step (goes_downloader/features)
 }
 ABI_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain", "data_variable", "dqf_variable", "precision"}
 GLM_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain"}

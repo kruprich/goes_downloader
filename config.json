@@ -413,5 +413,54 @@
     "description": "GLM lightning flashes (time, lat/lon, area, energy, quality)",
     "gcs_product_prefix": "GLM-L2-LCFA",
     "filename_must_contain": "GLM-L2-LCFA"
+  },
+  "features": {
+    "output_root_dir": "./goes_features",
+    "start_date_utc": null,
+    "end_date_utc": null,
+    "overwrite_existing": false,
+    "max_workers": 4,
+    "grid": {
+      "resolution_km": 4
+    },
+    "time_step_minutes": 15,
+    "dtype": "float16",
+    "chunk_yx": [256, 256],
+    "glm": {
+      "quality_flags": null,
+      "lightning_ellipsoid_km": {"equatorial": 14.0, "polar": 6.0},
+      "min_coverage": 0.95
+    },
+    "channels": [
+      {"name": "c02", "product": "mcmip_c02", "output": false, "description": "0.64 um reflectance factor (helper)"},
+      {"name": "c05", "product": "mcmip_c05", "output": false, "description": "1.6 um reflectance factor (helper)"},
+      {"name": "cos_sza", "solar": "cos_zenith", "output": false, "description": "cosine of the solar zenith angle (helper)"},
+      {"name": "vis_064", "expr": "mask(c02 / cos_sza, cos_sza - 0.1)", "description": "0.64 um reflectance, divided by cos(solar zenith); missing when the sun is lower than ~84 deg"},
+      {"name": "nir_16", "expr": "mask(c05 / cos_sza, cos_sza - 0.1)", "description": "1.6 um reflectance (ice clouds are darker), divided by cos(solar zenith); missing when the sun is lower than ~84 deg"},
+      {"name": "c13", "product": "mcmip_c13", "description": "10.3 um clean IR window (K)"},
+      {"name": "c13_min", "product": "mcmip_c13", "aggregation": "min", "description": "coldest 2 km pixel in the cell (K): overshooting tops"},
+      {"name": "c15", "product": "mcmip_c15", "description": "12.3 um dirty IR window (K)"},
+      {"name": "cloud_top_height", "product": "acha", "valid_dqf": [0, 1], "description": "m; NaN under clear sky"},
+      {"name": "tpw", "product": "tpw", "fill_gaps_minutes": 60, "description": "total precipitable water (mm); clear sky only, so each cell keeps its last value for up to 60 min"},
+      {"name": "cape", "product": "dsi_cape", "fill_gaps_minutes": 60, "description": "J/kg; clear sky only, last value kept up to 60 min"},
+      {"name": "lifted_index", "product": "dsi_li", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
+      {"name": "k_index", "product": "dsi_ki", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
+      {"name": "fed", "glm": "extent", "output": false, "description": "flashes touching each cell in the 5-min slot (helper)"},
+      {"name": "fed_past_15min", "expr": "sum_past(fed, 15)", "description": "flash-extent density: flashes touching the cell in the 15 min before the issue time"}
+    ],
+    "labels": [
+      {"name": "lightning_next_30min", "start_minutes": 0, "end_minutes": 30, "radius_cells": 1, "source": "extent", "description": "a flash footprint within 1 cell in the 30 min after the issue time"},
+      {"name": "lightning_next_60min", "start_minutes": 0, "end_minutes": 60, "radius_cells": 1, "source": "extent", "description": "a flash footprint within 1 cell in the 60 min after the issue time"}
+    ],
+    "geography": {
+      "path": "geography.zarr",
+      "cache_dir": "./goes_static",
+      "fields": [
+        {"name": "elevation", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "clip": [0, null], "description": "m, mean of NOAA ETOPO 2022 (1.85 km) over the cell; sea is 0, large lakes show their floor"},
+        {"name": "elevation_std", "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc", "variable": "z", "aggregation": "std", "clip": [0, null], "description": "terrain roughness (m): standard deviation of elevation within the cell"},
+        {"name": "land_fraction", "url": "https://gpm.nasa.gov/sites/default/files/downloads/IMERG_land_sea_mask.nc.gz", "variable": "landseamask", "scale": -0.01, "offset": 1.0, "clip": [0, 1], "description": "1 land, 0 water (ocean and lakes), from NASA's 0.1 degree IMERG mask, interpolated"},
+        {"name": "satellite_zenith", "geometry": "satellite_zenith", "description": "deg between the local vertical and the direction to GOES"}
+      ]
+    }
   }
 }

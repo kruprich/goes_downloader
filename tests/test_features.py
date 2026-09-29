@@ -498,6 +498,27 @@ def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives(built, tmp_p
     assert raw_neighbour_arrived(cfg, path)
 
 
+def test_unreadable_feature_store_is_rebuilt_instead_of_failing_the_run(built):
+    from goes_downloader.features.build import features_day_path, raw_neighbour_arrived
+
+    cfg, grid = built
+    path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
+    assert build_day(cfg, grid, DAY2)["complete"]
+    os.remove(os.path.join(path, ".zmetadata"))  # e.g. a store left behind by an older version
+    assert raw_neighbour_arrived(cfg, path)
+
+
+def test_rebuilding_a_day_replaces_the_store_without_leaving_one_behind(built):
+    from goes_downloader.features.build import features_day_path
+
+    cfg, grid = built
+    path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
+    for _ in range(2):  # the second build publishes over the first one's store
+        assert build_day(cfg, grid, DAY2)["complete"]
+    assert os.path.exists(os.path.join(path, ".zmetadata"))
+    assert not os.path.exists(path + ".old") and not os.path.exists(path + ".tmp")
+
+
 def test_only_channels_read_at_earlier_slots_are_computed_every_slot(built):
     from goes_downloader.features.expressions import make_plan
 

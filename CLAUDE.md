@@ -166,9 +166,12 @@ slots before the day to its end. Only `Plan.every_slot` channels (read at earlie
 values forward with `fill_gaps`, or read by such a channel) are computed at every slot; the rest only
 at output slots, which cut a day from 42–44 s to 32 s with identical output. The cache keeps only
 the slots `lag`/`*_past` still need. `run_build` rebuilds a complete day when a raw day it recorded
-as missing or incomplete has since completed (`raw_neighbour_arrived`); on Ctrl-C it terminates the
-workers, which run multiprocessing's finalizers before exiting (`_exit_now`) so numcodecs' lock isn't
-reported as a leaked semaphore.
+as missing or incomplete has since completed, or when its store can't be read (`raw_neighbour_arrived`);
+on Ctrl-C it terminates the workers, which run multiprocessing's finalizers before exiting (`_exit_now`)
+so numcodecs' lock isn't reported as a leaked semaphore, and the pool is always shut down so its atexit
+hook can't join the queued days. `build_day` publishes by renaming any existing store to `<day>.zarr.old`
+before moving `.tmp` into place, so a worker killed mid-publish can't leave a store that reads as
+complete with its arrays deleted; `run_build` removes leftover `.old` directories.
 
 **Invariants that are easy to break:**
 - Arrays written in full must use `_write_array` (`fill_value=None` + `_ARRAY_DIMENSIONS`).

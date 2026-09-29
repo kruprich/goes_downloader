@@ -47,7 +47,10 @@ def raw_neighbour_arrived(cfg: FeatureConfig, path: str) -> bool:
 
     from ..store import output_zarr_path_for_day, zarr_store_is_complete
 
-    raw_days = zarr.open_consolidated(path, mode="r").attrs.get("raw_days", {})
+    try:
+        raw_days = zarr.open_consolidated(path, mode="r").attrs.get("raw_days", {})
+    except Exception:  # an unreadable store is rebuilt anyway; never abort the run over one day
+        return True
     return any(
         st != "complete" and zarr_store_is_complete(output_zarr_path_for_day(cfg.raw.raw_output_root_dir, datetime.strptime(d, "%Y-%m-%d")))
         for d, st in raw_days.items()
@@ -322,8 +325,15 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         }
     )
     zarr.consolidate_metadata(root.store)
-    shutil.rmtree(out_path, ignore_errors=True)
+    # Rename the old store aside rather than deleting it in place: a worker killed on Ctrl-C partway
+    # through the delete would otherwise leave .zattrs (complete: true) without its arrays, and the day
+    # would never be rebuilt.
+    old_path = out_path + ".old"
+    shutil.rmtree(old_path, ignore_errors=True)
+    if os.path.exists(out_path):
+        os.rename(out_path, old_path)
     shutil.move(tmp_path, out_path)
+    shutil.rmtree(old_path, ignore_errors=True)
 
     return {
         "day": day_iso,
@@ -368,6 +378,8 @@ def run_build(cfg: FeatureConfig) -> None:
         path = features_day_path(cfg, datetime.strptime(d, "%Y-%m-%d"))
         return cfg.overwrite_existing or not zarr_store_is_complete(path) or raw_neighbour_arrived(cfg, path)
 
+    for d in days:  # a store renamed aside by build_day and left behind by a Ctrl-C between the two moves
+        shutil.rmtree(features_day_path(cfg, datetime.strptime(d, "%Y-%m-%d")) + ".old", ignore_errors=True)
     todo = [d for d in days if needs_build(d)]
     log(f"{len(days) - len(todo)} of {len(days)} days already complete; building {len(todo)}")
 
@@ -393,14 +405,17 @@ def run_build(cfg: FeatureConfig) -> None:
                 log(f"-> {d} {r['status']} in {r['seconds']:.0f}s, {r['bytes'] / 1e6:.0f} MB, {r['n_flashes']} flashes  [{i}/{len(todo)}, ETA {eta}]{extra}")
             else:
                 log(f"-> {d} {r['status']}  [{i}/{len(todo)}]")
-    except KeyboardInterrupt:
+    except BaseException:
         # A day takes tens of seconds, so don't wait: the days in progress stay .tmp and are rebuilt next
-        # run. ProcessPoolExecutor has no public way to stop its workers before Python 3.14.
+        # run. ProcessPoolExecutor has no public way to stop its workers before Python 3.14. Without this
+        # the pool's atexit hook would join every queued day, so the command would hang after a Ctrl-C or
+        # any other escaping exception.
         for proc in list((getattr(pool, "_processes", None) or {}).values()):
             proc.terminate()
-        pool.shutdown(cancel_futures=True)  # quick once the workers are gone; frees the pool's locks
         raise
-    pool.shutdown()
+    finally:
+        # cancel_futures is quick once the workers are gone, and frees the pool's locks.
+        pool.shutdown(cancel_futures=True)
 
     print("\n" + "=" * 72)
     print(f"Days built:      {len(ok) + len(failed)} of {len(todo)} ({len(ok)} complete)")

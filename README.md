@@ -327,9 +327,11 @@ rebuilt when the same command runs again. Changing the `features` config doesn't
 - `time_step_minutes` (15): how often a sample is written. Channels are always computed on the
   5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5 minutes whatever the step.
 - `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc `codec`,
-  `level`, `shuffle`; default LZ4HC 5 with byte shuffle): how the frames are stored. Training reads
-  whole frames, and in one chunk with LZ4HC a frame reads in 1.7 ms, against 9.8 ms with zstd 3,
-  bit shuffle and 256x256 chunks, for 5% more disk; building costs the same.
+  `level`, `shuffle`; the config uses LZ4 9 with byte shuffle): how the frames are stored. Training
+  reads whole frames, and in one chunk with LZ4 a frame reads in 0.85 ms, against 9.8 ms with zstd 3,
+  bit shuffle and 256x256 chunks. LZ4HC 5 reads just as fast (0.7–0.9 ms) and stores 14% less, but
+  costs 8.9 CPU-seconds a day to compress against 0.6; with the workers filling every core that is
+  only 3% of the build time, so prefer it if disk matters more than the speed of a backfill.
 
 Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends
 there, and every label window starts there.
@@ -413,14 +415,19 @@ repo's evaluation area and coastal band), not model inputs.
 
 ### Size and speed
 
-With the default config (11 stored channels, 4 km, every 15 minutes, float16, LZ4HC): about 0.33 GB
-per day for Apr 10 – May 9 2025, so about 176 GB for the 534-day range. On an otherwise idle machine
-a day takes about 32 s and 115 CPU-seconds (a build uses about 4 cores; measured on 2025-10-27, where
-computing every channel at every 5-minute slot took 42–44 s), of which mapping the day's ~50 million
-GLM events to cells is about 6 s. Channels are computed at every 5-minute slot only when needed: when
-read at earlier slots (`lag`, `*_past`), when carrying values forward (`fill_gaps_minutes`), or when
-such a channel reads them; the rest only at the stored times. While a download runs, 3 days in parallel took 52–116 s
-each: build with fewer `--workers`, or while the download is stopped. The geography store takes about
+With the config as it stands (11 stored channels, 4 km, every 15 minutes, float16, LZ4 9): about
+0.37 GB per day, so about 200 GB for the 534-day range (0.33 GB and 176 GB with LZ4HC 5).
+
+A day on its own takes about 27 s and 113 CPU-seconds, of which mapping the day's ~50 million GLM
+events to cells is about 8 s. Building is CPU-bound, so what matters for a backfill is filling the
+cores once rather than several times over: each worker gets one Blosc thread, and `max_workers` is the
+core count. Measured on 12 September 2026 days on an idle 12-core machine, 12 such workers build a day
+in 11.9 s, against 15.8 s for the 4 workers that let Blosc spread compression over every core.
+Channels are computed at every 5-minute slot only when needed: when read at earlier slots (`lag`,
+`*_past`), when carrying values forward (`fill_gaps_minutes`), or when such a channel reads them; the
+rest only at the stored times (measured on 2025-10-27, where computing every channel at every slot
+took 42–44 s against 32 s). While a download runs, 3 days in parallel took 52–116 s each: build with far
+fewer `--workers`, or while the download is stopped. The geography store takes about
 16 s once its sources are cached, 14 s of it for the borders.
 
 ## Tests

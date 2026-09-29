@@ -419,14 +419,14 @@
     "start_date_utc": null,
     "end_date_utc": null,
     "overwrite_existing": false,
-    "max_workers": 4,
+    "max_workers": 12,
     "grid": {
       "resolution_km": 4
     },
     "time_step_minutes": 15,
     "dtype": "float16",
     "chunk_yx": null,
-    "compression": {"codec": "lz4hc", "level": 5, "shuffle": "byte"},
+    "compression": {"codec": "lz4", "level": 9, "shuffle": "byte"},
     "glm": {
       "quality_flags": null,
       "lightning_ellipsoid_km": {"equatorial": 14.0, "polar": 6.0},

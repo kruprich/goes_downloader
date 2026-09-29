@@ -67,10 +67,18 @@ def _exit_now(*_: Any) -> None:
     os._exit(1)
 
 
-def _ignore_ctrl_c() -> None:
-    """Worker initializer: only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM)."""
+def _init_worker() -> None:
+    """
+    Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM). One Blosc thread per
+    worker: a day is CPU-bound, so letting every worker spread compression over all cores only
+    oversubscribes them (on 12 cores, 12 workers with one thread each build a day in 12.3 s against
+    15.8 s for 4 workers with Blosc's default).
+    """
+    import numcodecs
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, _exit_now)
+    numcodecs.blosc.set_nthreads(1)
 
 
 class ChannelStats:
@@ -386,7 +394,7 @@ def run_build(cfg: FeatureConfig) -> None:
     ok, failed, total_bytes, t0 = [], [], 0, time.monotonic()
     workers = min(cfg.max_workers, max(1, len(todo)))
     # Workers start fresh (spawn) so no zarr/numpy thread state is inherited from this process
-    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"), initializer=_ignore_ctrl_c)
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"), initializer=_init_worker)
     try:
         futures = {pool.submit(build_day, cfg, grid, d): d for d in todo}
         for i, fut in enumerate(as_completed(futures), 1):

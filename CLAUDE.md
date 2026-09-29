@@ -233,6 +233,10 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
   16.1 GB/day because of the MCMIPC files.
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
-  in it; geography sources are cached in `./goes_static`. Current config: about 0.33 GB/day
-  (~176 GB for the range), stored as whole-frame LZ4HC chunks (reads 5.8x faster than zstd in
-  256x256 chunks); a day takes ~32 s and ~4 cores on an idle machine, much longer next to a download.
+  in it; geography sources are cached in `./goes_static`. Current config: about 0.37 GB/day
+  (~200 GB for the range), stored as whole-frame LZ4 9 chunks (reads 0.85 ms/frame, as fast as LZ4HC
+  and 11x faster than zstd in 256x256 chunks; LZ4HC 5 stores 14% less for 8.9 CPU-seconds a day).
+  Building is CPU-bound: each pool worker gets one Blosc thread (`_init_worker`) and `max_workers` is
+  the core count (12), which builds a day in 11.9 s against 15.8 s for 4 workers with Blosc threading
+  over every core. A day on its own takes ~27 s and 113 CPU-seconds. Much slower next to a download:
+  use far fewer `--workers` then.

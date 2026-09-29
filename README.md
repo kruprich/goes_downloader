@@ -2,8 +2,9 @@
 
 Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from the public GCS bucket
 `gcp-public-data-goes-19` into one raw Zarr store per UTC day, for building a
-lightning-prediction training dataset. No time binning or spatial aggregation happens
-here; that belongs in a separate feature-building step.
+lightning-prediction training dataset. No time binning or spatial aggregation happens in the
+download; the feature step (`build_features.py`, see [Building features](#building-features)) turns
+the raw stores into CNN inputs and lightning labels on one grid.
 
 For each UTC day it:
 
@@ -27,8 +28,10 @@ The full store layout, including every attribute, is described in the docstring 
 |---|---|
 | `download_raw.py` | Runs the download (`python download_raw.py --config config.json`) |
 | `report.py` | Shows which days the stores hold and how complete they are |
+| `build_geography.py` | Puts terrain, land/water, viewing angle and country borders on the feature grid, once |
+| `build_features.py` | Builds the per-day feature stores (CNN inputs and lightning labels) |
 | `config.json` | Date range, output folder, products to download and all settings |
-| `goes_downloader/` | The code; `store.py` documents the store layout |
+| `goes_downloader/` | The code; `store.py` documents the raw store layout, `features/__init__.py` the feature stores |
 | `tests/` | The test suite (see [Tests](#tests)) |
 | `pyproject.toml` | The package, supported Python versions, dependencies and test settings |
 | `requirements.lock` | The exact dependency versions it was tested with |
@@ -286,11 +289,139 @@ Byte ranges save about a quarter of the time, but only with enough worker proces
 small, so fetching them is limited by request round trips, not bandwidth. They overlap with the
 bandwidth-bound ABI files only because files start in scan-time order.
 
+## Building features
+
+The feature step reads the raw stores and writes one feature store per UTC day to
+`goes_features/YYYY/YYYYDDD.zarr`: the configured channels and lightning labels on one grid, every
+`time_step_minutes`. It is configured by the `features` section of `config.json` and reuses the
+download settings (`raw_output_root_dir`, dates, products). The layout is in the docstring of
+`goes_downloader/features/__init__.py`.
+
+```bash
+.venv/bin/python build_geography.py --config config.json    # once: terrain, land/water, viewing angle, borders
+.venv/bin/python build_features.py --config config.json     # every day in the range
+.venv/bin/python build_features.py --config config.json --start 2025-04-10 --end 2025-12-31 --stats
+```
+
+`--start`, `--end`, `--workers` and `--overwrite` override the config for one run. Days already
+complete are skipped, so the command can run again as the download adds days. `--stats` builds
+nothing: it combines the per-day sums of the days in the range into
+`goes_features/stats_<start>_<end>.json` (mean, std, min, max and valid fraction per channel, positive
+fraction per label).
+
+A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
+before for lags and gap filling, the day after for labels. Neighbours outside the download date range
+never arrive, so they don't hold a day back; their slots are just missing. Incomplete days are rebuilt
+on the next run. Changing the `features` config doesn't touch days already complete: pass
+`--overwrite` or delete `goes_features/`.
+
+### Grid and time
+
+- `grid.resolution_km` (4): cell size at the sub-satellite point, a multiple of the finest product's
+  (2 km). Cells are blocks of ABI fixed-grid pixels, so a 4 km cell is 2x2 band pixels and a 10 km cell
+  is exactly one DSI pixel. Over CONUS a 4 km cell is about 4.4 km east-west by 5.8 km north-south.
+- `grid.bounds`: lat/lon box of the grid; left out, the download `bounds`; `null`, everything stored.
+- `time_step_minutes` (15): how often a sample is written. Channels are always computed on the
+  5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5 minutes whatever the step.
+- `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc `codec`,
+  `level`, `shuffle`; default LZ4HC 5 with byte shuffle): how the frames are stored. Training reads
+  whole frames, and in one chunk with LZ4HC a frame reads in 1.7 ms, against 9.8 ms with zstd 3,
+  bit shuffle and 256x256 chunks, for 5% more disk; building costs the same.
+
+Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends
+there, and every label window starts there.
+
+### Channels
+
+Each entry of `features.channels` has a `name` (usable in expressions), an optional `description`,
+and `"output": false` for helper channels that other channels read but that aren't stored. It takes
+its values from exactly one of:
+
+- **`product`**: an ABI product from the `download` list, in physical units. `aggregation` (`mean`,
+  `min`, `max`, `std`, or `fraction` of pixels whose value is in `values`) applies when the product is
+  at least as fine as the grid; a coarser product takes the pixel under the cell centre. `valid_dqf`
+  (`[0]`) lists the quality flags kept, `min_valid_fraction` (0.5) the share of valid pixels a cell
+  needs, and `fill_gaps_minutes` keeps each cell's last valid value that long (for clear-sky-only TPW
+  and DSI).
+- **`glm`**: per 5-minute slot and cell, `count` (flash centroids), `extent` (flashes with an event in
+  the cell: the flash-extent density LightningCast uses), `energy_fj` or `area_km2`. Missing when GLM
+  covered less than `glm.min_coverage` of the slot: with 0.95, one missing 20-second file of the slot's
+  15 is enough, and a `sum_past` over that slot is missing too (8 of 2,880 times in the first 30 days,
+  whose labels were still known).
+- **`solar`**: `cos_zenith`, `local_hour_sin` or `local_hour_cos` at the middle of the slot (NOAA's
+  solar-calculator algorithm, within 0.02° of astropy).
+- **`expr`**: an expression over other channels with `+ - * / **`, numbers and `lag(x, minutes)`,
+  `sum_past`, `mean_past`, `min_past`, `max_past(x, minutes)`, `abs`, `sqrt`, `log1p`, `exp`,
+  `minimum`, `maximum`, `clip(x, low, high)` and `mask(x, m)` (x where m > 0, missing elsewhere).
+  Any missing input makes the result missing.
+
+The default channels are the 0.64 and 1.6 µm reflectances divided by cos(solar zenith) and missing
+when the sun is lower than ~84° (`mask(c02 / cos_sza, cos_sza - 0.1)`; the reflectance factor in the
+files isn't normalised by the sun angle), band 13's mean and coldest pixel, band 15, cloud-top
+height, TPW, CAPE, lifted index and K-index (gap-filled up to 60 minutes), and the flash-extent
+density of the last 15 minutes. The sun's position isn't stored: it's a function of time and place,
+so the model computes it.
+
+### Labels and GLM
+
+Each entry of `features.labels` is 1 where at least `min_flashes` (1) flashes occurred within
+`radius_cells` (0) cells between `start_minutes` (0) and `end_minutes` after the issue time, 0 where
+none did, and 255 (unknown) where GLM covered less than `glm.min_coverage` (0.95) of the window. With
+`"source": "extent"` (the default) a flash counts in every cell one of its events fell in, its
+footprint; with `"centroid"` only in the cell of its centroid. The configured labels use extent within
+1 cell (GLM pixels are 8-10 km, about two cells). With extent, `min_flashes` counts flash-cell hits
+within the radius. Orphan events (`flash_index` -1, a few hundred of ~50 million a day) belong to no
+flash and are left out of footprints.
+
+`flash_count` (centroids) and `flash_extent` (footprints) hold the flashes of each time step's window
+ending at the issue time, so other labels, persistence baselines and "new lightning" scores can be
+derived later. `glm.quality_flags` (`null` = all) filters flashes; flag 3 marks large flashes, not
+false ones. `glm.lightning_ellipsoid_km` (14/6) is the ellipsoid GLM geolocates flashes and events on;
+reading their lat/lon back on it recovers the direction GLM saw, which lines them up with the cloud
+tops ABI sees from the same satellite. `null` uses the ground ellipsoid (a ~2 km shift over CONUS).
+
+### Geography
+
+`build_geography.py` writes `goes_features/geography.zarr` once: the `features.geography.fields` on
+the feature grid, one array per field, with their statistics for normalisation. Sources are
+downloaded once into `geography.cache_dir` (`./goes_static`, about 66 MB); OPeNDAP URLs are read for
+the grid's area only. A source finer than the cells is aggregated (`mean`, `std`, `min`, `max`), a
+coarser one interpolated. `scale`, `offset` and `clip` apply to the source values first.
+
+Borders fields (`"borders"`) come from a GeoJSON file of country polygons keyed by `ADM0_A3`: the
+polygons of `countries` (all, if omitted) are drawn on a 0.01° raster, where holes such as the Great
+Lakes stay water, and aggregated to cells. `"fraction"` is the share of the cell on that land;
+`"distance_km"` is the great-circle distance from the cell centre to the nearest cell at least half on
+it (0 on it). `within` keeps only polygons with a vertex in a lat/lon box, which is how Alaska and
+Hawaii are left out of the contiguous US. They are for choosing where to score forecasts (the model
+repo's evaluation area and coastal band), not model inputs.
+`build_features.py` stops if the geography store is on a different grid (rebuild it with
+`--overwrite`).
+
+| Field | Source | Notes |
+|---|---|---|
+| `elevation` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model), 60 arc-seconds | Cell mean (m), clipped at 0 so the sea is 0. Large lakes show their floor; `land_fraction` tells them apart. |
+| `elevation_std` | the same | Terrain roughness (m). |
+| `land_fraction` | [NASA IMERG land/sea mask](https://gpm.nasa.gov/data/directory/imerg-land-sea-mask-netcdf), 0.1° | 1 land, 0 water; interpolated. |
+| `satellite_zenith` | grid geometry | Degrees between the local vertical and the direction to GOES. |
+| `conus_land` | [Natural Earth](https://www.naturalearthdata.com/) 1:10m countries with large lakes removed (public domain) | Share of the cell on US land within 24–50° N, 126–66° W. |
+| `conus_distance_km` | the same | km to the nearest cell at least half on that land, 0 on it: coastal bands are water within some distance of it. |
+| `any_land` | the same | Share of the cell on any country's land. |
+
+### Size and speed
+
+With the default config (11 stored channels, 4 km, every 15 minutes, float16, LZ4HC): about 0.33 GB
+per day for Apr 10 – May 9 2025, so about 176 GB for the 534-day range. On an otherwise idle machine
+a day takes about 33 s and 130 CPU-seconds (a build uses about 4 cores), of which mapping the day's
+~50 million GLM events to cells is about 6 s. While a download runs, 3 days in parallel took 52–116 s
+each: build with fewer `--workers`, or while the download is stopped. The geography store takes about
+16 s once its sources are cached, 14 s of it for the borders.
+
 ## Tests
 
 ```bash
 uv pip install -e ".[dev]" -c requirements.lock
-pytest              # offline, under a second: small synthetic files stand in for the GOES ones
+pytest              # offline, a few seconds: small synthetic files and stores stand in for the GOES ones
 pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
 ```
 

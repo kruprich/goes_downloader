@@ -8,10 +8,14 @@ A downloader (`download_raw.py` → the `goes_downloader` package, driven by `co
 mirrors GOES-19 ABI CONUS L2 products and GLM lightning flashes and events from the public bucket
 `gcp-public-data-goes-19` into one raw Zarr store per UTC day. It is the raw layer for a
 lightning-prediction training dataset: it deliberately does **no** time binning, regridding or
-quality filtering. That belongs in a separate feature-building step that does not exist yet.
-`report.py` summarizes what the stores hold. The docstring at the top of `goes_downloader/store.py`
-is the authoritative description of the store layout and its attributes; README.md covers setup,
-usage, reading, assumptions about the source data, and measured sizes and speeds.
+quality filtering. That is the feature step (`goes_downloader/features/`, run by
+`build_geography.py` once and `build_features.py`), which turns the raw stores into CNN inputs and
+lightning labels on one grid, one feature store per day, for the model in the separate
+`goes_lightning_model` repository. `report.py` summarizes what the raw stores hold. The docstrings
+of `goes_downloader/store.py` (raw stores), `goes_downloader/features/__init__.py` (feature stores)
+and `goes_downloader/features/geography.py` (the geography store) are the authoritative layouts;
+README.md covers setup, usage, reading, assumptions about the source data, and measured sizes and
+speeds.
 
 ## Commands
 
@@ -23,9 +27,11 @@ install `numcodecs<0.16`.
 .venv/bin/python -m pip install -e ".[dev]" -c requirements.lock   # without [dev] to only run it
 .venv/bin/python download_raw.py --config config.json     # a full run; prints a data report at the end
 .venv/bin/python report.py --config config.json           # which days are complete / need attention
+.venv/bin/python build_geography.py --config config.json  # once: static fields on the feature grid
+.venv/bin/python build_features.py --config config.json   # feature stores; --start/--end/--workers/--stats
 .venv/bin/python -m pytest                                # offline tests, under a second
 .venv/bin/python -m pytest --network                      # + real files and the test hour (~0.5 GB, ~30 s)
-.venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py   # the only linter
+.venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py build_features.py build_geography.py
 ```
 
 `pyproject.toml` holds the package definition, `requires-python`, the direct dependencies and the
@@ -51,6 +57,19 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   importing nothing outside its main guard.
 - `test_report.py`, `test_runner.py`: the report's rules; the report after a run, `--no-report`,
   Ctrl-C.
+- `test_features.py`: the feature step on two synthetic raw days on the real fixed grid (a 2 km
+  and a 10 km product with bad-DQF, fill and missing scans; hand-placed flashes and events): block
+  aggregation and nearest-pixel sampling against the pixels, `lag` across midnight, `mask` against
+  the sun, flash centroids and footprints, labels (including a flash stored in the next day's first
+  file and a GLM gap), completeness, geography regridding, borders rasterized by the even-odd rule
+  (holes, a `within` filter) and their distances against brute force, sun and satellite geometry against
+  astropy/spherical values, config errors, the entry scripts' imports.
+
+For changes to the feature step, also build a few real days (with 2–3 `--workers` while a download
+runs) and compare against values recomputed from the raw arrays: block means of the 2 km frames,
+the 10 km pixel under each cell centre, and flash footprints mapped from `glm/events` with NOAA's
+formula instead of pyproj (skipping orphan events, `flash_index` -1). Write them to a scratch `output_root_dir`; avoid raw days that have a
+`.tmp` next to them (the downloader is rebuilding them).
 
 **Network tests** (`test_network.py`, `--network`) decode two real files of every configured
 product both ways and run the reference hour through the whole pipeline with both
@@ -136,6 +155,15 @@ the product/bounds key sets) as well as read.
    if no listing/file errors occurred and the day ended ≥24 h ago; incomplete days are rebuilt
    from scratch on the next run.
 
+**Feature step (`goes_downloader/features/`).** `settings` (the `features` section; unknown keys are
+errors), `expressions` (derived channels and the evaluation `Plan`), `grid` (`TargetGrid`,
+`make_grid`, `axis_map`/`reduce2d`/`aggregate`, `SolarGeometry`, `satellite_zenith_deg`), `raw`
+(`RawTimeline`: raw frames by global 5-min slot across days), `glm` (`GlmTimeline`: centroids,
+footprints from events, coverage), `geography` (the one-time static fields, including country borders
+rasterized from GeoJSON by scanline: `rasterize_rings`, `distance_to_km`), `build` (`build_day` in
+spawn workers, `run_build`, `run_stats`, the CLIs). `build_day` evaluates every channel slot by slot
+from `lookback` slots before the day to its end, keeping only the slots `lag`/`*_past` still need.
+
 **Invariants that are easy to break:**
 - Arrays written in full must use `_write_array` (`fill_value=None` + `_ARRAY_DIMENSIONS`).
   zarr's default fill of 0 makes xarray read every legitimate 0 as missing.
@@ -161,6 +189,19 @@ the product/bounds key sets) as well as read.
   NOAA never published the file.
 - `report.py` reads root and group attributes (`complete`, `too_recent`, `n_*`, `n_present`,
   `abi_product_keys`, `glm_included`); keep them when changing the writer.
+- Feature grid cells are blocks of the finest product's pixels counted from the uncropped sector
+  origin, so they nest in the 2 km and 10 km grids; the geography store must have the same cells
+  (`check_geography`). Coarser sources take the pixel under the cell centre, ties to the lower one.
+- GLM flashes and events are read on the lightning ellipsoid (+14/+6 km), which recovers GLM's view
+  angle. A flash belongs to its file's day store but counts at its own first-event time, so the
+  store of the day before the range is read too. Footprints are distinct (flash, cell) pairs.
+  Event `flash_index` is -1 for orphans (no flash in their file): mask it before indexing flashes,
+  or -1 silently picks the day's last flash.
+- Feature inputs end at the issue time (slot start + 5 min); label windows start there. Labels are
+  255 where GLM covered less than `glm.min_coverage`; GLM channels are NaN likewise.
+- `flash_count` and `flash_extent` are written in full with `fill_value=None`; `features` uses NaN and
+  `labels` 255. A feature day is complete only if every raw day it read inside the download range is.
+- The entry scripts import nothing outside their main guard (spawn workers re-run them).
 
 ## Conventions
 
@@ -169,7 +210,7 @@ the product/bounds key sets) as well as read.
 - Keep README.md, the `store.py` docstring (layout and every attribute) and this file in sync with
   behaviour changes. README.md's sizes, speeds and memory figures are measurements: re-measure when
   behaviour changes and say what was measured. Assumptions that only matter for interpreting the
-  data belong in the future feature step, not the README.
+  data belong in the feature step's documentation.
 - Behaviour changes come with tests; keep `pytest` and pyflakes clean.
 - Output goes to `raw_output_root_dir` (default `./goes_raw`; the config uses `./goes_raw2`;
   `goes_raw*/` is git-ignored). `goes_raw/` holds 28 days from an older product list (bands 8, 11,
@@ -179,3 +220,7 @@ the product/bounds key sets) as well as read.
   with the NOAA CONUS bounds (~1.12–1.24 TB). With `"byte_ranges"` a day downloads 4.9 GB and
   takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
   16.1 GB/day because of the MCMIPC files.
+- Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
+  in it; geography sources are cached in `./goes_static`. Current config: about 0.33 GB/day
+  (~176 GB for the range), stored as whole-frame LZ4HC chunks (reads 5.8x faster than zstd in
+  256x256 chunks); a day takes ~33 s and ~4 cores on an idle machine, much longer next to a download.

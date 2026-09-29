@@ -128,9 +128,10 @@ the product/bounds key sets) as well as read.
 4. GLM flashes and events (~70 M events/day, up to ~1.9 GB in the main process) accumulate in
    memory and are written at the end with per-file rows and a `glm/coverage` flag per 20-second
    window. `decode_glm_file` links each event to its flash through the file's event → group →
-   flash ids (`_parent_rows`; duplicate ids are a file error, and an orphan whose group or flash isn't
-   in the file gets -1, as NOAA's files have some); `write_glm_tables` turns that into `flash_index`,
-   the row in the day's time-sorted `glm/flashes`, and counts orphans (`n_orphan_events`).
+   flash ids (`_parent_rows`, `_through`; an orphan gets -1: its group or flash is missing from the
+   file, or the id is used twice because 16-bit flash ids wrap around in very active files).
+   `write_glm_tables` turns that into `flash_index`, the row in the day's time-sorted
+   `glm/flashes`, and counts orphans (`n_orphan_events`). No id problem fails a file.
 5. Build in `<day>.zarr.tmp`, consolidate metadata, then move into place. `complete` is true only
    if no listing/file errors occurred and the day ended ≥24 h ago; incomplete days are rebuilt
    from scratch on the next run.

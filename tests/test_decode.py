@@ -36,8 +36,8 @@ def test_parent_rows():
     # Parents not in the file (NOAA's orphans) give -1
     assert _parent_rows(np.array([40, 10]), ids, "x").tolist() == [-1, 1]
     assert _parent_rows(np.array([1]), np.array([], dtype=np.int64), "x").tolist() == [-1]
-    with pytest.raises(ValueError, match="duplicate"):
-        _parent_rows(np.array([10]), np.array([10, 10]), "x")
+    # An id used twice (flash ids wrap around) is ambiguous, so its children are orphans too
+    assert _parent_rows(np.array([10, 20]), np.array([10, 10, 20]), "x").tolist() == [-1, 2]
 
 
 def test_glm_events_link_to_their_flash(glm_file):
@@ -74,3 +74,11 @@ def test_orphan_events_are_kept_without_a_flash(tmp_path):
     want[0] = -1
     want[parents == orphaned_group] = -1
     assert decoded["event_flash"].tolist() == want.tolist() and (want == -1).sum() >= 2
+
+
+def test_file_whose_events_have_no_groups_at_all():
+    """NOAA publishes some files with events but zero groups (12 such files in 2025-2026)."""
+    event_group = np.array([-1, -1, -1], dtype=np.int32)
+    from goes_downloader.decode import _through
+    assert _through(event_group, np.zeros(0, dtype=np.int32)).tolist() == [-1, -1, -1]
+    assert _through(np.array([1, -1, 0]), np.array([7, 9], dtype=np.int32)).tolist() == [9, -1, 7]

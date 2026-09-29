@@ -173,18 +173,29 @@ GLM_READ_VARIABLES = [*GLM_FLASH_VARIABLES.values(), *GLM_EVENT_VARIABLES, *GLM_
 
 def _parent_rows(parent_ids: np.ndarray, ids: np.ndarray, what: str) -> np.ndarray:
     """
-    Row in `ids` of each parent id, or -1 where the parent is not in the file. NOAA's files have such
-    orphans (e.g. 64 of 2410 events on 2025-04-22 16:08:20 pointed at groups the file doesn't hold),
-    so they are kept rather than failing the file. Duplicate ids are an error.
+    Row in `ids` of each parent id, or -1 where the parent can't be found in the file. NOAA's files
+    have such orphans, which are kept rather than failing the file:
+    - parents missing from the file (e.g. 64 of 2410 events on 2025-04-22 16:08:20; some files
+      have events but no groups at all);
+    - ids used twice, since flash ids are 16-bit and wrap around in very active files (6 of
+      16,065 flash ids on 2026-08-23 16:53:40), so their children can't tell which is theirs.
     """
-    order = np.argsort(ids, kind="stable")
-    sorted_ids = ids[order]
-    if np.any(sorted_ids[1:] == sorted_ids[:-1]):
-        raise ValueError(f"{what}: duplicate ids")
     if len(parent_ids) == 0 or len(ids) == 0:
         return np.full(len(parent_ids), -1, dtype=np.int32)
-    pos = np.minimum(np.searchsorted(sorted_ids, parent_ids), len(ids) - 1)
-    return np.where(sorted_ids[pos] == parent_ids, order[pos], -1).astype(np.int32)
+    order = np.argsort(ids, kind="stable")
+    sorted_ids = ids[order]
+    first = np.searchsorted(sorted_ids, parent_ids, side="left")
+    unique = np.searchsorted(sorted_ids, parent_ids, side="right") - first == 1
+    return np.where(unique, order[np.minimum(first, len(ids) - 1)], -1).astype(np.int32)
+
+
+def _through(rows: np.ndarray, parent_of_row: np.ndarray) -> np.ndarray:
+    """parent_of_row[rows], with -1 where rows is -1 (also when parent_of_row is empty, as in files
+    whose events all lack their groups)."""
+    out = np.full(len(rows), -1, dtype=np.int32)
+    ok = rows >= 0
+    out[ok] = parent_of_row[rows[ok]]
+    return out
 
 
 def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
@@ -216,7 +227,7 @@ def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
             "quality_flag": quality.astype(np.uint8).reshape(-1),
             "event_lat": floats(var["event_lat"]),
             "event_lon": floats(var["event_lon"]),
-            "event_flash": np.where(event_group >= 0, group_flash[event_group], -1).astype(np.int32),
+            "event_flash": _through(event_group, group_flash),
         }
 
 

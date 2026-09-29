@@ -43,7 +43,7 @@ start falls in the day, all quality flags kept.
   glm/events/{lat,lon,flash_index}[event]   every event (one lit sensor pixel at one moment), in file
                                        order; flash_index is the row of its flash in the same day's
                                        glm/flashes, or -1 for an orphan event whose group or flash
-                                       isn't in its file (NOAA's files have some). Events give each
+                                       can't be found in its file (missing, or an id used twice). Events give each
                                        flash's footprint, which a flash-extent density needs
   glm/coverage/time[window]            datetime64 start of each 20 s window (4320 per day)
   glm/coverage/covered[window]         uint8  1 if a GLM file for the window was published and decoded
@@ -301,10 +301,12 @@ def write_glm_tables(
     event_group = g.require_group("events")
     for k, dtype in GLM_EVENT_COLUMNS.items():
         if k == "flash_index":
-            parts = [
-                np.where(t >= 0, sorted_row[first_row[j] + np.maximum(t, 0)], -1)
-                for j, t in ((j, tables[i]["event_flash"]) for j, i in enumerate(file_indices))
-            ]
+            parts = []
+            for j, i in enumerate(file_indices):
+                local = tables[i]["event_flash"]
+                rows = np.full(len(local), -1, dtype=np.int32)  # orphans stay -1
+                rows[local >= 0] = sorted_row[first_row[j] + local[local >= 0]]
+                parts.append(rows)
         else:
             parts = [tables[i][f"event_{k}"] for i in file_indices]
         write_column(event_group, k, np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype), "event")

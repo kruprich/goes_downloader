@@ -13,17 +13,23 @@ from .config import LatLonBounds
 _crop_rects: Dict[str, Tuple[float, float, float, float]] = {}  # per worker process
 
 
+def geos_crs(projection: Dict[str, Any]) -> Any:
+    """The ABI fixed grid (geostationary projection, metres) as a pyproj CRS."""
+    from pyproj import CRS
+
+    return CRS.from_proj4(
+        f"+proj=geos +lon_0={projection['longitude_of_projection_origin']} +h={float(projection['perspective_point_height'])} "
+        f"+a={projection['semi_major_axis']} +b={projection['semi_minor_axis']} "
+        f"+sweep={projection['sweep_angle_axis']} +units=m +no_defs"
+    )
+
+
 def latlon_to_scan_angle(lat: np.ndarray, lon: np.ndarray, projection: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
     """Lat/lon (deg) -> ABI fixed-grid scan angles (rad). Points not visible from the satellite -> inf."""
     from pyproj import CRS, Transformer
 
     h = float(projection["perspective_point_height"])
-    geos = CRS.from_proj4(
-        f"+proj=geos +lon_0={projection['longitude_of_projection_origin']} +h={h} "
-        f"+a={projection['semi_major_axis']} +b={projection['semi_minor_axis']} "
-        f"+sweep={projection['sweep_angle_axis']} +units=m +no_defs"
-    )
-    tfm = Transformer.from_crs(CRS.from_epsg(4326), geos, always_xy=True)
+    tfm = Transformer.from_crs(CRS.from_epsg(4326), geos_crs(projection), always_xy=True)
     x_m, y_m = tfm.transform(np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64))
     return np.asarray(x_m) / h, np.asarray(y_m) / h
 

@@ -8,8 +8,10 @@ import math
 import multiprocessing
 import os
 import shutil
-import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import signal
+import sys
+import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +31,43 @@ FLOAT16_MAX = float(np.finfo(np.float16).max)
 
 
 def features_day_path(cfg: FeatureConfig, day: datetime) -> str:
-    return os.path.join(cfg.output_root_dir, str(day.year), f"{day.year}{day.timetuple().tm_yday:03d}.zarr")
+    from ..store import output_zarr_path_for_day
+
+    return output_zarr_path_for_day(cfg.output_root_dir, day)
+
+
+def raw_neighbour_arrived(cfg: FeatureConfig, path: str) -> bool:
+    """
+    Whether a complete feature store must be rebuilt because a raw day it recorded as missing or
+    incomplete is now complete. Days next to the ends of the raw date range are marked complete
+    without their neighbours (which won't arrive unless the range is extended); when it is, this
+    rebuilds them.
+    """
+    import zarr
+
+    from ..store import output_zarr_path_for_day, zarr_store_is_complete
+
+    raw_days = zarr.open_consolidated(path, mode="r").attrs.get("raw_days", {})
+    return any(
+        st != "complete" and zarr_store_is_complete(output_zarr_path_for_day(cfg.raw.raw_output_root_dir, datetime.strptime(d, "%Y-%m-%d")))
+        for d, st in raw_days.items()
+    )
+
+
+def _exit_now(*_: Any) -> None:
+    from multiprocessing import util
+
+    # Unregisters the lock numcodecs creates when a worker imports zarr; otherwise the resource tracker
+    # warns about "leaked semaphore objects". Exiting through Python instead would let the pool's
+    # worker loop catch the exit and start the next day.
+    util._run_finalizers(0)
+    os._exit(1)
+
+
+def _ignore_ctrl_c() -> None:
+    """Worker initializer: only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM)."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, _exit_now)
 
 
 class ChannelStats:
@@ -103,7 +141,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         # Inputs from the lookback, flash windows ending at each issue time, label windows after it
         glm_s0 = min(s0, s_day + 1 - step)
         glm_s1 = out_slots[-1] + 1 + plan.lookahead
-        glm = GlmTimeline(cfg, grid, raw, glm_s0, max(glm_s1, s_day + SLOTS_PER_DAY), extent=cfg.uses_events)
+        glm = GlmTimeline(cfg, grid, raw, glm_s0, max(glm_s1, s_day + SLOTS_PER_DAY))
 
     # --- store (built at *.tmp and moved into place when done)
     tmp_path = out_path + ".tmp"
@@ -125,7 +163,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     labels_arr = frames("labels", [len(cfg.labels)], np.uint8, LABEL_UNKNOWN, ["time", "label", "y", "x"]) if cfg.labels else None
     # Every slot is written, so no fill value: zarr's default of 0 would make xarray read 0 flashes as missing
     flash_arr = frames("flash_count", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
-    extent_arr = frames("flash_extent", [], np.uint16, None, ["time", "y", "x"]) if glm is not None and glm.has_extent else None
+    extent_arr = frames("flash_extent", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
 
     # --- evaluate every channel slot by slot, from the lookback to the end of the day
     cache: Dict[str, Dict[int, np.ndarray]] = {c.name: {} for c in cfg.channels}
@@ -177,7 +215,10 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         for name, depth in plan.depth.items():
             cache[name].pop(s - 1 - depth, None)  # no longer reachable from slot s
         per_slot: Dict[Any, Any] = {}
+        is_output = s >= s_day and (s - s_day) % step == 0
         for ch in plan.order:
+            if not is_output and ch.name not in plan.every_slot:
+                continue  # only needed at output slots
             if ch.kind == "product":
                 frame = product_frame(ch, s, per_slot)
                 if ch.fill_gaps_slots:
@@ -198,7 +239,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
                 frame[np.isinf(frame)] = np.nan
             cache[ch.name][s] = frame
 
-        if s < s_day or (s - s_day) % step:
+        if not is_output:
             continue
         k = (s - s_day) // step
         stack = np.stack([cache[c.name][s] for c in outputs])
@@ -270,7 +311,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "helper_channels": [channel_attrs(c) for c in cfg.channels if not c.output],
             "labels": [label_attrs(l) for l in cfg.labels],
             "glm": {"quality_flags": cfg.glm_quality_flags, "lightning_ellipsoid_km": cfg.glm_ellipsoid_km,
-                    "min_coverage": cfg.glm_min_coverage, "extent": bool(glm is not None and glm.has_extent)},
+                    "min_coverage": cfg.glm_min_coverage, "extent": glm is not None},
             "geography_path": cfg.geography_path,
             "channel_stats": {name: st.as_dict() for name, st in stats.items()},
             "label_stats": {name: {"n_known": n, "n_positive": p} for name, (n, p) in label_counts.items()},
@@ -323,19 +364,24 @@ def run_build(cfg: FeatureConfig) -> None:
     log(f"{len(outputs)} channels ({', '.join(outputs)}), {len(cfg.labels)} labels, every {cfg.time_step_slots * SLOT_MINUTES} min; "
         f"lookback {plan.lookback * SLOT_MINUTES} min; features {per_day / 1e9:.1f} GB/day before compression")
 
-    todo = [d for d in days if cfg.overwrite_existing or not zarr_store_is_complete(features_day_path(cfg, datetime.strptime(d, "%Y-%m-%d")))]
+    def needs_build(d: str) -> bool:
+        path = features_day_path(cfg, datetime.strptime(d, "%Y-%m-%d"))
+        return cfg.overwrite_existing or not zarr_store_is_complete(path) or raw_neighbour_arrived(cfg, path)
+
+    todo = [d for d in days if needs_build(d)]
     log(f"{len(days) - len(todo)} of {len(days)} days already complete; building {len(todo)}")
 
     ok, failed, total_bytes, t0 = [], [], 0, time.monotonic()
     workers = min(cfg.max_workers, max(1, len(todo)))
     # Workers start fresh (spawn) so no zarr/numpy thread state is inherited from this process
-    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"), initializer=_ignore_ctrl_c)
+    try:
         futures = {pool.submit(build_day, cfg, grid, d): d for d in todo}
         for i, fut in enumerate(as_completed(futures), 1):
             d = futures[fut]
             try:
                 r = fut.result()
-            except Exception as e:
+            except Exception as e:  # including BrokenProcessPool when a worker dies
                 log(f"!! {d} failed: {e!r}")
                 failed.append(d)
                 continue
@@ -347,6 +393,14 @@ def run_build(cfg: FeatureConfig) -> None:
                 log(f"-> {d} {r['status']} in {r['seconds']:.0f}s, {r['bytes'] / 1e6:.0f} MB, {r['n_flashes']} flashes  [{i}/{len(todo)}, ETA {eta}]{extra}")
             else:
                 log(f"-> {d} {r['status']}  [{i}/{len(todo)}]")
+    except KeyboardInterrupt:
+        # A day takes tens of seconds, so don't wait: the days in progress stay .tmp and are rebuilt next
+        # run. ProcessPoolExecutor has no public way to stop its workers before Python 3.14.
+        for proc in list((getattr(pool, "_processes", None) or {}).values()):
+            proc.terminate()
+        pool.shutdown(cancel_futures=True)  # quick once the workers are gone; frees the pool's locks
+        raise
+    pool.shutdown()
 
     print("\n" + "=" * 72)
     print(f"Days built:      {len(ok) + len(failed)} of {len(todo)} ({len(ok)} complete)")
@@ -442,8 +496,12 @@ def features_main(argv: Optional[List[str]] = None) -> None:
         cfg = replace(cfg, **overrides)
     if args.stats:
         run_stats(cfg)
-    else:
+        return
+    try:
         run_build(cfg)
+    except KeyboardInterrupt:
+        print("\nInterrupted. Finished days are kept; run the same command again to continue.", file=sys.stderr)
+        sys.exit(130)
 
 
 def geography_main(argv: Optional[List[str]] = None) -> None:

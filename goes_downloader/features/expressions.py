@@ -112,6 +112,9 @@ class Plan:
     depth: Dict[str, int]  # oldest slot (back from the current one) at which each channel is read
     lookback: int  # slots computed before the day so the first output slot has full history
     lookahead: int  # GLM slots after the last issue time that the labels need
+    # Channels computed at every slot: read at earlier slots (lag, *_past), carrying values forward
+    # (fill_gaps), or read by such a channel. The others are only computed at output slots.
+    every_slot: frozenset
 
 
 def make_plan(channels: Tuple[ChannelSpec, ...], label_end_slots: List[int]) -> Plan:
@@ -154,7 +157,12 @@ def make_plan(channels: Tuple[ChannelSpec, ...], label_end_slots: List[int]) -> 
         else:
             need[c.name] = max((off + need[r] for r, off in refs[c.name]), default=0)
 
-    return Plan(order, exprs, depth, max(need.values()), max(label_end_slots, default=0))
+    every = {c.name for c in channels if c.kind == "product" and c.fill_gaps_slots}
+    every |= {r for rs in refs.values() for r, off in rs if off > 0}
+    for c in reversed(order):  # readers before the channels they read
+        if c.name in every:
+            every |= {r for r, _ in refs.get(c.name, [])}
+    return Plan(order, exprs, depth, max(need.values()), max(label_end_slots, default=0), frozenset(every))
 
 
 class Evaluator:

@@ -107,11 +107,6 @@ class FeatureConfig:
     def uses_glm(self) -> bool:
         return self.raw.glm_product is not None
 
-    @property
-    def uses_events(self) -> bool:
-        """Whether flash footprints (GLM events) are needed; flash_extent is stored whenever GLM is."""
-        return self.uses_glm
-
 
 CHANNEL_KEYS = {
     "product": {"product", "aggregation", "values", "valid_dqf", "min_valid_fraction", "fill_gaps_minutes"},

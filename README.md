@@ -311,8 +311,11 @@ fraction per label).
 
 A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
 before for lags and gap filling, the day after for labels. Neighbours outside the download date range
-never arrive, so they don't hold a day back; their slots are just missing. Incomplete days are rebuilt
-on the next run. Changing the `features` config doesn't touch days already complete: pass
+don't hold a day back; their slots are just missing. If the range is extended and such a neighbour
+is downloaded, the next run rebuilds the day. Incomplete days are rebuilt on the next run.
+
+Ctrl-C stops a build within a second or two: the days being built are left as `.zarr.tmp` folders and
+rebuilt when the same command runs again. Changing the `features` config doesn't touch days already complete: pass
 `--overwrite` or delete `goes_features/`.
 
 ### Grid and time
@@ -412,8 +415,11 @@ repo's evaluation area and coastal band), not model inputs.
 
 With the default config (11 stored channels, 4 km, every 15 minutes, float16, LZ4HC): about 0.33 GB
 per day for Apr 10 – May 9 2025, so about 176 GB for the 534-day range. On an otherwise idle machine
-a day takes about 33 s and 130 CPU-seconds (a build uses about 4 cores), of which mapping the day's
-~50 million GLM events to cells is about 6 s. While a download runs, 3 days in parallel took 52–116 s
+a day takes about 32 s and 115 CPU-seconds (a build uses about 4 cores; measured on 2025-10-27, where
+computing every channel at every 5-minute slot took 42–44 s), of which mapping the day's ~50 million
+GLM events to cells is about 6 s. Channels are computed at every 5-minute slot only when needed: when
+read at earlier slots (`lag`, `*_past`), when carrying values forward (`fill_gaps_minutes`), or when
+such a channel reads them; the rest only at the stored times. While a download runs, 3 days in parallel took 52–116 s
 each: build with fewer `--workers`, or while the download is stopped. The geography store takes about
 16 s once its sources are cached, 14 s of it for the borders.
 

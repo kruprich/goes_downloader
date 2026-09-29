@@ -14,7 +14,11 @@ from .raw import RawTimeline, day_of_index
 from .settings import FeatureConfig
 
 SLOT_NS = SLOT_SECONDS * 1_000_000_000
+DAY_NS = SLOTS_PER_DAY * SLOT_NS
 GLM_WINDOWS_PER_SLOT = SLOT_SECONDS // GLM_WINDOW_SECONDS
+# A flash's first event lies within its file's 20 s, or up to ~2 s before it (it began in the
+# previous file's window), so the files that can hold flashes of [t0, t1) start in [t0 - 20 s, t1 + 20 s)
+FILE_MARGIN_NS = GLM_WINDOW_SECONDS * 1_000_000_000
 EVENT_CHUNK = 5_000_000  # events mapped at a time (~1 GB peak); a day has ~50 M
 
 
@@ -29,18 +33,20 @@ class GlmTimeline:
     - extent: one (slot, cell) per flash and cell that any of its events fell in, i.e. the flash's
       footprint, the basis of a flash-extent density (flashes per cell). Needs glm/events;
     - coverage: the fraction of 20 s GLM windows with data, per slot.
-    A flash counts at the slot of its first event, and belongs to the day store of its file, so the
-    stores of every day overlapping the range are read and flashes are selected by their own time.
+    A flash counts at the slot of its first event and belongs to the day store of its file: a flash
+    that starts a second or two before midnight is in the next day's first file. So the files that can
+    hold flashes of the range are read, whichever day holds them, and flashes are selected by their
+    own time.
     """
 
-    def __init__(self, cfg: FeatureConfig, grid: TargetGrid, raw: RawTimeline, s0: int, s1: int, extent: bool = True):
+    def __init__(self, cfg: FeatureConfig, grid: TargetGrid, raw: RawTimeline, s0: int, s1: int):
         self.s0, self.s1, self.ncells = s0, s1, grid.ny * grid.nx
         self.coverage = np.zeros(s1 - s0, dtype=np.float64)
         proj = glm_projection(grid.projection, cfg.glm_ellipsoid_km)
         slots, cells, energy, area = [], [], [], []
         ext_slots, ext_cells = [], []
-        # A flash can start a second or two before its file's day, so read the day before s0 as well
-        for d in range((s0 - 1) // SLOTS_PER_DAY, (s1 - 1) // SLOTS_PER_DAY + 1):
+        f0, f1 = s0 * SLOT_NS - FILE_MARGIN_NS, s1 * SLOT_NS + FILE_MARGIN_NS  # file start times to read
+        for d in range(f0 // DAY_NS, (f1 - 1) // DAY_NS + 1):
             root = raw.day(d).root
             if root is None or "glm/coverage" not in root:
                 continue
@@ -65,12 +71,19 @@ class GlmTimeline:
             energy.append(f["energy_j"][:][keep][inside].astype(np.float64) * 1e15)
             area.append(f["area_m2"][:][keep][inside].astype(np.float64) / 1e6)
 
-            if extent:
-                if "glm/events" not in root:
-                    raise ValueError(f"raw store for {day_of_index(d).date()} has no glm/events; flash extent needs one from the current downloader")
-                s_pairs, c_pairs = self._extent_pairs(root["glm/events"], keep, flash_slot, grid, proj)
-                ext_slots.append(s_pairs)
-                ext_cells.append(c_pairs)
+            if "glm/events" not in root:
+                raise ValueError(f"raw store for {day_of_index(d).date()} has no glm/events; flash extent needs one from the current downloader")
+            # Only the events of the files that can hold the range's flashes (events are in file order)
+            files = root["glm/files"]
+            start = files["start_ns"][:]
+            first_event = np.concatenate(([0], np.cumsum(files["n_events"][:], dtype=np.int64)))
+            sel = np.flatnonzero((start >= f0) & (start < f1))
+            if not sel.size:
+                continue
+            e0, e1 = int(first_event[sel[0]]), int(first_event[sel[-1] + 1])
+            s_pairs, c_pairs = self._extent_pairs(root["glm/events"], e0, e1, keep, flash_slot, grid, proj)
+            ext_slots.append(s_pairs)
+            ext_cells.append(c_pairs)
 
         slot = _cat(slots, np.int64)
         order = np.argsort(slot, kind="stable")
@@ -81,23 +94,22 @@ class GlmTimeline:
         order = np.argsort(ext_slot, kind="stable")
         self.ext_slot = ext_slot[order]
         self.ext_cell = _cat(ext_cells, np.int64)[order]
-        self.has_extent = extent
 
-    def _extent_pairs(self, events: Any, keep: np.ndarray, flash_slot: np.ndarray, grid: TargetGrid,
+    def _extent_pairs(self, events: Any, e0: int, e1: int, keep: np.ndarray, flash_slot: np.ndarray, grid: TargetGrid,
                       proj: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        (slot, cell) for every distinct (kept flash, cell touched by one of its events). Orphan events
-        (flash_index -1: their group or flash isn't in NOAA's file, a few hundred a day) belong to no
-        flash and are skipped.
+        (slot, cell) for every distinct (kept flash, cell touched by one of its events), from events
+        [e0, e1). Orphan events (flash_index -1: their group or flash can't be found in NOAA's file, a
+        few hundred a day) belong to no flash and are skipped.
         """
-        n = events["flash_index"].shape[0]
         keys = []
-        for a in range(0, n, EVENT_CHUNK):
-            fi = events["flash_index"][a : a + EVENT_CHUNK]
+        for a in range(e0, e1, EVENT_CHUNK):
+            b = min(a + EVENT_CHUNK, e1)
+            fi = events["flash_index"][a:b]
             sel = (fi >= 0) & keep[np.maximum(fi, 0)]
-            if not sel.any():  # events are in file (time) order, so neighbouring days skip most chunks
+            if not sel.any():
                 continue
-            x, y = latlon_to_scan_angle(events["lat"][a : a + EVENT_CHUNK][sel], events["lon"][a : a + EVENT_CHUNK][sel], proj)
+            x, y = latlon_to_scan_angle(events["lat"][a:b][sel], events["lon"][a:b][sel], proj)
             c = grid.cells_of(np.asarray(x), np.asarray(y))
             inside = c >= 0
             keys.append(np.unique(fi[sel][inside].astype(np.int64) * self.ncells + c[inside]))
@@ -114,8 +126,6 @@ class GlmTimeline:
     def sums(self, a: int, b: int, stat: str = "count") -> np.ndarray:
         """Flat per-cell totals over slots [a, b): flashes (count), their energy or area, or flashes touching the cell (extent)."""
         if stat == "extent":
-            if not self.has_extent:
-                raise ValueError("flash extent was not loaded")
             r = self._range(self.ext_slot, a, b)
             return np.bincount(self.ext_cell[r], minlength=self.ncells)
         r = self._range(self.slot, a, b)

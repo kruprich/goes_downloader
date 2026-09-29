@@ -99,6 +99,13 @@ def write_glm(path: str, flashes, covered: np.ndarray, orphans=()):
     e.array("lat", np.array([x[0] for x in ev], np.float32))
     e.array("lon", np.array([x[1] for x in ev], np.float32))
     e.array("flash_index", np.array([x[2] for x in ev], np.int32))
+    # One file per flash, starting at its 20 s window, but never before the store's day: a flash that
+    # starts just before midnight is in the next day's first file, as in NOAA's data
+    day_start = int(np.datetime64(root.attrs["day_utc"], "ns").astype(np.int64))
+    w = 20 * 10**9
+    fl = g.require_group("files")
+    fl.array("start_ns", np.array([max(day_start, t // w * w) for t, _, _ in flashes], np.int64))
+    fl.array("n_events", np.array([len(evs) + (len(orphans) if i == 0 else 0) for i, (_, _, evs) in enumerate(flashes)], np.int32))
     g.require_group("coverage").array("covered", covered.astype(np.uint8))
     zarr.consolidate_metadata(zarr.DirectoryStore(path))
 
@@ -468,3 +475,52 @@ def test_time_zone_of_slots(built, tmp_path):
     t = F["time"][:]
     assert t[0] == T1 and np.all(np.diff(t) == 15 * MIN) and len(t) == 96
     assert datetime.fromtimestamp(t[0] / 1e9, timezone.utc).hour == 0
+
+
+def test_flash_just_before_midnight_counts_without_labels(built, tmp_path):
+    """With no labels the GLM range ends at midnight; D (23:59:59) is in day 2's first file and must count."""
+    cfg, grid = built
+    nolabels = load_feature_config(config(tmp_path, labels=[], time_step_minutes=5, output_root_dir=str(tmp_path / "nolabels")))
+    build_day(nolabels, grid, DAY1)
+    F = zarr.open_consolidated(str(tmp_path / "nolabels/2025/2025152.zarr"), mode="r")
+    assert cells(F["flash_count"][287] > 0) == {(7, 7)} and cells(F["flash_extent"][287] > 0) == {(7, 7)}
+
+
+def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives(built, tmp_path):
+    from goes_downloader.features.build import features_day_path, raw_neighbour_arrived
+
+    cfg, grid = built
+    assert build_day(cfg, grid, DAY2)["complete"]  # day 3 is outside the download range
+    path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
+    assert not raw_neighbour_arrived(cfg, path)
+    p3 = write_raw_day(str(tmp_path / "raw"), "2025-06-03")  # the range was extended and day 3 downloaded
+    write_glm(p3, [], np.ones(4320))
+    assert raw_neighbour_arrived(cfg, path)
+
+
+def test_only_channels_read_at_earlier_slots_are_computed_every_slot(built):
+    from goes_downloader.features.expressions import make_plan
+
+    cfg, _ = built
+    plan = make_plan(cfg.channels, [l.end_slots for l in cfg.labels])
+    assert plan.every_slot == {"a", "fed"}  # lag(a, 15) and sum_past(fed, 15); the rest only at output slots
+
+
+def test_fraction_matches_values_float32_cannot_hold_exactly():
+    from goes_downloader.features.grid import matches_any
+
+    phys = np.array([3, 1, 2], dtype=np.float32) * np.float32(0.1)  # 0.3 is 0.30000001 in float32
+    assert not np.isin(phys, [0.3]).any()
+    assert matches_any(phys, [0.3, 0.1]).tolist() == [True, True, False]
+
+
+def test_ctrl_c_during_a_feature_build_exits_cleanly(monkeypatch, tmp_path, capsys):
+    from goes_downloader.features import build
+
+    def interrupted(cfg):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(build, "run_build", interrupted)
+    with pytest.raises(SystemExit) as stop:
+        build.features_main(["--config", config(tmp_path)])
+    assert stop.value.code == 130 and "Interrupted" in capsys.readouterr().err

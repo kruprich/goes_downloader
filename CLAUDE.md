@@ -29,7 +29,7 @@ install `numcodecs<0.16`.
 .venv/bin/python report.py --config config.json           # which days are complete / need attention
 .venv/bin/python build_geography.py --config config.json  # once: static fields on the feature grid
 .venv/bin/python build_features.py --config config.json   # feature stores; --start/--end/--workers/--stats
-.venv/bin/python -m pytest                                # offline tests, under a second
+.venv/bin/python -m pytest                                # offline tests, a few seconds
 .venv/bin/python -m pytest --network                      # + real files and the test hour (~0.5 GB, ~30 s)
 .venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py build_features.py build_geography.py
 ```
@@ -161,8 +161,14 @@ errors), `expressions` (derived channels and the evaluation `Plan`), `grid` (`Ta
 (`RawTimeline`: raw frames by global 5-min slot across days), `glm` (`GlmTimeline`: centroids,
 footprints from events, coverage), `geography` (the one-time static fields, including country borders
 rasterized from GeoJSON by scanline: `rasterize_rings`, `distance_to_km`), `build` (`build_day` in
-spawn workers, `run_build`, `run_stats`, the CLIs). `build_day` evaluates every channel slot by slot
-from `lookback` slots before the day to its end, keeping only the slots `lag`/`*_past` still need.
+spawn workers, `run_build`, `run_stats`, the CLIs). `build_day` goes slot by slot from `lookback`
+slots before the day to its end. Only `Plan.every_slot` channels (read at earlier slots, carrying
+values forward with `fill_gaps`, or read by such a channel) are computed at every slot; the rest only
+at output slots, which cut a day from 42–44 s to 32 s with identical output. The cache keeps only
+the slots `lag`/`*_past` still need. `run_build` rebuilds a complete day when a raw day it recorded
+as missing or incomplete has since completed (`raw_neighbour_arrived`); on Ctrl-C it terminates the
+workers, which run multiprocessing's finalizers before exiting (`_exit_now`) so numcodecs' lock isn't
+reported as a leaked semaphore.
 
 **Invariants that are easy to break:**
 - Arrays written in full must use `_write_array` (`fill_value=None` + `_ARRAY_DIMENSIONS`).
@@ -193,14 +199,17 @@ from `lookback` slots before the day to its end, keeping only the slots `lag`/`*
   origin, so they nest in the 2 km and 10 km grids; the geography store must have the same cells
   (`check_geography`). Coarser sources take the pixel under the cell centre, ties to the lower one.
 - GLM flashes and events are read on the lightning ellipsoid (+14/+6 km), which recovers GLM's view
-  angle. A flash belongs to its file's day store but counts at its own first-event time, so the
-  store of the day before the range is read too. Footprints are distinct (flash, cell) pairs.
+  angle. A flash belongs to its file's day store but counts at its own first-event time: one that
+  starts just before midnight is in the next day's first file. So `GlmTimeline` reads the files that
+  start within 20 s of the range (`FILE_MARGIN_NS`), whichever day holds them, and only their events
+  (offsets from `glm/files/n_events`). Footprints are distinct (flash, cell) pairs.
   Event `flash_index` is -1 for orphans (no flash in their file): mask it before indexing flashes,
   or -1 silently picks the day's last flash.
 - Feature inputs end at the issue time (slot start + 5 min); label windows start there. Labels are
   255 where GLM covered less than `glm.min_coverage`; GLM channels are NaN likewise.
 - `flash_count` and `flash_extent` are written in full with `fill_value=None`; `features` uses NaN and
-  `labels` 255. A feature day is complete only if every raw day it read inside the download range is.
+  `labels` 255. A feature day is complete only if every raw day it read inside the download range is;
+  days next to the range's ends are rebuilt once a missing neighbour arrives (`raw_neighbour_arrived`).
 - The entry scripts import nothing outside their main guard (spawn workers re-run them).
 
 ## Conventions
@@ -223,4 +232,4 @@ from `lookback` slots before the day to its end, keeping only the slots `lag`/`*
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
   in it; geography sources are cached in `./goes_static`. Current config: about 0.33 GB/day
   (~176 GB for the range), stored as whole-frame LZ4HC chunks (reads 5.8x faster than zstd in
-  256x256 chunks); a day takes ~33 s and ~4 cores on an idle machine, much longer next to a download.
+  256x256 chunks); a day takes ~32 s and ~4 cores on an idle machine, much longer next to a download.

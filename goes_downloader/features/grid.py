@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from ..common import iter_days_utc
-from ..crop import scan_angle_rect
+from ..crop import geos_crs, scan_angle_rect
 from .settings import ChannelSpec, FeatureConfig
 
 
@@ -62,22 +62,12 @@ class TargetGrid:
             np.allclose(self.x(), other.x(), atol=1e-7) and np.allclose(self.y(), other.y(), atol=1e-7))
 
 
-def _geos_crs(projection: Dict[str, Any]) -> Any:
-    from pyproj import CRS
-
-    return CRS.from_proj4(
-        f"+proj=geos +lon_0={projection['longitude_of_projection_origin']} +h={projection['perspective_point_height']} "
-        f"+a={projection['semi_major_axis']} +b={projection['semi_minor_axis']} "
-        f"+sweep={projection['sweep_angle_axis']} +units=m +no_defs"
-    )
-
-
 def grid_latlon(grid: TargetGrid) -> Tuple[np.ndarray, np.ndarray]:
     """Cell-centre lat/lon (deg, float32); NaN for cells off the Earth's disk."""
     from pyproj import CRS, Transformer
 
     h = float(grid.projection["perspective_point_height"])
-    tfm = Transformer.from_crs(_geos_crs(grid.projection), CRS.from_epsg(4326), always_xy=True)
+    tfm = Transformer.from_crs(geos_crs(grid.projection), CRS.from_epsg(4326), always_xy=True)
     xx, yy = np.meshgrid(grid.x() * h, grid.y() * h)
     lon, lat = tfm.transform(xx, yy)
     lat, lon = np.asarray(lat, dtype=np.float32), np.asarray(lon, dtype=np.float32)
@@ -330,6 +320,18 @@ class SourceFrame:
         return self._zeroed
 
 
+def matches_any(phys: np.ndarray, values: Any) -> np.ndarray:
+    """
+    Where float32 physical values equal any of the (float64) config values. Exact equality would miss
+    values such as 0.1 that float32 can't hold, so allow a relative 1e-5, far below any spacing of
+    category values.
+    """
+    hit = np.zeros(phys.shape, dtype=bool)
+    for v in values:
+        hit |= np.abs(phys - np.float32(v)) <= np.float32(1e-5 * max(1.0, abs(v)))
+    return hit
+
+
 def aggregate(ch: ChannelSpec, src: SourceFrame) -> np.ndarray:
     """One product channel on the grid."""
     n = src.n
@@ -337,7 +339,7 @@ def aggregate(ch: ChannelSpec, src: SourceFrame) -> np.ndarray:
         if ch.aggregation in ("min", "max"):
             out = src.reduce(np.where(src.valid, src.phys, np.float32(np.nan)), np.fmin if ch.aggregation == "min" else np.fmax)
         elif ch.aggregation == "fraction":
-            out = src.reduce((src.valid & np.isin(src.phys, ch.values)).astype(np.float32), np.add) / n
+            out = src.reduce((src.valid & matches_any(src.phys, ch.values)).astype(np.float32), np.add) / n
         elif ch.aggregation == "mean":
             out = src.reduce(src.zeroed, np.add) / n
         else:

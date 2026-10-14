@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A downloader (`download_raw.py` → the `goes_downloader` package, driven by `config.json`) that
-mirrors GOES-19 ABI CONUS L2 products and GLM lightning flashes and events from the public bucket
-`gcp-public-data-goes-19` into one raw Zarr store per UTC day. It is the raw layer for a
+mirrors GOES-19 ABI CONUS L2 products and GLM lightning flashes and events from NOAA's public bucket
+on AWS (`s3://noaa-goes19`, the config's `bucket`) or Google Cloud (`gs://gcp-public-data-goes-19`;
+same files and names) into one raw Zarr store per UTC day. It is the raw layer for a
 lightning-prediction training dataset: it deliberately does **no** time binning, regridding or
 quality filtering. That is the feature step (`goes_downloader/features/`, run by
 `build_geography.py` once and `build_features.py`), which turns the raw stores into CNN inputs and
@@ -21,7 +22,8 @@ speeds.
 
 Shells here don't activate the virtual environment, so call its Python directly. Python 3.12–3.13
 only (`requires-python` in pyproject.toml): the locked numpy and pyproj need 3.12, and 3.14 can't
-install `numcodecs<0.16`.
+install `numcodecs<0.16`. On the Mac checkout the venv uses python.org's 3.12, which has no CA
+certificates: prefix anything that touches the network with `SSL_CERT_FILE=/etc/ssl/cert.pem`.
 
 ```bash
 .venv/bin/python -m pip install -e ".[dev]" -c requirements.lock   # without [dev] to only run it
@@ -50,7 +52,10 @@ the decode pool replaces a worker that dies, and the replacement imports the cod
 serve them to the byte-range code through a fake remote whose buffers start as random bytes
 (`junk_fill`), so decoding anything that was not fetched fails the comparison.
 - `test_ranges.py`: byte-range decoding equals whole-file decoding; chunks of unread bands or
-  outside the crop aren't fetched; the fetched-range bookkeeping against a per-byte model.
+  outside the crop aren't fetched; the fetched-range bookkeeping against a per-byte model;
+  `_get_range` splits the object URL into host and path (fake `HTTPSConnection`).
+- `test_remote.py`: object URLs and `bucket` validation for both clouds; S3 (XML) and GCS (JSON)
+  listing pages through continuation tokens.
 - `test_decode.py`: rounding of packed values; linking GLM events to flashes and its errors.
 - `test_store.py`: GLM tables (flash order, event links after sorting, counts, coverage).
 - `test_config.py`: config validation and IR-band precision; `crop_slice`; the entry script
@@ -73,7 +78,8 @@ formula instead of pyproj (skipping orphan events, `flash_index` -1). Write them
 
 **Network tests** (`test_network.py`, `--network`) decode two real files of every configured
 product both ways and run the reference hour through the whole pipeline with both
-`download_method` values, requiring identical stores.
+`download_method` values, requiring identical stores, all from the configured `bucket`; and list the
+reference hour on both clouds in 50-object pages, requiring the same names and sizes.
 
 For a short real download, write a harness script that sets `remote.LIST_HOURS` and run it with
 `.venv/bin/python` (the package is installed in `.venv`, so the script can live anywhere). It must
@@ -103,8 +109,10 @@ if __name__ == "__main__":
 
 **Modules (`goes_downloader/`).**
 - `config`: the settings dataclasses and `load_config`.
-- `remote`: file names, listing (`list_day_names`, `select_files`, `LIST_HOURS`), whole-file
-  downloads (`http_get`, aiohttp).
+- `remote`: file names, object URLs (`object_url`), listing (`list_object_names` for S3's
+  ListObjectsV2 XML or the GCS JSON API, `list_day_names`, `select_files`, `LIST_HOURS`,
+  `LIST_PAGE_SIZE`), whole-file downloads (`http_get`, aiohttp). The only module that knows the
+  clouds apart: the main process builds each object's HTTPS URL, and byte-range workers get that.
 - `decode`: NetCDF → packed ABI arrays and GLM flash/event tables; `DecodePool`.
 - `crop`: the bounds → scan-angle rectangle → pixel window.
 - `ranges`: byte-range fetching and decoding in the pool workers (`_RangeFile`).
@@ -118,7 +126,10 @@ Pool workers import only `ranges`/`decode` and what they need: `download_raw.py`
 inside the main guard, and `remote` imports aiohttp inside `http_get`, so workers skip aiohttp and
 zarr (~146 MB each). Keep it that way (`test_entry_script_imports_nothing_outside_its_main_guard`).
 
-**Config (`config.json`).** `abi_products` and `glm_product` define the downloadable products (all
+**Config (`config.json`).** `bucket` is `s3://<name>` or `gs://<name>` (validated by
+`BUCKET_PATTERN`; stored as the root attr `source_bucket`), read anonymously over HTTPS. Each
+product's `product_prefix` is the top-level folder, the same on both clouds.
+`abi_products` and `glm_product` define the downloadable products (all
 16 CMIP bands twice, plus single-variable CONUS L2 products, each with a `description`): `cmip_*`
 read each band's own file, `mcmip_*` read one band from the all-band MCMIPC file at 2 km, which
 is only practical with `"byte_ranges"` (~59 MB per whole file; `run_all_days` warns otherwise).
@@ -130,9 +141,9 @@ The `download` list selects which to fetch; it currently holds LightningCast's b
 the product/bounds key sets) as well as read.
 
 **Per-day flow (`process_single_day`).**
-1. List each distinct `gcs_product_prefix` once (24 hourly prefixes). `select_files` filters by
+1. List each distinct `product_prefix` once (24 hourly prefixes). `select_files` filters by
    `filename_must_contain` and keeps the newest creation time when NOAA republishes a scan.
-2. Group ABI products by source file (`(gcs_product_prefix, filename_must_contain)`), so products
+2. Group ABI products by source file (`(product_prefix, filename_must_contain)`), so products
    reading different variables from one file (e.g. the `mcmip_*` bands, the `dsi_*` indices) share
    one download and one decode. Each file goes to a 5-minute slot (288/day) by scan start.
 3. Download (`http_get`, retries on transient errors) → decode in `DecodePool` (returns packed
@@ -230,8 +241,10 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   2025-04-10 (GOES-19 became operational as GOES-East on 2025-04-07) to 2026-09-25, 534 days, about
   2.1 GB/day stored
   with the NOAA CONUS bounds (~1.12–1.24 TB). With `"byte_ranges"` a day downloads 4.9 GB and
-  takes 95–110 s on a ~60 MB/s connection (14–16 h for the range); `"whole_files"` would download
-  16.1 GB/day because of the MCMIPC files.
+  took 95–110 s from Google Cloud on a ~60 MB/s connection (14–16 h for the range); `"whole_files"`
+  would download 16.1 GB/day because of the MCMIPC files. README's speed and memory figures are from
+  Google Cloud except its "Choosing a cloud" table: on the 8-core, 16 GB Mac with 24 processes a day
+  took 2 min 53 s from AWS and 4 min 01 s from Google Cloud (one run each, identical stores).
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
   in it; geography sources are cached in `./goes_static`. Current config: about 0.37 GB/day
   (~200 GB for the range), stored as whole-frame LZ4 9 chunks (reads 0.85 ms/frame, as fast as LZ4HC

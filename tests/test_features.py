@@ -112,13 +112,13 @@ def write_glm(path: str, flashes, covered: np.ndarray, orphans=()):
 
 def config(tmp_path, end=DAY2, **features):
     raw = {
-        "gcs_bucket": "test", "start_date_utc": DAY1, "end_date_utc": end, "raw_output_root_dir": str(tmp_path / "raw"),
+        "bucket": "s3://test", "start_date_utc": DAY1, "end_date_utc": end, "raw_output_root_dir": str(tmp_path / "raw"),
         "download": ["p2", "p10", "glm"],
         "abi_products": [
-            {"key": "p2", "gcs_product_prefix": "A", "filename_must_contain": "A-M6", "data_variable": "V", "dqf_variable": "DQF"},
-            {"key": "p10", "gcs_product_prefix": "B", "filename_must_contain": "B-M6", "data_variable": "V", "dqf_variable": "DQF"},
+            {"key": "p2", "product_prefix": "A", "filename_must_contain": "A-M6", "data_variable": "V", "dqf_variable": "DQF"},
+            {"key": "p10", "product_prefix": "B", "filename_must_contain": "B-M6", "data_variable": "V", "dqf_variable": "DQF"},
         ],
-        "glm_product": {"key": "glm", "gcs_product_prefix": "G", "filename_must_contain": "G"},
+        "glm_product": {"key": "glm", "product_prefix": "G", "filename_must_contain": "G"},
         "features": {
             "output_root_dir": str(tmp_path / "features"),
             "start_date_utc": DAY1, "end_date_utc": DAY2,

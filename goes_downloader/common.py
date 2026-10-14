@@ -15,7 +15,6 @@ NAT_NS = np.iinfo(np.int64).min  # int64 view of numpy NaT
 # CF attributes that make xarray decode int64 nanosecond arrays to datetime64 (int64 min -> NaT)
 TIME_ATTRS = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
 
-GCS_HOST = "storage.googleapis.com"
 RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 
 

@@ -1,6 +1,7 @@
 """Byte-range downloads: the fetched-range bookkeeping, and decoding from partial files."""
 
 import random
+import threading
 
 import numpy as np
 import pytest
@@ -115,3 +116,47 @@ def test_ranged_glm_matches_whole_file(glm_file, remote):
     for key in whole:
         assert same(whole[key], partial[key]), key
     assert downloaded < len(data)
+
+
+class FakeConnection:
+    """http.client.HTTPSConnection stand-in: serves byte ranges of one pattern and records every request."""
+    opened = []
+
+    def __init__(self, host, timeout):
+        self.host, self.requests = host, []
+        FakeConnection.opened.append(self)
+
+    def request(self, method, path, headers):
+        self.requests.append((method, path, headers["Range"]))
+        start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
+        self.body = bytes(range(256))[start:end + 1]
+
+    def getresponse(self):
+        body = self.body
+
+        class Response:
+            status = 206
+
+            def read(self):
+                return body
+        return Response()
+
+    def close(self):
+        pass
+
+
+def test_get_range_requests_the_object_from_its_host(monkeypatch):
+    """The worker splits the object URL into host and path, and keeps one connection per host."""
+    monkeypatch.setattr(ranges.http.client, "HTTPSConnection", FakeConnection)
+    monkeypatch.setattr(ranges, "_range_connections", threading.local())
+    FakeConnection.opened = []
+    s3 = "https://noaa-goes19.s3.amazonaws.com/GLM-L2-LCFA/2025/300/18/f.nc"
+    gcs = "https://storage.googleapis.com/gcp-public-data-goes-19/GLM-L2-LCFA/2025/300/18/f.nc"
+    assert ranges._get_range(s3, 10, 20, 1, 1) == bytes(range(10, 20))
+    assert ranges._get_range(s3, 0, 4, 1, 1) == bytes(range(4))
+    assert ranges._get_range(gcs, 5, 6, 1, 1) == bytes([5])
+    assert [(c.host, c.requests) for c in FakeConnection.opened] == [
+        ("noaa-goes19.s3.amazonaws.com", [("GET", "/GLM-L2-LCFA/2025/300/18/f.nc", "bytes=10-19"),
+                                          ("GET", "/GLM-L2-LCFA/2025/300/18/f.nc", "bytes=0-3")]),
+        ("storage.googleapis.com", [("GET", "/gcp-public-data-goes-19/GLM-L2-LCFA/2025/300/18/f.nc", "bytes=5-5")]),
+    ]

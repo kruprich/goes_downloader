@@ -14,13 +14,13 @@ import numpy as np
 import zarr
 
 from . import progress
-from .common import GCS_HOST, GLM_WINDOWS_PER_DAY, SLOT_SECONDS, SLOTS_PER_DAY, to_ns
+from .common import GLM_WINDOWS_PER_DAY, SLOT_SECONDS, SLOTS_PER_DAY, to_ns
 from .config import ProductSpec, RawConfig
 from .crop import DayCrop
 from .decode import DecodePool, decode_abi_file, decode_glm_file
 from .progress import log
 from .ranges import ranged_decode_abi_file, ranged_decode_glm_file
-from .remote import RemoteFile, http_get, list_day_names, select_files
+from .remote import RemoteFile, http_get, list_day_names, object_url, select_files
 from .store import (
     AbiProductState,
     directory_size,
@@ -36,7 +36,7 @@ MAX_ERRORS_LOGGED_PER_DAY = 5
 
 
 def infer_satellite_label_from_bucket(bucket: str) -> str:
-    m = re.search(r"goes-(\d+)", bucket)
+    m = re.search(r"goes-?(\d+)", bucket)  # noaa-goes19, gcp-public-data-goes-19
     return f"GOES-{int(m.group(1))}" if m else "UNKNOWN"
 
 
@@ -58,13 +58,13 @@ async def process_single_day(
     # --- listing: each bucket prefix once, shared by every product that reads from it
     log(f"=== {day_label} listing ===")
     specs = cfg.abi_products + ([cfg.glm_product] if cfg.glm_product is not None else [])
-    prefixes = sorted({spec.gcs_product_prefix for spec in specs})
+    prefixes = sorted({spec.product_prefix for spec in specs})
     listings = await asyncio.gather(*(list_day_names(cfg, session, p, day) for p in prefixes))
     objects_by_prefix = {p: objects for p, (objects, _) in zip(prefixes, listings)}
     n_listing_errors = sum(n for _, n in listings)
 
     def day_files(spec: ProductSpec) -> List[RemoteFile]:
-        files = select_files(objects_by_prefix[spec.gcs_product_prefix], spec.filename_must_contain)
+        files = select_files(objects_by_prefix[spec.product_prefix], spec.filename_must_contain)
         return [f for f in files if day_start <= f.start < day_end]
 
     glm_files = day_files(cfg.glm_product) if cfg.glm_product is not None else []
@@ -75,7 +75,7 @@ async def process_single_day(
     abi_states = {spec.key: AbiProductState(spec, crop) for spec in cfg.abi_products}
     same_files: Dict[Tuple[str, str], List[AbiProductState]] = {}
     for spec in cfg.abi_products:
-        same_files.setdefault((spec.gcs_product_prefix, spec.filename_must_contain), []).append(abi_states[spec.key])
+        same_files.setdefault((spec.product_prefix, spec.filename_must_contain), []).append(abi_states[spec.key])
 
     abi_items: List[Tuple[List[AbiProductState], int, RemoteFile]] = []
     n_slot_collisions = 0
@@ -114,8 +114,8 @@ async def process_single_day(
             "slot_seconds": SLOT_SECONDS,
             "slot_rule": "ABI scan goes to slot floor((scan_start - day_start) / slot_seconds)",
             "time_encoding": "int64 ns since 1970-01-01 UTC; int64 min = NaT",
-            "source_gcs_bucket": cfg.gcs_bucket,
-            "source_satellite_label": infer_satellite_label_from_bucket(cfg.gcs_bucket),
+            "source_bucket": cfg.bucket,
+            "source_satellite_label": infer_satellite_label_from_bucket(cfg.bucket),
             "abi_product_keys": [p.key for p in cfg.abi_products],
             "glm_included": cfg.glm_product is not None,
             "bounds": vars(cfg.bounds) if cfg.bounds is not None else None,
@@ -138,13 +138,13 @@ async def process_single_day(
     http_args = (cfg.http_timeout_seconds, cfg.http_retries)
 
     async def download(blob: str) -> bytes:
-        payload = await http_get(cfg, session, f"https://{GCS_HOST}/{cfg.gcs_bucket}/{blob}", as_json=False)
+        payload = await http_get(cfg, session, object_url(cfg.bucket, blob), as_json=False)
         if progress.current is not None:
             progress.current.add_bytes(progress_key, len(payload))
         return payload
 
     async def run_ranged(f: RemoteFile, fn: Any, *args: Any) -> Any:
-        decoded, n_downloaded = await decode_pool.run(fn, f"/{cfg.gcs_bucket}/{f.blob}", f.size, *args, *http_args)
+        decoded, n_downloaded = await decode_pool.run(fn, object_url(cfg.bucket, f.blob), f.size, *args, *http_args)
         if progress.current is not None:
             progress.current.add_bytes(progress_key, f.size, n_downloaded)
         return decoded

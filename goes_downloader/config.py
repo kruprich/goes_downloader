@@ -13,7 +13,7 @@ from .progress import log
 @dataclass(frozen=True)
 class ProductSpec:
     key: str
-    gcs_product_prefix: str
+    product_prefix: str
     filename_must_contain: str
     data_variable: Optional[str] = None
     dqf_variable: Optional[str] = None
@@ -31,7 +31,8 @@ class LatLonBounds:
 
 @dataclass(frozen=True)
 class RawConfig:
-    gcs_bucket: str
+    # The public bucket as a URL: "s3://noaa-goes19" (AWS) or "gs://gcp-public-data-goes-19" (Google Cloud)
+    bucket: str
     start_date_utc: str
     end_date_utc: str
     raw_output_root_dir: str
@@ -70,6 +71,7 @@ def _require(d: Dict[str, Any], k: str, typ: Any):
     return v
 
 
+BUCKET_PATTERN = re.compile(r"(s3|gs)://([a-z0-9][a-z0-9._-]*[a-z0-9])/?")
 CMIP_BAND_PATTERN = re.compile(r"CMIP\w*-M\d+C(\d{2})")  # single-band files: ...-CMIPC-M6C13
 MCMIP_BAND_VARIABLE = re.compile(r"CMI_C(\d{2})")  # the all-band MCMIP files hold one CMI_Cnn per band
 
@@ -85,14 +87,14 @@ def is_cmip_ir_band(product: Dict[str, Any]) -> bool:
 # Every key the downloader or the feature step reads. Others are reported (they are usually typos, which would
 # silently fall back to a default); keys starting with "_" are skipped silently, e.g. "_comment".
 TOP_LEVEL_KEYS = {
-    "gcs_bucket", "start_date_utc", "end_date_utc", "raw_output_root_dir", "overwrite_existing",
+    "bucket", "start_date_utc", "end_date_utc", "raw_output_root_dir", "overwrite_existing",
     "download_method", "byte_range_processes", "max_concurrent_http_requests", "http_timeout_seconds",
     "http_retries", "max_decode_processes", "max_days_in_flight", "max_inflight_payloads",
     "bounds", "cmip_precision", "download", "abi_products", "glm_product",
     "features",  # read by the feature step (goes_downloader/features)
 }
-ABI_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain", "data_variable", "dqf_variable", "precision"}
-GLM_PRODUCT_KEYS = {"key", "description", "gcs_product_prefix", "filename_must_contain"}
+ABI_PRODUCT_KEYS = {"key", "description", "product_prefix", "filename_must_contain", "data_variable", "dqf_variable", "precision"}
+GLM_PRODUCT_KEYS = {"key", "description", "product_prefix", "filename_must_contain"}
 BOUNDS_KEYS = {"lat_min", "lat_max", "lon_min", "lon_max"}
 
 
@@ -135,7 +137,7 @@ def load_config(config_path: str) -> RawConfig:
         defined_abi.append(
             ProductSpec(
                 key=_require(p, "key", str),
-                gcs_product_prefix=_require(p, "gcs_product_prefix", str),
+                product_prefix=_require(p, "product_prefix", str),
                 filename_must_contain=_require(p, "filename_must_contain", str),
                 data_variable=_require(p, "data_variable", str),
                 dqf_variable=_require(p, "dqf_variable", str),
@@ -145,7 +147,7 @@ def load_config(config_path: str) -> RawConfig:
     glm_raw = _require(raw, "glm_product", dict)
     defined_glm = ProductSpec(
         key=_require(glm_raw, "key", str),
-        gcs_product_prefix=_require(glm_raw, "gcs_product_prefix", str),
+        product_prefix=_require(glm_raw, "product_prefix", str),
         filename_must_contain=_require(glm_raw, "filename_must_contain", str),
     )
 
@@ -169,6 +171,10 @@ def load_config(config_path: str) -> RawConfig:
         if not (-90 <= bounds.lat_min < bounds.lat_max <= 90 and -180 <= bounds.lon_min < bounds.lon_max <= 180):
             raise ValueError(f"bounds out of range or min >= max: {bounds}")
 
+    bucket = BUCKET_PATTERN.fullmatch(_require(raw, "bucket", str))
+    if bucket is None:
+        raise ValueError(f"bucket must be s3://<name> (AWS) or gs://<name> (Google Cloud), got {raw['bucket']!r}")
+
     start_date_utc = _require(raw, "start_date_utc", str)
     end_date_utc = _require(raw, "end_date_utc", str)
     datetime.strptime(start_date_utc, "%Y-%m-%d")
@@ -183,7 +189,7 @@ def load_config(config_path: str) -> RawConfig:
     # A file waiting for a byte-range worker holds no data, so let every worker have one per day
     default_inflight = byte_range_processes if download_method == "byte_ranges" else max_concurrent_http_requests
     return RawConfig(
-        gcs_bucket=_require(raw, "gcs_bucket", str),
+        bucket=f"{bucket.group(1)}://{bucket.group(2)}",
         start_date_utc=start_date_utc,
         end_date_utc=end_date_utc,
         raw_output_root_dir=str(raw.get("raw_output_root_dir", "./goes_raw")),

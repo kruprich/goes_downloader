@@ -17,10 +17,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import numpy as np
 
-from .common import GCS_HOST, RETRYABLE_HTTP_STATUS, backoff_seconds
+from .common import RETRYABLE_HTTP_STATUS, backoff_seconds
 from .config import LatLonBounds
 from .crop import crop_window
 from .decode import GLM_READ_VARIABLES, abi_grid, decode_abi_file, decode_glm_file
@@ -35,17 +36,22 @@ RANGE_MERGE_GAP_BYTES = 16 * 1024
 # Requests one worker makes at once for one file's chunks
 RANGE_THREADS_PER_PROCESS = 4
 
-_range_connections = threading.local()  # one keep-alive HTTPS connection per thread
+_range_connections = threading.local()  # one keep-alive HTTPS connection per thread, to the bucket's host
 _range_threads: Optional[ThreadPoolExecutor] = None
 
 
-def _get_range(path: str, start: int, end: int, timeout: int, retries: int) -> bytes:
+def _get_range(url: str, start: int, end: int, timeout: int, retries: int) -> bytes:
     """Bytes [start, end) of a bucket object, over this thread's keep-alive connection; retries transient errors."""
+    parts = urlsplit(url)
+    host, path = parts.hostname, parts.path
     last_error = "no attempts"
     for attempt in range(1, retries + 1):
         conn = getattr(_range_connections, "conn", None)
+        if conn is not None and conn.host != host:
+            conn.close()
+            conn = None
         if conn is None:
-            conn = _range_connections.conn = http.client.HTTPSConnection(GCS_HOST, timeout=timeout)
+            conn = _range_connections.conn = http.client.HTTPSConnection(host, timeout=timeout)
         try:
             conn.request("GET", path, headers={"Range": f"bytes={start}-{end - 1}"})
             r = conn.getresponse()
@@ -61,7 +67,7 @@ def _get_range(path: str, start: int, end: int, timeout: int, retries: int) -> b
             _range_connections.conn = None
         if attempt < retries:
             time.sleep(backoff_seconds(attempt))
-    raise RuntimeError(f"GET {path} bytes {start}-{end - 1} failed: {last_error}")
+    raise RuntimeError(f"GET {url} bytes {start}-{end - 1} failed: {last_error}")
 
 
 def _range_executor() -> ThreadPoolExecutor:
@@ -78,10 +84,10 @@ class _RangeFile(io.RawIOBase):
     anonymous memory map, so only fetched pages use memory; call release() when done.
     """
 
-    def __init__(self, path: str, size: int, timeout: int, retries: int):
+    def __init__(self, url: str, size: int, timeout: int, retries: int):
         if size <= 0:
-            raise ValueError(f"{path}: size unknown")
-        self.path, self.size, self.timeout, self.retries = path, size, timeout, retries
+            raise ValueError(f"{url}: size unknown")
+        self.url, self.size, self.timeout, self.retries = url, size, timeout, retries
         self.buf = mmap.mmap(-1, size)
         # Fetched ranges [starts[i], ends[i]), sorted, neither overlapping nor touching
         self.starts: List[int] = []
@@ -135,7 +141,7 @@ class _RangeFile(io.RawIOBase):
             return
 
         def get(span: List[int]) -> bytes:
-            return _get_range(self.path, span[0], span[1], self.timeout, self.retries)
+            return _get_range(self.url, span[0], span[1], self.timeout, self.retries)
 
         bodies = [get(spans[0])] if len(spans) == 1 else list(_range_executor().map(get, spans))
         for (start, end), body in zip(spans, bodies):
@@ -169,7 +175,7 @@ class _RangeFile(io.RawIOBase):
 
 
 def _open_remote(
-    path: str, size: int, names: List[str], timeout: int, retries: int
+    url: str, size: int, names: List[str], timeout: int, retries: int
 ) -> Tuple[_RangeFile, Dict[str, Tuple[Optional[Tuple[int, ...]], List[Tuple[Tuple[int, ...], int, int]]]]]:
     """
     Fetches a remote file's metadata and locates the stored chunks of `names`. Returns the file and,
@@ -177,7 +183,7 @@ def _open_remote(
     """
     import h5py
 
-    rf = _RangeFile(path, size, timeout, retries)
+    rf = _RangeFile(url, size, timeout, retries)
     rf.fetch([(0, RANGE_HEAD_BYTES), (size - RANGE_TAIL_BYTES, size)])
     with h5py.File(rf, "r") as h:
         # netCDF-C reads every object header and attribute when it opens a file, so fetch them all
@@ -207,13 +213,13 @@ def _open_remote(
 
 
 def ranged_decode_abi_file(
-    path: str, size: int, variables: List[Tuple[str, str, Optional[float]]], bounds: Optional[LatLonBounds], timeout: int, retries: int
+    url: str, size: int, variables: List[Tuple[str, str, Optional[float]]], bounds: Optional[LatLonBounds], timeout: int, retries: int
 ) -> Tuple[List[Dict[str, Any]], int]:
     """decode_abi_file on a remote file, fetching only metadata, x/y and the chunks inside the crop. Returns (decoded, bytes downloaded)."""
     import netCDF4 as nc
 
     data_names = sorted({name for dv, qv, _ in variables for name in (dv, qv)})
-    rf, chunks = _open_remote(path, size, ["x", "y", *data_names], timeout, retries)
+    rf, chunks = _open_remote(url, size, ["x", "y", *data_names], timeout, retries)
     try:
         grid = [(offset, offset + n) for name in ("x", "y") for _, offset, n in chunks[name][1]]
         window = None
@@ -240,9 +246,9 @@ def ranged_decode_abi_file(
     return decoded, rf.downloaded
 
 
-def ranged_decode_glm_file(path: str, size: int, timeout: int, retries: int) -> Tuple[Dict[str, np.ndarray], int]:
+def ranged_decode_glm_file(url: str, size: int, timeout: int, retries: int) -> Tuple[Dict[str, np.ndarray], int]:
     """decode_glm_file on a remote file, fetching only metadata and GLM_READ_VARIABLES. Returns (decoded, bytes downloaded)."""
-    rf, chunks = _open_remote(path, size, GLM_READ_VARIABLES, timeout, retries)
+    rf, chunks = _open_remote(url, size, GLM_READ_VARIABLES, timeout, retries)
     try:
         rf.fetch([(offset, offset + n) for name in GLM_READ_VARIABLES for _, offset, n in chunks[name][1]])
         decoded = decode_glm_file(rf.buf)

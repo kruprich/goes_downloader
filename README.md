@@ -1,14 +1,15 @@
 # goes_downloader
 
-Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from the public GCS bucket
-`gcp-public-data-goes-19` into one raw Zarr store per UTC day, for building a
+Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from NOAA's public bucket on AWS
+(`s3://noaa-goes19`) or Google Cloud (`gs://gcp-public-data-goes-19`) into one raw Zarr store per
+UTC day, for building a
 lightning-prediction training dataset. No time binning or spatial aggregation happens in the
 download; the feature step (`build_features.py`, see [Building features](#building-features)) turns
 the raw stores into CNN inputs and lightning labels on one grid.
 
 For each UTC day it:
 
-1. Lists ABI and GLM files over the GCS JSON API, retrying transient errors.
+1. Lists ABI and GLM files (S3 `ListObjectsV2` or the GCS JSON API), retrying transient errors.
 2. ABI: stores every 5-min scan on the product's grid, cropped to `bounds`, as the file's packed
    integers plus its DQF flags. The current config stores bands 2, 5, 13 and 15 at 2 km (read
    from the all-band MCMIPC files) and ACHA cloud height, TPW and the DSI stability indices at 10 km.
@@ -52,7 +53,8 @@ uv pip install -e . -c requirements.lock                   # or: pip install -e 
 versions the downloader was tested with. `-e` installs the package in place, so edits to the code
 take effect without reinstalling.
 
-What a run needs, with the current config (measured on 2025-10-27, 12 CPU cores, ~60 MB/s):
+What a run needs, with the current config (measured on 2025-10-27 from Google Cloud, 12 CPU cores,
+~60 MB/s; see [Choosing a cloud](#choosing-a-cloud) for AWS):
 
 - **Disk:** about 2.1 GB per day stored (measured on an October day; summer days hold more
   daylight imagery), so ~1.12–1.24 TB for the 534 days of the configured range.
@@ -106,7 +108,11 @@ python report.py --config config.json --all --csv days.csv
 
 ## Config basics
 
-- `gcs_bucket`: the public bucket to read (`gcp-public-data-goes-19`).
+- `bucket`: the public bucket to read, as `s3://<name>` or `gs://<name>`. The config uses AWS,
+  `s3://noaa-goes19`; Google Cloud's copy is `gs://gcp-public-data-goes-19`. NOAA publishes the same
+  files under the same names in both, and the stored data is identical either way (checked for the
+  test hour: every array and attribute but `source_bucket`). Both are read anonymously over HTTPS,
+  so no cloud account or credentials are needed. See [Choosing a cloud](#choosing-a-cloud).
 - `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included. The
   config starts on 2025-04-10, just after NOAA declared GOES-19 operational as GOES-East on
   2025-04-07. Its data is on the operational 75.0°W grid from 2025-04-02, and before 2025-03-20 it
@@ -209,7 +215,7 @@ them as constant per product but should check.
 - ABI stays in scan mode 6 (CONUS every 5 minutes). Every product's filename filter contains
   `-M6`, so scans taken in other modes are not downloaded. Each 5-minute slot holds at most one
   scan; an extra scan in the same slot is skipped and counted in `n_abi_slot_collisions`.
-- The bucket stores files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
+- Both buckets store files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
   file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
   the file with the newest creation time is used.
 - All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W) since
@@ -430,20 +436,46 @@ took 42–44 s against 32 s). While a download runs, 3 days in parallel took 52�
 fewer `--workers`, or while the download is stopped. The geography store takes about
 16 s once its sources are cached, 14 s of it for the borders.
 
+## Choosing a cloud
+
+AWS (`s3://noaa-goes19`, in `us-east-1`) and Google Cloud (`gs://gcp-public-data-goes-19`) hold the
+same files, so switching `bucket` changes only where they come from; days already complete are
+not downloaded again.
+
+The other measurements in this README were taken reading from Google Cloud, before AWS was
+supported. Measured on 14 October 2026 from an 8-core M1 Mac with 16 GB, with
+`"byte_ranges"` and 24 processes (half the config's 48, to leave memory for the rest of the Mac), one
+run each of 2025-10-27:
+
+| `bucket` | Time per day | Downloaded | Stored | Peak RSS, all processes (sampled every 2 s) |
+|---|---|---|---|---|
+| `s3://noaa-goes19` | 2 min 53 s (28 MB/s) | 4.9 GB | 2.1 GB | 3.3 GB |
+| `gs://gcp-public-data-goes-19` | 4 min 01 s (20 MB/s) | 4.9 GB | 2.1 GB | 3.7 GB |
+
+Both stores were identical apart from `source_bucket` and `completed_utc`. On that connection a
+16 KB range request took 58 ms from AWS and 89 ms from Google Cloud; byte ranges make several
+requests in a row per file, so round trips matter as much as bandwidth. Which cloud is faster
+depends on where you run it, so time a day from your own machine. The AWS bucket is in
+`us-east-1`, so a machine there is next to the data.
+
 ## Tests
 
 ```bash
 uv pip install -e ".[dev]" -c requirements.lock
 pytest              # offline, a few seconds: small synthetic files and stores stand in for the GOES ones
-pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~30 s)
+pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~35 s)
 ```
 
-GitHub runs pyflakes and the offline tests on Python 3.12 and 3.13 for every push and pull
-request (`.github/workflows/tests.yml`); the network tests are run by hand.
+The network tests read from the configured `bucket` and also check that both clouds list the same
+files for the test hour. GitHub runs pyflakes and the offline tests on Python 3.12 and 3.13 for
+every push and pull request (`.github/workflows/tests.yml`); the network tests are run by hand.
 
 ## Troubleshooting
 
 - **"requires a different Python" when installing:** use Python 3.12 or 3.13.
+- **`CERTIFICATE_VERIFY_FAILED` (every listing fails):** the python.org installer for macOS comes
+  without CA certificates. Run its `Install Certificates.command` once, or start the commands with
+  `SSL_CERT_FILE=/etc/ssl/cert.pem`.
 - **A day stays incomplete:** run the same command again; failed files are retried. The `!!` log
   lines and `report.py` show which days and files failed. A file that fails on every run points
   to a problem with that file at the source.

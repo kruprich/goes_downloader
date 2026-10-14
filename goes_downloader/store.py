@@ -68,7 +68,7 @@ Root attrs:
   n_glm_files, n_glm_flashes, n_glm_events, n_glm_windows_missing (null without GLM)
   n_glm_orphan_events    events stored with flash_index -1 (their group or flash isn't in the file)
   day_utc, year, julian_day, slots_per_day, slot_seconds, slot_rule, time_encoding
-  source_gcs_bucket, source_satellite_label, abi_product_keys, glm_included
+  source_bucket (s3:// or gs:// URL), source_satellite_label, abi_product_keys, glm_included
   bounds                 the configured lat/lon box (null for none); crop_scan_angle_rect is the
                          scan-angle rectangle (x_min, x_max, y_min, y_max) computed from it
 

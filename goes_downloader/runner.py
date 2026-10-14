@@ -24,7 +24,7 @@ from .report import print_report
 async def run_all_days(cfg: RawConfig) -> None:
     days = list(iter_days_utc(cfg.start_date_utc, cfg.end_date_utc))
     os.makedirs(cfg.raw_output_root_dir, exist_ok=True)
-    if cfg.download_method == "whole_files" and any("MCMIP" in p.gcs_product_prefix for p in cfg.abi_products):
+    if cfg.download_method == "whole_files" and any("MCMIP" in p.product_prefix for p in cfg.abi_products):
         log("!! whole_files downloads each all-band MCMIP file in full (~59 MB per scan); byte_ranges fetches only the bands used")
 
     connector = aiohttp.TCPConnector(

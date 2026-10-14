@@ -1,10 +1,14 @@
-"""The bucket: file names, listing a day's files, and whole-file downloads (main process)."""
+"""
+The bucket (AWS S3 or Google Cloud Storage): file names, listing a day's files, and whole-file
+downloads (main process). NOAA publishes the same files under the same names on both.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -18,6 +22,10 @@ if TYPE_CHECKING:
 
 # Hours listed per day; tests set this to a few hours to run a short download
 LIST_HOURS = range(24)
+# Objects per listing request (both clouds allow at most 1000); tests lower it to page through an hour
+LIST_PAGE_SIZE = 1000
+
+S3_NAMESPACE = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
 GOES_FILENAME_TIME_PATTERN = re.compile(r"_([sec])(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)")
 
@@ -41,6 +49,14 @@ def parse_remote_file(blob: str, size: int = 0) -> Optional[RemoteFile]:
     if set(times) != {"s", "e", "c"}:
         return None
     return RemoteFile(blob=blob, start=times["s"], end=times["e"], created=times["c"], size=size)
+
+
+def object_url(bucket: str, blob: str) -> str:
+    """HTTPS URL of an object in an s3:// or gs:// bucket (the anonymous, public endpoints)."""
+    cloud, name = bucket.split("://")
+    if cloud == "s3":
+        return f"https://{name}.s3.amazonaws.com/{blob}"
+    return f"https://storage.googleapis.com/{name}/{blob}"
 
 
 async def _backoff(attempt: int) -> None:
@@ -74,35 +90,51 @@ async def http_get(
     raise RuntimeError(f"GET {url} failed: {last_error}")
 
 
-async def gcs_list_object_names(
+async def list_object_names(
     cfg: RawConfig,
     session: aiohttp.ClientSession,
     prefix: str,
 ) -> Dict[str, int]:
     """Object name -> size in bytes for everything under the prefix."""
-    url = f"https://storage.googleapis.com/storage/v1/b/{cfg.gcs_bucket}/o"
-    params: Dict[str, str] = {"prefix": prefix, "fields": "items(name,size),nextPageToken", "maxResults": "1000"}
+    cloud, name = cfg.bucket.split("://")
     objects: Dict[str, int] = {}
-    while True:
-        js = await http_get(cfg, session, url, params, as_json=True)
-        objects.update((it["name"], int(it.get("size", 0))) for it in js.get("items", []) if it.get("name"))
-        page_token = js.get("nextPageToken")
-        if not page_token:
-            return objects
-        params["pageToken"] = page_token
+    if cloud == "s3":  # ListObjectsV2, which answers in XML
+        url = object_url(cfg.bucket, "")
+        params: Dict[str, str] = {"list-type": "2", "prefix": prefix, "max-keys": str(LIST_PAGE_SIZE)}
+        while True:
+            page = ET.fromstring(await http_get(cfg, session, url, params, as_json=False))
+            for it in page.iter(f"{S3_NAMESPACE}Contents"):
+                key = it.findtext(f"{S3_NAMESPACE}Key")
+                if key:
+                    objects[key] = int(it.findtext(f"{S3_NAMESPACE}Size", "0"))
+            token = page.findtext(f"{S3_NAMESPACE}NextContinuationToken")
+            if not token:
+                break
+            params["continuation-token"] = token
+    else:  # the JSON API
+        url = f"https://storage.googleapis.com/storage/v1/b/{name}/o"
+        params = {"prefix": prefix, "fields": "items(name,size),nextPageToken", "maxResults": str(LIST_PAGE_SIZE)}
+        while True:
+            js = await http_get(cfg, session, url, params, as_json=True)
+            objects.update((it["name"], int(it.get("size", 0))) for it in js.get("items", []) if it.get("name"))
+            token = js.get("nextPageToken")
+            if not token:
+                break
+            params["pageToken"] = token
+    return objects
 
 
 async def list_day_names(
     cfg: RawConfig,
     session: aiohttp.ClientSession,
-    gcs_product_prefix: str,
+    product_prefix: str,
     day: datetime,
 ) -> Tuple[Dict[str, int], int]:
     """Returns (name -> size for every object under the day's 24 hourly prefixes, n_failed_prefixes)."""
     jday = day.timetuple().tm_yday
-    prefixes = [f"{gcs_product_prefix}/{day.year}/{jday:03d}/{hh:02d}/" for hh in LIST_HOURS]
+    prefixes = [f"{product_prefix}/{day.year}/{jday:03d}/{hh:02d}/" for hh in LIST_HOURS]
     results = await asyncio.gather(
-        *(gcs_list_object_names(cfg, session, p) for p in prefixes), return_exceptions=True
+        *(list_object_names(cfg, session, p) for p in prefixes), return_exceptions=True
     )
 
     objects: Dict[str, int] = {}

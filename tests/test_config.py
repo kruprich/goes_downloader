@@ -60,7 +60,7 @@ def test_mcmip_products_read_one_band_each_from_the_same_file():
     raw = json.load(open(os.path.join(REPO, "config.json")))
     mcmip = [p for p in raw["abi_products"] if p["key"].startswith("mcmip_")]
     assert len(mcmip) == 16
-    assert {(p["gcs_product_prefix"], p["filename_must_contain"]) for p in mcmip} == {("ABI-L2-MCMIPC", "ABI-L2-MCMIPC-M6")}
+    assert {(p["product_prefix"], p["filename_must_contain"]) for p in mcmip} == {("ABI-L2-MCMIPC", "ABI-L2-MCMIPC-M6")}
     assert [p["data_variable"] for p in mcmip] == [f"CMI_C{b:02d}" for b in range(1, 17)]
 
 

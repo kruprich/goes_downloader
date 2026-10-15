@@ -32,6 +32,7 @@ The full store layout, including every attribute, is described in the docstring 
 | `build_geography.py` | Puts terrain, land/water, viewing angle and country borders on the feature grid, once |
 | `build_features.py` | Builds the per-day feature stores (CNN inputs and lightning labels) |
 | `config.json` | Date range, output folder, products to download and all settings |
+| `config.c7i-flex.large.json` | The same products, set up for a 2-vCPU, 4 GB machine (one day at a time, 6 workers, a 3-day test range) |
 | `goes_downloader/` | The code; `store.py` documents the raw store layout, `features/__init__.py` the feature stores |
 | `tests/` | The test suite (see [Tests](#tests)) |
 | `pyproject.toml` | The package, supported Python versions, dependencies and test settings |

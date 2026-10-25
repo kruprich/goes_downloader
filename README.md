@@ -2,67 +2,60 @@
 
 Downloads GOES-19 ABI (CONUS L2) and GLM (LCFA) data from NOAA's public bucket on AWS
 (`s3://noaa-goes19`) or Google Cloud (`gs://gcp-public-data-goes-19`) into one raw Zarr store per
-UTC day, for building a
-lightning-prediction training dataset. No time binning or spatial aggregation happens in the
-download; the feature step (`build_features.py`, see [Building features](#building-features)) turns
-the raw stores into CNN inputs and lightning labels on one grid.
+UTC day, for building a lightning-prediction training dataset. The download does no time binning
+or spatial aggregation. A separate feature step (`build_features.py`, see
+[Building features](#building-features)) turns the raw stores into CNN inputs and lightning
+labels on one grid.
 
 For each UTC day it:
 
-1. Lists ABI and GLM files (S3 `ListObjectsV2` or the GCS JSON API), retrying transient errors.
-2. ABI: stores every 5-min scan on the product's grid, cropped to `bounds`, as the file's packed
-   integers plus its DQF flags. The current config stores bands 2, 5, 13 and 15 at 2 km (read
-   from the all-band MCMIPC files) and ACHA cloud height, TPW and the DSI stability indices at 10 km.
+1. Lists the day's ABI and GLM files, retrying transient errors.
+2. ABI: stores every 5-minute scan on the product's own grid, cropped to `bounds`, as the file's
+   packed integers plus its quality flags (DQF).
 3. GLM: stores every flash (time, lat/lon, area, energy, quality flag) and every event (lat/lon
-   and the flash it belongs to), plus a coverage flag for every 20-second window, so outages
-   (including files NOAA never published) show up as gaps rather than as "no lightning".
-4. Writes `<raw_output_root_dir>/YYYY/YYYYDDD.zarr` and marks it `complete` only if every listing and file
-   succeeded and the day ended at least 24 hours ago, since NOAA publishes some files late.
-   Incomplete days are rebuilt on the next run.
+   and the flash it belongs to), plus a coverage flag for every 20-second window. Outages,
+   including files NOAA never published, therefore show up as gaps rather than as "no lightning".
+4. Writes `<raw_output_root_dir>/YYYY/YYYYDDD.zarr`. The day is marked `complete` only if every
+   listing and file succeeded and the day ended at least 24 hours ago, since NOAA publishes some
+   files late. Incomplete days are rebuilt on the next run.
 
-The full store layout, including every attribute, is described in the docstring at the top of
-`goes_downloader/store.py`.
+The docstring at the top of `goes_downloader/store.py` describes the full store layout,
+including every attribute.
 
 ## Files
 
 | Path | What it is |
 |---|---|
-| `download_raw.py` | Runs the download (`python download_raw.py --config config.json`) |
+| `download_raw.py` | Runs the download |
 | `report.py` | Shows which days the stores hold and how complete they are |
 | `build_geography.py` | Puts terrain, land/water, viewing angle and country borders on the feature grid, once |
 | `build_features.py` | Builds the per-day feature stores (CNN inputs and lightning labels) |
 | `config.json` | Date range, output folder, products to download and all settings |
-| `config.c7i-flex.large.json` | The same products, set up for a 2-vCPU, 4 GB machine (one day at a time, 6 workers, a 3-day test range) |
 | `goes_downloader/` | The code; `store.py` documents the raw store layout, `features/__init__.py` the feature stores |
 | `tests/` | The test suite (see [Tests](#tests)) |
-| `pyproject.toml` | The package, supported Python versions, dependencies and test settings |
-| `requirements.lock` | The exact dependency versions it was tested with |
-| `.github/workflows/tests.yml` | Runs the offline tests on GitHub for every push |
+| `requirements.lock` | The exact dependency versions the code was tested with |
 
 ## Setup
 
-Use Python 3.12 or 3.13 (both tested). The tested versions in `requirements.lock` need 3.12 or
-newer, and Python 3.14 does not work: the `zarr<3` pin needs `numcodecs<0.16`, which has no 3.14
-wheel. Installing on another version stops with "requires a different Python".
+Use Python 3.12 or 3.13. Python 3.14 is not supported: `zarr<3` needs `numcodecs<0.16`, which
+has no 3.14 wheel.
 
 ```bash
-uv venv --python 3.13 .venv && source .venv/bin/activate   # or: python3.13 -m venv .venv
-uv pip install -e . -c requirements.lock                   # or: pip install -e . -c requirements.lock
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install -e . -c requirements.lock
 ```
 
-`pyproject.toml` lists the direct dependencies; `-c requirements.lock` holds them to the exact
-versions the downloader was tested with. `-e` installs the package in place, so edits to the code
-take effect without reinstalling.
+`-c requirements.lock` pins the dependencies to the tested versions. `uv venv` and `uv pip install`
+work the same way.
 
-What a run needs, with the current config (measured on 2025-10-27 from Google Cloud, 12 CPU cores,
-~60 MB/s; see [Choosing a cloud](#choosing-a-cloud) for AWS):
+What a run needs with the example config. These figures were measured on one October day, read
+from Google Cloud on a 12-core machine with a ~60 MB/s connection:
 
-- **Disk:** about 2.1 GB per day stored (measured on an October day; summer days hold more
-  daylight imagery), so ~1.12–1.24 TB for the 534 days of the configured range.
-- **Network:** about 4.9 GB per day downloaded. A day takes 95–110 s, so the range takes 14–16 h.
-- **Memory:** about 10 GB: 7.2–7.7 GB for the 48 byte-range workers and up to 1.9 GB for the main
-  process, which holds a day's GLM events until the day is written. Lower `byte_range_processes`
-  to use less.
+- **Disk:** about 2.1 GB per day. Summer days hold more daylight imagery and take more.
+- **Network:** about 4.9 GB per day. A day took 95–110 s.
+- **Memory:** about 10 GB in total. The 48 byte-range workers use 7.2–7.7 GB. The main process
+  uses up to 1.9 GB, because it holds a day's GLM events until the day is written. Lower
+  `byte_range_processes` to use less.
 
 ## Running a download
 
@@ -70,37 +63,41 @@ What a run needs, with the current config (measured on 2025-10-27 from Google Cl
 python download_raw.py --config config.json
 ```
 
-Days already marked `complete` are skipped unless `overwrite_existing` is `true`, so running the
-same command again continues where the last run stopped and retries incomplete days.
+Days already marked `complete` are skipped unless `overwrite_existing` is `true`. Running the same
+command again therefore continues where the last run stopped and retries incomplete days.
 
-While it runs, the last line shows a progress bar, days done, data downloaded, data saved to
-disk (added as each day finishes), download speed (last 30 s) and an ETA. The ETA uses each
-day's exact size once the day is listed and the average listed day for days not reached yet.
-When output is redirected to a file, a progress line is printed once a minute instead. When the
-run finishes, it prints a summary and then the data report (see
-[Checking the data](#checking-the-data)); `--no-report` skips the report.
+While it runs, the last line shows:
 
-Ctrl-C stops the run within a few seconds: files being decoded finish, the days in progress are
-left as `.zarr.tmp` folders, and running the same command again rebuilds those days and continues.
+- a progress bar
+- days done
+- data downloaded and data saved to disk
+- download speed
+- an ETA
+
+When output is redirected to a file, it prints a progress line once a minute instead. At the end
+it prints a summary and the data report (see [Checking the data](#checking-the-data));
+`--no-report` skips the report.
+
+Ctrl-C stops the run within a few seconds. Days in progress are left as `.zarr.tmp` folders, and
+the next run rebuilds them.
 
 For a long run, use `screen` or `tmux` so it survives closing the terminal, and keep a log:
 
 ```bash
-screen -S goes                     # detach with Ctrl-A D, reattach with: screen -r goes
-source .venv/bin/activate
 python download_raw.py --config config.json 2>&1 | tee -a goes_download.log
 ```
 
-Lines starting with `!!` in the log are errors (`grep '!!' goes_download.log`). Don't edit the
-code while a run is going: a worker process that dies is replaced, and the replacement loads
-whatever the code is at that moment.
+Lines starting with `!!` are errors (`grep '!!' goes_download.log`). Don't edit the code during a
+run: when a worker process dies, its replacement loads whatever the code is at that moment.
 
 ## Checking the data
 
 `report.py` reads every day store in the config's date range and lists the days that need
-attention: not complete (or missing, or interrupted), an ABI product with less than 98% of its
-scans, or less than 99% GLM coverage. The download prints the same report when a run finishes,
-covering the whole date range including days done by earlier runs (not after Ctrl-C).
+attention:
+
+- days that are not complete, missing or interrupted
+- days where an ABI product has less than 98% of its scans
+- days with less than 99% GLM coverage
 
 ```bash
 python report.py --config config.json                  # summary and days needing attention
@@ -109,306 +106,325 @@ python report.py --config config.json --all --csv days.csv
 
 ## Config basics
 
-- `bucket`: the public bucket to read, as `s3://<name>` or `gs://<name>`. The config uses AWS,
-  `s3://noaa-goes19`; Google Cloud's copy is `gs://gcp-public-data-goes-19`. NOAA publishes the same
-  files under the same names in both, and the stored data is identical either way (checked for the
-  test hour: every array and attribute but `source_bucket`). Both are read anonymously over HTTPS,
-  so no cloud account or credentials are needed. See [Choosing a cloud](#choosing-a-cloud).
-- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included. The
-  config starts on 2025-04-10, just after NOAA declared GOES-19 operational as GOES-East on
-  2025-04-07. Its data is on the operational 75.0°W grid from 2025-04-02, and before 2025-03-20 it
-  came from the 89.5°W test position (don't mix the two). It ends on the latest day that had ended
-  24 hours before the last update; move the end date forward and run again to add newer days.
-- `raw_output_root_dir` (default `./goes_raw`, relative to where you run the command): where the
-  day stores go. The config uses `./goes_raw2`; `goes_raw*/` folders are git-ignored.
-- `overwrite_existing` (default `false`): rebuild days that are already complete, e.g. after
+- `bucket`: the public bucket to read, as `s3://<name>` or `gs://<name>`. NOAA publishes the same
+  files under the same names on AWS (`s3://noaa-goes19`) and Google Cloud
+  (`gs://gcp-public-data-goes-19`), so the stored data is identical either way. Both buckets are
+  read anonymously over HTTPS; no cloud account is needed. See
+  [Choosing a cloud](#choosing-a-cloud).
+- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included.
+  - NOAA declared GOES-19 operational as GOES-East on 2025-04-07.
+  - Its data is on the operational 75.0°W grid from 2025-04-02.
+  - Before 2025-03-20 it came from the 89.5°W test position. Don't mix the two positions in one
+    dataset.
+
+  To add newer days, move the end date forward and run again.
+- `raw_output_root_dir` (default `./goes_raw`): where the day stores go, relative to the directory
+  you run the command from.
+- `overwrite_existing` (default `false`): rebuild days that are already complete, for example after
   changing the products or `bounds`.
-- `download`: the product keys to fetch (see below).
+- `download`: the product keys to fetch (see [Choosing products](#choosing-products)).
 
-A key the downloader doesn't know is reported when the run starts (`!! ... ignoring keys the
-downloader doesn't use`), since a misspelled setting would otherwise silently fall back to its
-default. Keys starting with `_`, such as `"_comment"`, are for notes and are skipped silently.
+When a run starts, it reports any config key it doesn't know (`!! ... ignoring keys`), because a
+misspelled setting would otherwise silently fall back to its default. Keys starting with `_`, such
+as `"_comment"`, are treated as notes and skipped.
 
-Days that ended less than 24 hours before the run are stored but not marked complete (the report
-shows them as "too recent"); any later run rebuilds them, and marks them complete once the
-24 hours have passed.
+Days that ended less than 24 hours before the run are stored but not marked complete. The report
+shows them as "too recent", and a later run completes them.
 
 ## Choosing products
 
-`abi_products` and `glm_product` in `config.json` define the products that can be downloaded
-(all 16 CMIP bands in two sets, plus the CONUS L2 products), each with a `description`. Only the
-keys listed in `download` are fetched, for example:
+`abi_products` and `glm_product` in `config.json` define the products that can be downloaded,
+each with a `description`. Only the keys listed in `download` are fetched, for example:
 
 ```json
 "download": ["mcmip_c02", "mcmip_c05", "mcmip_c13", "mcmip_c15", "acha", "tpw", "dsi_cape", "dsi_li", "dsi_ki", "glm"]
 ```
 
-The 16 CMIP bands come in two sets. `cmip_c01`–`cmip_c16` read each band's own file at its native
-resolution (0.5 km for band 2, 1 km for bands 1, 3 and 5, 2 km for the rest). `mcmip_c01`–
-`mcmip_c16` read the band from the all-band MCMIPC file, where every band is at 2 km. With
-`"download_method": "byte_ranges"` only the chosen bands are fetched from it (about 1–4 MB per band
-per scan inside `bounds`); with `"whole_files"` every ~59 MB file is downloaded in full. Band 2 at
-native resolution is ~19.5 GB/day to download, so the MCMIPC set is the practical way to get the
-visible and near-infrared bands. For bands 13 and 15 both sets give identical data.
+The 16 CMIP bands come in two sets:
 
-Products that read different variables from the same files, like the `mcmip_*` bands or the five
-`dsi_*` stability indices (CAPE, lifted index, K-index, Showalter index, total totals), share one
-download per scan. Leave out `"glm"` to skip lightning. Changing the list does not touch days
-already marked complete; delete them or set `overwrite_existing` to rebuild them with the new
-products.
+- `cmip_c01`–`cmip_c16` read each band's own file at its native resolution: 0.5 km for band 2,
+  1 km for bands 1, 3 and 5, and 2 km for the rest.
+- `mcmip_c01`–`mcmip_c16` read the band from the all-band MCMIPC file, where every band is at 2 km.
+  With `"download_method": "byte_ranges"` only the chosen bands are fetched, about 1–4 MB per band
+  per scan inside `bounds`. With `"whole_files"`, every ~59 MB file is downloaded in full.
+
+Band 2 at native resolution is about 19.5 GB per day to download, so the MCMIPC set is the
+practical way to get the visible and near-infrared bands.
+
+Products that read different variables from the same files share one download per scan. Examples
+are the `mcmip_*` bands and the five `dsi_*` stability indices. Leave out `"glm"` to skip
+lightning.
+
+Changing the `download` list doesn't touch days already marked complete. To rebuild them with the
+new products, delete them or set `overwrite_existing`.
 
 ## Reading the data
 
-Reading needs `xarray` and `dask`, which the downloader itself does not install
-(`uv pip install xarray dask`; checked with xarray 2026.7 and dask 2026.8). Each day store opens
-directly with xarray, one product (or GLM table) at a time, and several days combine into one
-continuous time series:
+Reading needs `xarray` and `dask` (`pip install xarray dask`), which the downloader doesn't
+install. Each day store opens directly with xarray, one product or GLM table at a time, and
+several days combine into one time series:
 
 ```python
 import glob, xarray as xr
 
-days = sorted(glob.glob("goes_raw2/*/*.zarr"))  # the config's raw_output_root_dir
+days = sorted(glob.glob("goes_raw/*/*.zarr"))  # your raw_output_root_dir
 c13 = xr.open_mfdataset(days, engine="zarr", group="abi/mcmip_c13", combine="by_coords")
 flashes = xr.open_mfdataset(days, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
 coverage = xr.open_mfdataset(days, engine="zarr", group="glm/coverage", combine="by_coords")
 events = xr.open_zarr(days[0], group="glm/events")  # one day: flash_index refers to that day's flashes
 ```
 
-`coverage.covered` has one entry per 20-second window: 0 means there is no GLM data for that
-window, so no flashes there does not mean no lightning. NOAA misses a few GLM files on most days,
-and on 2026-07-15 published no GLM data from 20:22:40 UTC to midnight. A flash's `file_index` is
-its row in the same day's `glm/files`, so it no longer identifies a file once several days are
-combined; use the flash times instead.
+**ABI values** are the file's packed integers, not physical units:
+`physical = value * scale_factor + add_offset`, with both stored per time slot.
 
-`glm/events` holds every GLM event (one lit pixel of the lightning sensor at one moment) with its
-`lat`, `lon` and `flash_index`, the row of its flash in the same day's `glm/flashes`. NOAA's files
-contain some orphan events whose group or flash can't be found: missing from the file (e.g. 64 of
-2,410 events in one file on 2025-04-22; a few files have events but no groups at all), or
-ambiguous because flash ids are 16-bit and wrap around in very active files (6 of 16,065 ids were
-used twice in one file on 2026-08-23). They are kept with `flash_index` -1 and counted in
-`glm/files/n_orphan_events` and the day's `n_glm_orphan_events`. Events are
-what shows how far each flash spread, which a flash-extent density needs; the flash table only has
-each flash's centre and area. Like `file_index`, `flash_index` only works within one day's store.
+- xarray turns fill values into NaN, which makes `value` a float array. Pass
+  `mask_and_scale=False` to get the stored integers.
+- Time slots without a scan read as all NaN.
+- The x/y coordinates are `x_scan_angle_rad` and `y_scan_angle_rad`.
 
-ABI values are the file's packed numbers, not physical units: the physical value is
-`value * scale_factor + add_offset` (both stored per time slot). xarray turns fill values into NaN,
-which makes `value` a float array; pass `mask_and_scale=False` to get the stored integers. Time
-slots without a scan read as all NaN, and the ABI x/y coordinates are `x_scan_angle_rad` and
-`y_scan_angle_rad`.
+**GLM coverage:** `coverage.covered` has one entry per 20-second window. 0 means there is no GLM
+data for that window, so no flashes there doesn't mean no lightning. NOAA misses a few GLM files on
+most days, and occasionally hours at a time.
+
+**GLM events:** `glm/events` holds every GLM event (one lit pixel of the lightning sensor at one
+moment) with its `lat`, `lon` and `flash_index`. `flash_index` is the row of the event's flash in
+the same day's `glm/flashes`. Events show how far each flash spread, which a flash-extent density
+needs; the flash table has only each flash's centre and area.
+
+NOAA's files contain a few orphan events whose group or flash is missing, or ambiguous because the
+16-bit flash ids wrap around in very active files. Orphans are kept with `flash_index` -1 and
+counted in `glm/files/n_orphan_events` and in the day's `n_glm_orphan_events`.
+
+`flash_index` and a flash's `file_index` (its row in `glm/files`) are only valid within one day's
+store. Once several days are combined, use the flash times instead.
 
 ## Assumptions about the source data
 
 **Checked on every scan.** A scan that breaks one of these counts as a file error, which leaves the
-day incomplete so it is retried and visible in the log:
+day incomplete, so it is retried and shows in the log:
 
 - Within a day, each product's grid (shape and x/y scan angles), fill value and quality-flag data
   type stay the same as in its first scan.
-- Data values are packed integers that fit in 16 bits; quality flags fit in 8 or 16 bits.
+- Data values are packed integers that fit in 16 bits, and quality flags fit in 8 or 16 bits.
 
-**Recorded, but expected to stay constant.** `scale_factor` and `add_offset` are stored for every
-scan, so a change would be captured. For GOES-19 they have never changed: one file per month for
-every current product, from the start of the data (Oct 2024 for CMIP and MCMIPC, Dec 2024 for the
-others) to Sep 2026, all had the same scale, offset and fill value. The feature step can treat
-them as constant per product but should check.
+**Recorded, not checked.** `scale_factor` and `add_offset` are stored for every scan, so a change
+would be captured. For GOES-19 they have not changed for any current product from the start of
+its data through September 2026.
 
-**Assumed, not checked:**
+**Assumed:**
 
-- ABI stays in scan mode 6 (CONUS every 5 minutes). Every product's filename filter contains
-  `-M6`, so scans taken in other modes are not downloaded. Each 5-minute slot holds at most one
-  scan; an extra scan in the same slot is skipped and counted in `n_abi_slot_collisions`.
-- Both buckets store files under `<product>/<year>/<day-of-year>/<hour>/` by scan start time, and
-  file names carry `_s`, `_e` and `_c` (start, end, creation) times. When NOAA republishes a scan,
-  the file with the newest creation time is used.
-- All ABI products share one projection (the GOES-East fixed grid, centred on 75.0°W) since
-  GOES-19 moved to the GOES-East position in April 2025. Earlier files use its 89.5°W test
-  position, so don't mix those dates with later ones. The `bounds` crop is computed from the first
-  ABI scan decoded each day and applied to every ABI product.
-- GLM flash times are "seconds since" offsets in the file. A GLM file belongs to the day its start
-  time falls in, so a flash in the first file of a day can begin a second or two before midnight;
-  select flashes by their own times, not by which day store holds them.
-- NOAA publishes a day's files within 24 hours of the day ending; later files are missed once
-  the day is marked complete.
-- In a complete day, ABI `present` = 0 and GLM `covered` = 0 mean NOAA did not publish that scan
-  or file; a failed download would have left the day incomplete.
+- ABI stays in scan mode 6, with CONUS scanned every 5 minutes. Every product's filename filter
+  contains `-M6`, so scans taken in other modes are not downloaded.
+- Each 5-minute slot holds at most one scan. An extra scan in the same slot is skipped and counted
+  in `n_abi_slot_collisions`.
+- Files are stored under `<product>/<year>/<day-of-year>/<hour>/`.
+- File names carry `_s`, `_e` and `_c` times (scan start, scan end, file creation). When NOAA
+  republishes a scan, the file with the newest creation time is used.
+- All ABI products share the GOES-East fixed grid. The `bounds` crop is computed from the day's
+  first ABI scan and applied to every ABI product.
+- A GLM file belongs to the day its start time falls in, so a flash in a day's first file can begin
+  a second or two before midnight. Select flashes by their own times, not by which day store holds
+  them.
+- NOAA publishes a day's files within 24 hours of the day ending. Files published later are missed.
+- In a complete day, ABI `present` = 0 and GLM `covered` = 0 mean NOAA didn't publish that scan or
+  file. A failed download would have left the day incomplete.
 
 ## Config options for storage
 
-- `cmip_precision` (K, `0.25` in the config): rounds the infrared CMIP bands (7–16) to save space.
-  The step is the largest power-of-two number of packed counts that is at most this many K (0.246 K
-  for band 13, 0.238 K for band 15) and is stored per scan in `quantization_step`; each value moves
-  by at most half a step. This cuts CMIP storage by about 26%; `null` keeps full precision. The
-  visible and near-infrared bands (1–6) are reflectance and keep full precision.
+- `cmip_precision` (K): rounds the infrared CMIP bands (7–16) to save space.
+  - The step actually used is the largest power-of-two number of packed counts that is at most
+    this many K: 0.246 K for band 13 at `0.25`. It is stored per scan in `quantization_step`.
+  - At `0.25` this cuts CMIP storage by about 26%.
+  - `null` keeps full precision.
+  - The visible and near-infrared bands (1–6) are reflectance and always keep full precision.
 - `precision` (per ABI product, in the product's units): overrides `cmip_precision` for that
-  product, or rounds any other product. Categorical products such as cloud top phase must not set it.
-- `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`): **applies to ABI only.** Crops every ABI
-  product to the smallest scan-angle rectangle containing the box; `null` keeps the full CONUS
-  sector. GLM is never cropped: every flash and event in GLM's field of view is kept (about
-  240 MB/day, mostly events), and the feature step selects what its grid needs.
-  The config uses 24–50°N, 125–66°W, the contiguous-US bounding box NOAA NCEI publishes for its
-  nClimGrid-Daily dataset. That box keeps about 65% of the ABI pixels.
+  product, or rounds any other product. Categorical products, such as cloud top phase, must not
+  set it.
+- `bounds` (`lat_min`, `lat_max`, `lon_min`, `lon_max`), **ABI only:** crops every ABI product to
+  the smallest scan-angle rectangle containing the box. `null` keeps the full CONUS sector.
+  - GLM is never cropped. Every flash and event is kept (about 240 MB per day), and the feature
+    step selects what its grid needs.
+  - The example config uses 24–50°N, 125–66°W, NOAA NCEI's contiguous-US box, which keeps about
+    65% of the ABI pixels.
 
-Measured on 2025-10-27 with the current products and that box: 2.1 GB/day. Bands 13 and 15 take
-0.46 GB each, bands 2 and 5 0.37 GB each and GLM 0.24 GB. Bands 2 and 5 are reflectance, so they
-shrink to about a tenth at night; days with more daylight store more.
+With the example config a day stores about 2.1 GB:
+
+| Product | Per day |
+|---|---|
+| Bands 13 and 15 | 0.46 GB each |
+| Bands 2 and 5 | 0.37 GB each (they shrink to about a tenth at night) |
+| GLM | 0.24 GB |
 
 ## Config options for speed
 
-- `download_method` (`"whole_files"` if not set; the config uses `"byte_ranges"`): how files are
-  fetched.
-  - `"whole_files"` downloads every file in full and decodes it in `max_decode_processes` processes.
+- `download_method` (default `"whole_files"`; the example config uses `"byte_ranges"`):
+  - `"whole_files"` downloads every file in full and decodes it in `max_decode_processes`
+    processes.
   - `"byte_ranges"` downloads only the parts that are used: each file's internal HDF5 index, the
-    variables that are stored (for GLM the flash and event variables and the ids linking them, not
-    the rest of the group data), and for ABI only the bands and image blocks that overlap
-    `bounds`. With the current products that is 4.9 GB per day out of 16.1 GB of source files.
-    Each file then takes a few requests in a row, so the requests run in `byte_range_processes`
-    worker processes. The stored data is identical either way.
-- `byte_range_processes` (48): with `"byte_ranges"`, worker processes that each fetch and decode
-  one file at a time. Together they peaked at 7.2–7.7 GB of memory with the current products.
-- `max_concurrent_http_requests` (32): open connections shared by all days, for listing and, with
-  `"whole_files"`, downloads. Byte-range workers use their own connections.
-- `http_timeout_seconds` (60): time limit for one request, including reading the whole file. With
-  `"byte_ranges"` it limits each network read instead.
+    variables that are stored, and for ABI only the bands and image blocks that overlap `bounds`.
+    With the example products that is 4.9 GB per day instead of 16.1 GB. Each file takes several
+    requests in a row, so these run in `byte_range_processes` worker processes.
+
+  The stored data is identical either way.
+- `byte_range_processes` (48): worker processes for `"byte_ranges"`, each fetching and decoding one
+  file at a time.
+- `max_concurrent_http_requests` (32): open connections shared by all days, used for listing and,
+  with `"whole_files"`, for downloads.
+- `http_timeout_seconds` (60): time limit for one request. With `"byte_ranges"`, it limits each
+  network read instead.
 - `http_retries` (5): attempts per request. Timeouts, connection errors and HTTP 408, 429 and 5xx
   are retried with backoff; other errors fail at once.
-- `max_decode_processes` (4): with `"whole_files"`, worker processes that decode the NetCDF files.
+- `max_decode_processes` (4): decode processes for `"whole_files"`.
 - `max_days_in_flight` (2): days processed at the same time, so the next day's listing overlaps the
   current day's downloads.
-- `max_inflight_payloads` (optional): files per day that can be between download start and being
-  written to Zarr, which caps memory use. Defaults to `max_concurrent_http_requests`, or to
-  `byte_range_processes` with `"byte_ranges"`.
+- `max_inflight_payloads` (optional): files per day between download start and being written,
+  which caps memory. Defaults to `max_concurrent_http_requests`, or to `byte_range_processes` with
+  `"byte_ranges"`.
 
-Download speed is usually limited by the internet connection. On a connection that delivers about
-60 MB/s, 64 connections with 8 decode processes was no faster than the defaults, 128 connections
-was slower, and decoding used only about 1.3 CPU cores.
-
-Measured on one full day (2025-10-27) on that connection with 12 CPU cores. With the current
-products, `"byte_ranges"` with 48 processes took 95–110 s, downloaded 4.9 GB, used 288 s of CPU
-and 7.2–7.7 GB for the workers; `"whole_files"` would download 16.1 GB. An earlier comparison,
-with single-band files for bands 8, 11, 13 and 15 and GLM flashes only:
-
-| `download_method` | Time per day | Downloaded | CPU time | Worker memory |
-|---|---|---|---|---|
-| `"whole_files"` | 106–107 s | 6.9 GB | 125 s | 0.5 GB |
-| `"byte_ranges"`, 32 processes | 90 s | 4.7 GB | not measured | 6.3 GB |
-| `"byte_ranges"`, 48 processes | 79–82 s | 4.7 GB | 438 s | 9.5 GB |
-
-Byte ranges save about a quarter of the time, but only with enough worker processes. GLM files are
-small, so fetching them is limited by request round trips, not bandwidth. They overlap with the
-bandwidth-bound ABI files only because files start in scan-time order.
+Speed is usually limited by the internet connection. With `"byte_ranges"`, much fewer than ~48
+workers leaves bandwidth unused. GLM files are small, so fetching them is limited by request round
+trips rather than bandwidth.
 
 ## Building features
 
 The feature step reads the raw stores and writes one feature store per UTC day to
-`goes_features/YYYY/YYYYDDD.zarr`: the configured channels and lightning labels on one grid, every
-`time_step_minutes`. It is configured by the `features` section of `config.json` and reuses the
-download settings (`raw_output_root_dir`, dates, products). The layout is in the docstring of
-`goes_downloader/features/__init__.py`.
+`<features.output_root_dir>/YYYY/YYYYDDD.zarr`. Each store holds the configured channels and
+lightning labels on one grid, every `time_step_minutes`. It is configured by the `features` section
+of `config.json` and reuses the download settings: `raw_output_root_dir`, the dates and the
+products. The layout is in the docstring of `goes_downloader/features/__init__.py`.
 
 ```bash
-.venv/bin/python build_geography.py --config config.json    # once: terrain, land/water, viewing angle, borders
-.venv/bin/python build_features.py --config config.json     # every day in the range
-.venv/bin/python build_features.py --config config.json --start 2025-04-10 --end 2025-12-31 --stats
+python build_geography.py --config config.json    # once: terrain, land/water, viewing angle, borders
+python build_features.py --config config.json     # every day in the range
+python build_features.py --config config.json --start 2025-04-10 --end 2025-12-31 --stats
 ```
 
-`--start`, `--end`, `--workers` and `--overwrite` override the config for one run. Days already
-complete are skipped, so the command can run again as the download adds days. `--stats` builds
-nothing: it combines the per-day sums of the days in the range into
-`goes_features/stats_<start>_<end>.json` (mean, std, min, max and valid fraction per channel, positive
-fraction per label).
+- `--start`, `--end`, `--workers` and `--overwrite` override the config for one run.
+- Days already complete are skipped, so the command can run again as the download adds days.
+- `--stats` builds nothing. It combines the per-day sums over the range into
+  `stats_<start>_<end>.json`: mean, std, min, max and valid fraction per channel, and positive
+  fraction per label.
 
 A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
-before for lags and gap filling, the day after for labels. Neighbours outside the download date range
-don't hold a day back; their slots are just missing. If the range is extended and such a neighbour
-is downloaded, the next run rebuilds the day. Incomplete days are rebuilt on the next run.
+before for lags and gap filling, and the day after for labels. Neighbours outside the download date
+range don't hold a day back; their slots are just missing. If the range is later extended, the
+affected days are rebuilt.
 
-Ctrl-C stops a build within a second or two: the days being built are left as `.zarr.tmp` folders and
-rebuilt when the same command runs again. Changing the `features` config doesn't touch days already complete: pass
-`--overwrite` or delete `goes_features/`.
+Ctrl-C stops a build within a second or two; days in progress are rebuilt on the next run. Changing
+the `features` config doesn't touch days already complete: pass `--overwrite` or delete the output
+folder.
 
 ### Grid and time
 
-- `grid.resolution_km` (4): cell size at the sub-satellite point, a multiple of the finest product's
-  (2 km). Cells are blocks of ABI fixed-grid pixels, so a 4 km cell is 2x2 band pixels and a 10 km cell
-  is exactly one DSI pixel. Over CONUS a 4 km cell is about 4.4 km east-west by 5.8 km north-south.
-- `grid.bounds`: lat/lon box of the grid; left out, the download `bounds`; `null`, everything stored.
+- `grid.resolution_km` (4): cell size at the sub-satellite point. It must be a multiple of the
+  finest product's pixel size (2 km). Cells are blocks of ABI fixed-grid pixels, so a 4 km cell is
+  2x2 pixels of a 2 km band, and a 10 km cell is exactly one DSI pixel. Over CONUS a 4 km cell is
+  about 4.4 km east-west by 5.8 km north-south.
+- `grid.bounds`: lat/lon box of the grid. If left out, the download `bounds` are used; `null` uses
+  everything stored.
 - `time_step_minutes` (15): how often a sample is written. Channels are always computed on the
-  5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5 minutes whatever the step.
-- `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc `codec`,
-  `level`, `shuffle`; the config uses LZ4 9 with byte shuffle): how the frames are stored. Training
-  reads whole frames, and in one chunk with LZ4 a frame reads in 0.85 ms, against 9.8 ms with zstd 3,
-  bit shuffle and 256x256 chunks. LZ4HC 5 reads just as fast (0.7–0.9 ms) and stores 14% less, but
-  costs 8.9 CPU-seconds a day to compress against 0.6; with the workers filling every core that is
-  only 3% of the build time, so prefer it if disk matters more than the speed of a backfill.
+  5-minute ABI slots, so `lag`, `sum_past` and gap filling work at 5-minute resolution whatever the
+  step.
+- `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc
+  `codec`, `level`, `shuffle`): how the frames are stored.
+  - Training reads whole frames, which one chunk per frame makes fast: about 0.85 ms per frame with
+    LZ4, against 9.8 ms with zstd in 256x256 chunks.
+  - LZ4HC 5 (the default) reads just as fast and stores 14% less than LZ4 9, but compresses more
+    slowly.
 
 Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends
 there, and every label window starts there.
 
 ### Channels
 
-Each entry of `features.channels` has a `name` (usable in expressions), an optional `description`,
-and `"output": false` for helper channels that other channels read but that aren't stored. It takes
-its values from exactly one of:
+Each entry of `features.channels` has:
 
-- **`product`**: an ABI product from the `download` list, in physical units. `aggregation` (`mean`,
-  `min`, `max`, `std`, or `fraction` of pixels whose value is in `values`) applies when the product is
-  at least as fine as the grid; a coarser product takes the pixel under the cell centre. `valid_dqf`
-  (`[0]`) lists the quality flags kept, `min_valid_fraction` (0.5) the share of valid pixels a cell
-  needs, and `fill_gaps_minutes` keeps each cell's last valid value that long (for clear-sky-only TPW
-  and DSI).
-- **`glm`**: per 5-minute slot and cell, `count` (flash centroids), `extent` (flashes with an event in
-  the cell: the flash-extent density LightningCast uses), `energy_fj` or `area_km2`. Missing when GLM
-  covered less than `glm.min_coverage` of the slot: with 0.95, one missing 20-second file of the slot's
-  15 is enough, and a `sum_past` over that slot is missing too (8 of 2,880 times in the first 30 days,
-  whose labels were still known).
-- **`solar`**: `cos_zenith`, `local_hour_sin` or `local_hour_cos` at the middle of the slot (NOAA's
-  solar-calculator algorithm, within 0.02° of astropy).
-- **`expr`**: an expression over other channels with `+ - * / **`, numbers and `lag(x, minutes)`,
-  `sum_past`, `mean_past`, `min_past`, `max_past(x, minutes)`, `abs`, `sqrt`, `log1p`, `exp`,
-  `minimum`, `maximum`, `clip(x, low, high)` and `mask(x, m)` (x where m > 0, missing elsewhere).
+- a `name`, usable in expressions
+- an optional `description`
+- `"output": false` for helper channels that other channels read but that aren't stored
+
+It takes its values from exactly one of these sources:
+
+- **`product`**: an ABI product from the `download` list, in physical units.
+  - `aggregation` applies when the product is at least as fine as the grid: `mean`, `min`, `max`,
+    `std`, or `fraction` (the share of pixels whose value is in `values`). A coarser product takes
+    the pixel under the cell centre.
+  - `valid_dqf` (`[0]`) lists the quality flags kept.
+  - `min_valid_fraction` (0.5) is the share of valid pixels a cell needs.
+  - `fill_gaps_minutes` keeps each cell's last valid value for that long, which suits clear-sky-only
+    products such as TPW and DSI.
+- **`glm`**: per 5-minute slot and cell, one of:
+  - `count`: flash centroids
+  - `extent`: flashes with an event in the cell (flash-extent density)
+  - `energy_fj`
+  - `area_km2`
+
+  The value is missing when GLM covered less than `glm.min_coverage` of the slot.
+- **`solar`**: `cos_zenith`, `local_hour_sin` or `local_hour_cos` at the middle of the slot,
+  computed with NOAA's solar-calculator algorithm.
+- **`expr`**: an expression over other channels. It can use `+ - * / **`, numbers and these
+  functions:
+  - `lag(x, minutes)`
+  - `sum_past`, `mean_past`, `min_past`, `max_past(x, minutes)`
+  - `abs`, `sqrt`, `log1p`, `exp`, `minimum`, `maximum`
+  - `clip(x, low, high)`
+  - `mask(x, m)`: x where m > 0, missing elsewhere
+
   Any missing input makes the result missing.
 
-The default channels are the 0.64 and 1.6 µm reflectances divided by cos(solar zenith) and missing
-when the sun is lower than ~84° (`mask(c02 / cos_sza, cos_sza - 0.1)`; the reflectance factor in the
-files isn't normalised by the sun angle), band 13's mean and coldest pixel, band 15, cloud-top
-height, TPW, CAPE, lifted index and K-index (gap-filled up to 60 minutes), and the flash-extent
-density of the last 15 minutes. The sun's position isn't stored: it's a function of time and place,
-so the model computes it.
+For example, the example config's visible channels divide reflectance by cos(solar zenith) and are
+missing when the sun is low: `mask(c02 / cos_sza, cos_sza - 0.1)`.
 
 ### Labels and GLM
 
-Each entry of `features.labels` is 1 where at least `min_flashes` (1) flashes occurred within
-`radius_cells` (0) cells between `start_minutes` (0) and `end_minutes` after the issue time, 0 where
-none did, and 255 (unknown) where GLM covered less than `glm.min_coverage` (0.95) of the window. With
-`"source": "extent"` (the default) a flash counts in every cell one of its events fell in, its
-footprint; with `"centroid"` only in the cell of its centroid. The configured labels use extent within
-1 cell (GLM pixels are 8-10 km, about two cells). With extent, `min_flashes` counts flash-cell hits
-within the radius. Orphan events (`flash_index` -1, a few hundred of ~50 million a day) belong to no
-flash and are left out of footprints.
+Each entry of `features.labels` is:
 
-`flash_count` (centroids) and `flash_extent` (footprints) hold the flashes of each time step's window
-ending at the issue time, so other labels, persistence baselines and "new lightning" scores can be
-derived later. `glm.quality_flags` (`null` = all) filters flashes; flag 3 marks large flashes, not
-false ones. `glm.lightning_ellipsoid_km` (14/6) is the ellipsoid GLM geolocates flashes and events on;
-reading their lat/lon back on it recovers the direction GLM saw, which lines them up with the cloud
-tops ABI sees from the same satellite. `null` uses the ground ellipsoid (a ~2 km shift over CONUS).
+- 1 where at least `min_flashes` (default 1) flashes occurred within `radius_cells` (default 0)
+  cells, between `start_minutes` (default 0) and `end_minutes` after the issue time
+- 0 where none did
+- 255 (unknown) where GLM covered less than `glm.min_coverage` (0.95) of the window
+
+With `"source": "extent"` (the default), a flash counts in every cell one of its events fell in.
+With `"centroid"`, it counts only in the cell of its centroid. Orphan events belong to no flash and
+are left out.
+
+`flash_count` (centroids) and `flash_extent` (footprints) hold the flashes in each time step's
+window ending at the issue time. From these you can derive other labels, persistence baselines and
+"new lightning" scores later.
+
+- `glm.quality_flags` (`null` = all) filters flashes. Flag 3 marks large flashes, not false ones.
+- `glm.lightning_ellipsoid_km` (14/6) is the ellipsoid GLM geolocates flashes on. Reading their
+  lat/lon back on it recovers the direction GLM saw, which lines flashes up with the cloud tops ABI
+  sees. `null` uses the ground ellipsoid, which shifts flashes by about 2 km over CONUS.
 
 ### Geography
 
-`build_geography.py` writes `goes_features/geography.zarr` once: the `features.geography.fields` on
-the feature grid, one array per field, with their statistics for normalisation. Sources are
-downloaded once into `geography.cache_dir` (`./goes_static`, about 66 MB); OPeNDAP URLs are read for
-the grid's area only. A source finer than the cells is aggregated (`mean`, `std`, `min`, `max`), a
-coarser one interpolated. `scale`, `offset` and `clip` apply to the source values first.
+`build_geography.py` writes `geography.zarr` into the features output folder, once. It holds each
+of `features.geography.fields` on the feature grid, one array per field, with statistics for
+normalisation.
 
-Borders fields (`"borders"`) come from a GeoJSON file of country polygons keyed by `ADM0_A3`: the
-polygons of `countries` (all, if omitted) are drawn on a 0.01° raster, where holes such as the Great
-Lakes stay water, and aggregated to cells. `"fraction"` is the share of the cell on that land;
-`"distance_km"` is the great-circle distance from the cell centre to the nearest cell at least half on
-it (0 on it). `within` keeps only polygons with a vertex in a lat/lon box, which is how Alaska and
-Hawaii are left out of the contiguous US. They are for choosing where to score forecasts (the model
-repo's evaluation area and coastal band), not model inputs.
-`build_features.py` stops if the geography store is on a different grid (rebuild it with
-`--overwrite`).
+- Sources are downloaded once into `geography.cache_dir` (`./goes_static`, about 66 MB). OPeNDAP
+  URLs are read for the grid's area only.
+- A source finer than the cells is aggregated (`mean`, `std`, `min`, `max`); a coarser one is
+  interpolated.
+- `scale`, `offset` and `clip` apply to the source values first.
+
+**Borders fields** (`"borders"`) come from a GeoJSON file of country polygons keyed by `ADM0_A3`.
+The polygons of `countries` (all countries, if omitted) are drawn on a 0.01° raster, where holes
+such as the Great Lakes stay water, and then aggregated to cells.
+
+- `"fraction"` is the share of the cell on that land.
+- `"distance_km"` is the distance to the nearest cell at least half on that land, and 0 on it.
+- `within` keeps only polygons with a vertex in a lat/lon box. This is how the example config
+  leaves Alaska and Hawaii out of the contiguous US.
+
+Borders fields are meant for choosing where to score forecasts, such as an evaluation area or a
+coastal band, rather than as model inputs.
+
+`build_features.py` stops if the geography store was built on a different grid; rebuild it with
+`--overwrite`.
+
+The example config defines these fields:
 
 | Field | Source | Notes |
 |---|---|---|
@@ -417,59 +433,39 @@ repo's evaluation area and coastal band), not model inputs.
 | `land_fraction` | [NASA IMERG land/sea mask](https://gpm.nasa.gov/data/directory/imerg-land-sea-mask-netcdf), 0.1° | 1 land, 0 water; interpolated. |
 | `satellite_zenith` | grid geometry | Degrees between the local vertical and the direction to GOES. |
 | `conus_land` | [Natural Earth](https://www.naturalearthdata.com/) 1:10m countries with large lakes removed (public domain) | Share of the cell on US land within 24–50° N, 126–66° W. |
-| `conus_distance_km` | the same | km to the nearest cell at least half on that land, 0 on it: coastal bands are water within some distance of it. |
+| `conus_distance_km` | the same | km to the nearest cell at least half on that land, 0 on it. |
 | `any_land` | the same | Share of the cell on any country's land. |
 
 ### Size and speed
 
-With the config as it stands (11 stored channels, 4 km, every 15 minutes, float16, LZ4 9): about
-0.37 GB per day, so about 200 GB for the 534-day range (0.33 GB and 176 GB with LZ4HC 5).
+With the example config (11 stored channels, 4 km cells, every 15 minutes, float16, LZ4 9), a day
+stores about 0.37 GB.
 
-A day on its own takes about 27 s and 113 CPU-seconds, of which mapping the day's ~50 million GLM
-events to cells is about 8 s. Building is CPU-bound, so what matters for a backfill is filling the
-cores once rather than several times over: each worker gets one Blosc thread, and `max_workers` is the
-core count. Measured on 12 September 2026 days on an idle 12-core machine, 12 such workers build a day
-in 11.9 s, against 15.8 s for the 4 workers that let Blosc spread compression over every core.
-Channels are computed at every 5-minute slot only when needed: when read at earlier slots (`lag`,
-`*_past`), when carrying values forward (`fill_gaps_minutes`), or when such a channel reads them; the
-rest only at the stored times (measured on 2025-10-27, where computing every channel at every slot
-took 42–44 s against 32 s). While a download runs, 3 days in parallel took 52–116 s each: build with far
-fewer `--workers`, or while the download is stopped. The geography store takes about
-16 s once its sources are cached, 14 s of it for the borders.
+Building is CPU-bound. On its own a day takes about 27 s. With `max_workers` set to the core count,
+12 workers on 12 cores built a day every ~12 s. Building next to a running download is much slower,
+so use far fewer `--workers` then. The geography store takes about 16 s once its sources are cached.
 
 ## Choosing a cloud
 
 AWS (`s3://noaa-goes19`, in `us-east-1`) and Google Cloud (`gs://gcp-public-data-goes-19`) hold the
-same files, so switching `bucket` changes only where they come from; days already complete are
-not downloaded again.
+same files, so switching `bucket` changes only where they come from. Days already complete are not
+downloaded again.
 
-The other measurements in this README were taken reading from Google Cloud, before AWS was
-supported. Measured on 14 October 2026 from an 8-core M1 Mac with 16 GB, with
-`"byte_ranges"` and 24 processes (half the config's 48, to leave memory for the rest of the Mac), one
-run each of 2025-10-27:
-
-| `bucket` | Time per day | Downloaded | Stored | Peak RSS, all processes (sampled every 2 s) |
-|---|---|---|---|---|
-| `s3://noaa-goes19` | 2 min 53 s (28 MB/s) | 4.9 GB | 2.1 GB | 3.3 GB |
-| `gs://gcp-public-data-goes-19` | 4 min 01 s (20 MB/s) | 4.9 GB | 2.1 GB | 3.7 GB |
-
-Both stores were identical apart from `source_bucket` and `completed_utc`. On that connection a
-16 KB range request took 58 ms from AWS and 89 ms from Google Cloud; byte ranges make several
-requests in a row per file, so round trips matter as much as bandwidth. Which cloud is faster
-depends on where you run it, so time a day from your own machine. The AWS bucket is in
-`us-east-1`, so a machine there is next to the data.
+Byte-range downloads make several requests in a row per file, so round-trip time matters as much as
+bandwidth. In one test from a home connection, a day took 2 min 53 s from AWS and 4 min 01 s from
+Google Cloud (8-core Mac, 24 workers). Which cloud is faster depends on where you run it, so time a
+day from your own machine. A machine in AWS `us-east-1` is next to the data.
 
 ## Tests
 
 ```bash
-uv pip install -e ".[dev]" -c requirements.lock
+pip install -e ".[dev]" -c requirements.lock
 pytest              # offline, a few seconds: small synthetic files and stores stand in for the GOES ones
-pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~35 s)
+pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~1 min)
 ```
 
-The network tests read from the configured `bucket` and also check that both clouds list the same
-files for the test hour. GitHub runs pyflakes and the offline tests on Python 3.12 and 3.13 for
-every push and pull request (`.github/workflows/tests.yml`); the network tests are run by hand.
+The network tests read from the configured `bucket`, and check that both clouds list the same files
+for the test hour. GitHub Actions runs pyflakes and the offline tests on Python 3.12 and 3.13.
 
 ## Troubleshooting
 
@@ -481,6 +477,6 @@ every push and pull request (`.github/workflows/tests.yml`); the network tests a
   lines and `report.py` show which days and files failed. A file that fails on every run points
   to a problem with that file at the source.
 - **"too recent" in the report:** the day ended less than 24 hours before the run; run again later.
-- **Running out of memory:** lower `byte_range_processes` (32 used ~6.3 GB and was ~10% slower).
-- **Slower than expected:** check the connection's speed first. With `"byte_ranges"`, fewer than
-  ~48 workers leaves bandwidth unused.
+- **Running out of memory:** lower `byte_range_processes`.
+- **Slower than expected:** check the connection's speed first. With `"byte_ranges"`, much fewer
+  than ~48 workers leaves bandwidth unused.

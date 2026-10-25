@@ -243,7 +243,7 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   with the NOAA CONUS bounds (~1.12–1.24 TB). With `"byte_ranges"` a day downloads 4.9 GB and
   took 95–110 s from Google Cloud on a ~60 MB/s connection (14–16 h for the range); `"whole_files"`
   would download 16.1 GB/day because of the MCMIPC files. README's speed and memory figures are from
-  Google Cloud except its "Choosing a cloud" table: on the 8-core, 16 GB Mac with 24 processes a day
+  Google Cloud except its "Choosing a cloud" section: on the 8-core, 16 GB Mac with 24 processes a day
   took 2 min 53 s from AWS and 4 min 01 s from Google Cloud (one run each, identical stores).
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
   in it; geography sources are cached in `./goes_static`. Current config: about 0.37 GB/day

@@ -30,8 +30,7 @@ Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
   time[time]                           datetime64 slot start, every time_step_minutes
   channel[channel], label[label]       names in config order (channels with "output": false excluded)
   features[time, channel, y, x]        float16 (or float32); NaN = missing. One chunk per time step (or
-                                       chunk_yx), Blosc features.compression (LZ4HC 5, byte shuffle): training
-                                       reads whole frames, which this makes 5.8x faster than zstd in 256x256 chunks
+                                       chunk_yx), compressed with Blosc features.compression
   labels[time, label, y, x]            uint8 1 = lightning in the window, 0 = none, 255 = unknown (GLM covered
                                        less than glm.min_coverage of the window)
   flash_count[time, y, x]              uint16 flashes (quality-filtered) whose centroid is in the cell and whose

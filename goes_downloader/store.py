@@ -1,11 +1,8 @@
 """
 The per-day raw Zarr store: its layout, described here, and the code that writes it.
 
-GOES ABI (CONUS L2) + GLM (LCFA) -> per-day raw Zarr store, no aggregation
-==========================================================================
-
-Mirrors the source data into one Zarr store per UTC day so that binning, regridding
-and quality filtering can all happen later in a feature-building step.
+Each store mirrors one UTC day of GOES ABI (CONUS L2) and GLM (LCFA) data without aggregation, so
+binning, regridding and quality filtering can all happen later, in the feature step.
 
 Layout of <raw_output_root_dir>/YYYY/YYYYDDD.zarr
 
@@ -130,6 +127,7 @@ def _write_array(group: Any, name: str, data: np.ndarray, dims: List[str], **att
     array = group.create_dataset(name, data=data, fill_value=None, overwrite=True, **attrs.pop("zarr", {}))
     array.attrs.update({"_ARRAY_DIMENSIONS": dims, **attrs})
     return array
+
 
 GLM_FLASH_COLUMNS = {
     "time_first_ns": np.int64,

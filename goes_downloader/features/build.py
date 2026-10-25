@@ -8,19 +8,22 @@ import math
 import multiprocessing
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import signal
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import zarr
 
 from ..common import SLOTS_PER_DAY, TIME_ATTRS, iter_days_utc
 from ..progress import format_duration, log
+from ..store import _write_array, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 from .expressions import Evaluator, make_plan
+from .geography import build_geography, geography_grid
 from .glm import SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
 from .grid import SourceFrame, SolarGeometry, TargetGrid, aggregate, grid_latlon, make_grid
 from .raw import EPOCH, RawTimeline, day_of_index
@@ -31,8 +34,6 @@ FLOAT16_MAX = float(np.finfo(np.float16).max)
 
 
 def features_day_path(cfg: FeatureConfig, day: datetime) -> str:
-    from ..store import output_zarr_path_for_day
-
     return output_zarr_path_for_day(cfg.output_root_dir, day)
 
 
@@ -43,10 +44,6 @@ def raw_neighbour_arrived(cfg: FeatureConfig, path: str) -> bool:
     without their neighbours (which won't arrive unless the range is extended); when it is, this
     rebuilds them.
     """
-    import zarr
-
-    from ..store import output_zarr_path_for_day, zarr_store_is_complete
-
     try:
         raw_days = zarr.open_consolidated(path, mode="r").attrs.get("raw_days", {})
     except Exception:  # an unreadable store is rebuilt anyway; never abort the run over one day
@@ -70,9 +67,7 @@ def _exit_now(*_: Any) -> None:
 def _init_worker() -> None:
     """
     Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM). One Blosc thread per
-    worker: a day is CPU-bound, so letting every worker spread compression over all cores only
-    oversubscribes them (on 12 cores, 12 workers with one thread each build a day in 12.3 s against
-    15.8 s for 4 workers with Blosc's default).
+    worker: building is CPU-bound and max_workers already fills the cores (README: Size and speed).
     """
     import numcodecs
 
@@ -126,10 +121,6 @@ def label_attrs(l: LabelSpec) -> Dict[str, Any]:
 
 def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, Any]:
     """Builds one day's feature store. Runs in a worker process."""
-    import zarr
-
-    from ..store import _write_array, directory_size
-
     t_start = time.monotonic()
     day = datetime.strptime(day_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     out_path = features_day_path(cfg, day)
@@ -269,8 +260,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         if glm is not None:
             a = s + 1 - step
             flash_arr[k] = np.minimum(glm.sums(a, s + 1).reshape(shape), u16).astype(np.uint16)
-            if extent_arr is not None:
-                extent_arr[k] = np.minimum(glm.sums(a, s + 1, "extent").reshape(shape), u16).astype(np.uint16)
+            extent_arr[k] = np.minimum(glm.sums(a, s + 1, "extent").reshape(shape), u16).astype(np.uint16)
             glm_coverage[k] = glm.coverage_mean(a, s + 1)
             n_flashes += glm.n_flashes(a, s + 1)
         if labels_arr is not None:
@@ -333,9 +323,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         }
     )
     zarr.consolidate_metadata(root.store)
-    # Rename the old store aside rather than deleting it in place: a worker killed on Ctrl-C partway
-    # through the delete would otherwise leave .zattrs (complete: true) without its arrays, and the day
-    # would never be rebuilt.
+    # Rename the old store aside rather than deleting it in place: a worker killed mid-delete could
+    # leave .zattrs (complete: true) without its arrays, and the day would never be rebuilt.
     old_path = out_path + ".old"
     shutil.rmtree(old_path, ignore_errors=True)
     if os.path.exists(out_path):
@@ -356,8 +345,6 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
 
 def check_geography(cfg: FeatureConfig, grid: TargetGrid) -> None:
     """The geography store, if there is one, must be on the same grid as the features."""
-    from .geography import geography_grid
-
     path = geography_store_path(cfg)
     geo = geography_grid(path)
     if geo is None:
@@ -368,8 +355,6 @@ def check_geography(cfg: FeatureConfig, grid: TargetGrid) -> None:
 
 
 def run_build(cfg: FeatureConfig) -> None:
-    from ..store import zarr_store_is_complete
-
     days = [d.date().isoformat() for d in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc)]
     grid = make_grid(cfg)
     check_geography(cfg, grid)
@@ -414,10 +399,8 @@ def run_build(cfg: FeatureConfig) -> None:
             else:
                 log(f"-> {d} {r['status']}  [{i}/{len(todo)}]")
     except BaseException:
-        # A day takes tens of seconds, so don't wait: the days in progress stay .tmp and are rebuilt next
-        # run. ProcessPoolExecutor has no public way to stop its workers before Python 3.14. Without this
-        # the pool's atexit hook would join every queued day, so the command would hang after a Ctrl-C or
-        # any other escaping exception.
+        # Stop the workers now (there is no public API before Python 3.14); otherwise the pool's atexit
+        # hook joins every queued day and the command hangs. Days in progress stay .tmp for the next run.
         for proc in list((getattr(pool, "_processes", None) or {}).values()):
             proc.terminate()
         raise
@@ -435,8 +418,6 @@ def run_build(cfg: FeatureConfig) -> None:
 
 def run_stats(cfg: FeatureConfig) -> None:
     """Combines the per-day sums into mean/std per channel and positive rates per label."""
-    import zarr
-
     sums: Dict[str, Dict[str, float]] = {}
     labels: Dict[str, List[int]] = {}
     used, incomplete, missing, cells = [], [], [], 0
@@ -528,8 +509,6 @@ def features_main(argv: Optional[List[str]] = None) -> None:
 
 
 def geography_main(argv: Optional[List[str]] = None) -> None:
-    from .geography import build_geography, geography_grid
-
     p = argparse.ArgumentParser(description="Put the geography fields (terrain, land/water, viewing angle) on the feature grid, once.")
     p.add_argument("--config", default="config.json", help="Path to JSON config file")
     p.add_argument("--overwrite", action="store_true", help="Rebuild the geography store even if it matches the grid")
@@ -546,8 +525,6 @@ def geography_main(argv: Optional[List[str]] = None) -> None:
         raise SystemExit(f"{path} exists on a different grid; rebuild it with --overwrite")
     t0 = time.monotonic()
     out = build_geography(cfg, grid)
-    import zarr
-
     g = zarr.open_consolidated(out, mode="r")
     summary = ", ".join(f"{n} {st['min']:.4g}..{st['max']:.4g}" for n, st in g.attrs["stats"].items() if st["count"])
     log(f"wrote {out} ({grid.ny} x {grid.nx}) in {format_duration(time.monotonic() - t0)}: {summary}")

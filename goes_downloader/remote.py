@@ -59,10 +59,6 @@ def object_url(bucket: str, blob: str) -> str:
     return f"https://storage.googleapis.com/{name}/{blob}"
 
 
-async def _backoff(attempt: int) -> None:
-    await asyncio.sleep(backoff_seconds(attempt))
-
-
 async def http_get(
     cfg: RawConfig,
     session: aiohttp.ClientSession,
@@ -86,7 +82,7 @@ async def http_get(
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = repr(e)
         if attempt < cfg.http_retries:
-            await _backoff(attempt)
+            await asyncio.sleep(backoff_seconds(attempt))
     raise RuntimeError(f"GET {url} failed: {last_error}")
 
 

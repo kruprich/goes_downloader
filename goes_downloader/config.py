@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from .progress import log
 
+
 @dataclass(frozen=True)
 class ProductSpec:
     key: str

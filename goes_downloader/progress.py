@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     if current is not None:

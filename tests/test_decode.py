@@ -31,13 +31,13 @@ def test_quantize_leaves_values_alone(precision):
 
 def test_parent_rows():
     ids = np.array([30, 10, 20])
-    assert _parent_rows(np.array([20, 30, 30, 10]), ids, "x").tolist() == [2, 0, 0, 1]
-    assert _parent_rows(np.array([], dtype=np.int64), ids, "x").tolist() == []
+    assert _parent_rows(np.array([20, 30, 30, 10]), ids).tolist() == [2, 0, 0, 1]
+    assert _parent_rows(np.array([], dtype=np.int64), ids).tolist() == []
     # Parents not in the file (NOAA's orphans) give -1
-    assert _parent_rows(np.array([40, 10]), ids, "x").tolist() == [-1, 1]
-    assert _parent_rows(np.array([1]), np.array([], dtype=np.int64), "x").tolist() == [-1]
+    assert _parent_rows(np.array([40, 10]), ids).tolist() == [-1, 1]
+    assert _parent_rows(np.array([1]), np.array([], dtype=np.int64)).tolist() == [-1]
     # An id used twice (flash ids wrap around) is ambiguous, so its children are orphans too
-    assert _parent_rows(np.array([10, 20]), np.array([10, 10, 20]), "x").tolist() == [-1, 2]
+    assert _parent_rows(np.array([10, 20]), np.array([10, 10, 20])).tolist() == [-1, 2]
 
 
 def test_glm_events_link_to_their_flash(glm_file):

@@ -171,7 +171,7 @@ GLM_LINK_VARIABLES = ("event_parent_group_id", "group_id", "group_parent_flash_i
 GLM_READ_VARIABLES = [*GLM_FLASH_VARIABLES.values(), *GLM_EVENT_VARIABLES, *GLM_LINK_VARIABLES]
 
 
-def _parent_rows(parent_ids: np.ndarray, ids: np.ndarray, what: str) -> np.ndarray:
+def _parent_rows(parent_ids: np.ndarray, ids: np.ndarray) -> np.ndarray:
     """
     Row in `ids` of each parent id, or -1 where the parent can't be found in the file. NOAA's files
     have such orphans, which are kept rather than failing the file:
@@ -215,8 +215,8 @@ def decode_glm_file(payload: bytes) -> Dict[str, np.ndarray]:
         var = {name: ds.variables[name] for name in GLM_READ_VARIABLES}
         flash = {column: var[name] for column, name in GLM_FLASH_VARIABLES.items()}
         quality = np.ma.filled(np.ma.asarray(flash["quality_flag"][:], dtype=np.int16), 255)
-        event_group = _parent_rows(ids(var["event_parent_group_id"]), ids(var["group_id"]), "event_parent_group_id")
-        group_flash = _parent_rows(ids(var["group_parent_flash_id"]), ids(var["flash_id"]), "group_parent_flash_id")
+        event_group = _parent_rows(ids(var["event_parent_group_id"]), ids(var["group_id"]))
+        group_flash = _parent_rows(ids(var["group_parent_flash_id"]), ids(var["flash_id"]))
         return {
             "time_first_ns": _offset_seconds_to_ns(flash["time_first_ns"]),
             "time_last_ns": _offset_seconds_to_ns(flash["time_last_ns"]),

@@ -10,7 +10,7 @@ import numpy as np
 from ..common import GLM_WINDOW_SECONDS, NAT_NS, SLOT_SECONDS, SLOTS_PER_DAY
 from ..crop import latlon_to_scan_angle
 from .grid import TargetGrid, glm_projection
-from .raw import RawTimeline, day_of_index
+from .raw import RawTimeline
 from .settings import FeatureConfig
 
 SLOT_NS = SLOT_SECONDS * 1_000_000_000
@@ -71,8 +71,6 @@ class GlmTimeline:
             energy.append(f["energy_j"][:][keep][inside].astype(np.float64) * 1e15)
             area.append(f["area_m2"][:][keep][inside].astype(np.float64) / 1e6)
 
-            if "glm/events" not in root:
-                raise ValueError(f"raw store for {day_of_index(d).date()} has no glm/events; flash extent needs one from the current downloader")
             # Only the events of the files that can hold the range's flashes (events are in file order)
             files = root["glm/files"]
             start = files["start_ns"][:]

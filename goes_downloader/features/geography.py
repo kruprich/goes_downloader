@@ -27,6 +27,7 @@ Layout of geography.zarr
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import shutil
 import urllib.parse
@@ -37,9 +38,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import zarr
 
 from ..crop import latlon_to_scan_angle
 from ..progress import log
+from ..store import COMPRESSOR, _write_array
 from .grid import TargetGrid, grid_latlon, satellite_zenith_deg
 from .settings import FeatureConfig, GeographySpec, geography_store_path
 
@@ -160,7 +163,7 @@ def _bilinear(lat: np.ndarray, lon: np.ndarray, values: np.ndarray, qlat: np.nda
 
 
 def regrid_source(specs: List[GeographySpec], lat: np.ndarray, lon: np.ndarray, values: np.ndarray,
-                         grid: TargetGrid, cell_lat: np.ndarray, cell_lon: np.ndarray) -> List[np.ndarray]:
+                  grid: TargetGrid, cell_lat: np.ndarray, cell_lon: np.ndarray) -> List[np.ndarray]:
     """
     Puts one lat/lon source on the grid for each spec (which may differ in aggregation, clip, scale).
     A source finer than the cells is aggregated over the source pixels whose centres fall in each cell;
@@ -222,8 +225,6 @@ def regrid_source(specs: List[GeographySpec], lat: np.ndarray, lon: np.ndarray, 
 
 def read_borders(path: str, countries: Any, within: Any) -> List[np.ndarray]:
     """Rings ([n, 2] lon/lat, closed) of the countries' polygons (every country if None), outer and holes alike."""
-    import json
-
     with open(path, "r", encoding="utf-8") as f:
         features = json.load(f)["features"]
     rings = []
@@ -378,10 +379,6 @@ def definition(f: GeographySpec) -> Dict[str, Any]:
 
 def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
     """Writes the geography store (built at <path>.tmp and moved into place)."""
-    import zarr
-
-    from ..store import COMPRESSOR, _write_array
-
     if not cfg.geography:
         raise ValueError("features.geography.fields is empty")
     fields = compute_fields(cfg, grid)
@@ -412,8 +409,6 @@ def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
 
 def geography_grid(path: str) -> Any:
     """The TargetGrid a geography store was built on, or None if there is no store."""
-    import zarr
-
     if not os.path.exists(os.path.join(path, ".zgroup")):
         return None
     return TargetGrid(**zarr.open_consolidated(path, mode="r").attrs["grid"])

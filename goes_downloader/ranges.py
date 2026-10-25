@@ -211,7 +211,6 @@ def _open_remote(
     return rf, chunks
 
 
-
 def ranged_decode_abi_file(
     url: str, size: int, variables: List[Tuple[str, str, Optional[float]]], bounds: Optional[LatLonBounds], timeout: int, retries: int
 ) -> Tuple[List[Dict[str, Any]], int]:

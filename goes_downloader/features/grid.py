@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import zarr
 
 from ..common import iter_days_utc
 from ..crop import geos_crs, scan_angle_rect
+from ..store import output_zarr_path_for_day
 from .settings import ChannelSpec, FeatureConfig
 
 
@@ -165,17 +167,13 @@ def _nominal_km(step_rad: float, projection: Dict[str, Any]) -> float:
 
 def make_grid(cfg: FeatureConfig) -> TargetGrid:
     """Builds the target grid from the first raw day in the range that holds every product used."""
-    import zarr
-
-    from .raw import raw_day_path
-
     products = list(dict.fromkeys(c.product for c in cfg.channels if c.kind == "product"))
     if cfg.reference_product is not None:
         products = [cfg.reference_product]
 
     groups: Dict[str, Any] = {}
     for day in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc):
-        path = raw_day_path(cfg, day)
+        path = output_zarr_path_for_day(cfg.raw.raw_output_root_dir, day)
         if not os.path.exists(os.path.join(path, ".zgroup")):
             continue
         root = zarr.open_consolidated(path, mode="r")

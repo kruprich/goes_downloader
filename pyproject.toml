@@ -24,8 +24,8 @@ dev = ["pyflakes", "pytest"]
 
 # No console scripts: generated entry scripts import the package at top level, and the spawned
 # pool workers re-run the main script, so they would load aiohttp and zarr (see download_raw.py).
-[tool.setuptools]
-packages = ["goes_downloader"]
+[tool.setuptools.packages.find]
+include = ["goes_downloader*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

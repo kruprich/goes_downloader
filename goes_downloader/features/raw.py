@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import zarr
 
 from ..common import SLOTS_PER_DAY
 from ..store import output_zarr_path_for_day
@@ -14,10 +15,6 @@ from .grid import AxisMap, TargetGrid, axis_map
 from .settings import FeatureConfig
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-
-def raw_day_path(cfg: FeatureConfig, day: datetime) -> str:
-    return output_zarr_path_for_day(cfg.raw.raw_output_root_dir, day)
 
 
 def day_of_index(index: int) -> datetime:
@@ -46,8 +43,6 @@ class RawProduct:
 
 class RawDay:
     def __init__(self, path: str, grid: TargetGrid):
-        import zarr
-
         self.grid = grid
         self.root = zarr.open_consolidated(path, mode="r") if os.path.exists(os.path.join(path, ".zgroup")) else None
         self.complete = bool(self.root.attrs.get("complete", False)) if self.root is not None else False
@@ -69,7 +64,7 @@ class RawTimeline:
 
     def day(self, index: int) -> RawDay:
         if index not in self.days:
-            self.days[index] = RawDay(raw_day_path(self.cfg, day_of_index(index)), self.grid)
+            self.days[index] = RawDay(output_zarr_path_for_day(self.cfg.raw.raw_output_root_dir, day_of_index(index)), self.grid)
         return self.days[index]
 
     def read(self, product: str, s: int) -> Optional[Tuple[RawProduct, np.ndarray, np.ndarray, float, float]]:

@@ -31,7 +31,7 @@ certificates: prefix anything that touches the network with `SSL_CERT_FILE=/etc/
 .venv/bin/python report.py --config config.json           # which days are complete / need attention
 .venv/bin/python build_geography.py --config config.json  # once: static fields on the feature grid
 .venv/bin/python build_features.py --config config.json   # feature stores; --start/--end/--workers/--stats
-.venv/bin/python -m pytest                                # offline tests, a few seconds
+.venv/bin/python -m pytest                                # offline tests, about 10 s
 .venv/bin/python -m pytest --network                      # + real files and the test hour (~0.5 GB, ~30 s)
 .venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py build_features.py build_geography.py
 ```
@@ -58,8 +58,8 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   listing pages through continuation tokens.
 - `test_decode.py`: rounding of packed values; linking GLM events to flashes and its errors.
 - `test_store.py`: GLM tables (flash order, event links after sorting, counts, coverage).
-- `test_config.py`: config validation and IR-band precision; `crop_slice`; the entry script
-  importing nothing outside its main guard.
+- `test_config.py`: config validation and IR-band precision; `crop_slice`; the three entry
+  scripts importing nothing outside their main guards.
 - `test_report.py`, `test_runner.py`: the report's rules; the report after a run, `--no-report`,
   Ctrl-C.
 - `test_features.py`: the feature step on two synthetic raw days on the real fixed grid (a 2 km
@@ -68,7 +68,8 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   the sun, flash centroids and footprints, labels (including a flash stored in the next day's first
   file and a GLM gap), completeness, geography regridding, borders rasterized by the even-odd rule
   (holes, a `within` filter) and their distances against brute force, sun and satellite geometry against
-  astropy/spherical values, config errors, the entry scripts' imports.
+  astropy/spherical values, config errors. The raw days are written once per module (`raw_days`) and
+  each test's `raw/` links to them: a test that adds raw days must copy them first.
 
 For changes to the feature step, also build a few real days (with 2–3 `--workers` while a download
 runs) and compare against values recomputed from the raw arrays: block means of the 2 km frames,

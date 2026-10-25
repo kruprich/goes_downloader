@@ -11,10 +11,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 import aiohttp
-import numpy as np
 import pytest
 import zarr
 
+from conftest import REPO, same
 from goes_downloader import ranges, remote, runner
 from goes_downloader.config import load_config
 from goes_downloader.crop import crop_slice, scan_angle_rect
@@ -22,14 +22,8 @@ from goes_downloader.decode import decode_abi_file, decode_glm_file
 
 pytestmark = pytest.mark.network
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAY = datetime(2025, 10, 27, tzinfo=timezone.utc)
 HOUR = 18
-
-
-def same(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    return a.shape == b.shape and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
 
 
 async def list_hour(cfg, prefix, must_contain):

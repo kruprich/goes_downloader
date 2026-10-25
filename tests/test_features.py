@@ -5,16 +5,16 @@ centroids and footprints, labels, completeness, geography and the sun/satellite 
 
 import json
 import os
-import subprocess
-import sys
+import shutil
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 
 import netCDF4 as nc
 import numpy as np
 import pytest
 import zarr
 
+from conftest import PROJECTION, REPO
 from goes_downloader.common import SLOTS_PER_DAY
 from goes_downloader.crop import latlon_to_scan_angle
 from goes_downloader.features.build import build_day, check_geography
@@ -22,13 +22,6 @@ from goes_downloader.features.geography import EARTH_RADIUS_KM, build_geography,
 from goes_downloader.features.grid import SolarGeometry, grid_latlon, make_grid, satellite_zenith_deg
 from goes_downloader.features.settings import GeographySpec, load_feature_config
 
-PROJECTION = {  # GOES-East fixed grid, as in the real files
-    "grid_mapping_name": "geostationary", "perspective_point_height": 35786023.0, "semi_major_axis": 6378137.0,
-    "semi_minor_axis": 6356752.31414, "inverse_flattening": 298.2572221, "latitude_of_projection_origin": 0.0,
-    "longitude_of_projection_origin": -75.0, "sweep_angle_axis": "x",
-}
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 X0, DX, Y0, DY = -0.101332, 5.6e-5, 0.128212, -5.6e-5  # uncropped CONUS 2 km pixel centres (rad)
 CROP_Y0, CROP_X0, H, W = 600, 1200, 30, 40  # 2 km pixels kept; the 10 km product covers the same area
 DAY1, DAY2 = "2025-06-01", "2025-06-02"
@@ -152,14 +145,17 @@ def config(tmp_path, end=DAY2, **features):
     return str(path)
 
 
-@pytest.fixture
-def built(tmp_path):
-    """Two raw days with GLM, the feature config and its grid; flashes are placed on known cells."""
-    write_raw_day(str(tmp_path / "raw"), DAY1, missing_slot=99)  # the 08:15 output slot
-    p2 = write_raw_day(str(tmp_path / "raw"), DAY2)
-    p1 = os.path.join(str(tmp_path / "raw"), "2025", "2025152.zarr")
-    cfg = load_feature_config(config(tmp_path))
-    grid = make_grid(cfg)
+@pytest.fixture(scope="module")
+def raw_days(tmp_path_factory):
+    """
+    Two raw days with GLM, written once for the module (writing them is most of the setup time);
+    flashes are placed on known cells. Tests must not write into them.
+    """
+    shared = tmp_path_factory.mktemp("shared")
+    write_raw_day(str(shared / "raw"), DAY1, missing_slot=99)  # the 08:15 output slot
+    p2 = write_raw_day(str(shared / "raw"), DAY2)
+    p1 = os.path.join(str(shared / "raw"), "2025", "2025152.zarr")
+    grid = make_grid(load_feature_config(config(shared)))
     lat, lon = grid_latlon(grid)
     at = lambda r, c: (float(lat[r, c]), float(lon[r, c]))  # noqa: E731
     flashes1 = [
@@ -174,7 +170,15 @@ def built(tmp_path):
     cov2[6 * 180 : 7 * 180] = 0  # no GLM data 06:00-07:00 on day 2
     write_glm(p1, flashes1, np.ones(4320), orphans=[at(12, 15)])  # read as the last flash (B) if -1 were an index
     write_glm(p2, flashes2, cov2)
-    return cfg, grid
+    return shared / "raw"
+
+
+@pytest.fixture
+def built(tmp_path, raw_days):
+    """The feature config and its grid, with tmp_path/raw linked to the shared raw days."""
+    (tmp_path / "raw").symlink_to(raw_days)
+    cfg = load_feature_config(config(tmp_path))
+    return cfg, make_grid(cfg)
 
 
 def cells(mask):
@@ -193,6 +197,8 @@ def test_channels_match_the_raw_pixels(built, tmp_path):
     F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
     chan = list(F["channel"][:])
     assert chan == ["a", "a_min", "b", "a_day", "a_change", "fed15"]
+    t = F["time"][:]
+    assert t[0] == T1 and len(t) == 96 and (np.diff(t) == 15 * MIN).all()  # slot starts, UTC
     base = (datetime(2025, 6, 1) - datetime(1970, 1, 1)).days * SLOTS_PER_DAY
     yy, xx = np.meshgrid(CROP_Y0 + np.arange(H), CROP_X0 + np.arange(W), indexing="ij")
     for k in (1, 40):
@@ -447,14 +453,6 @@ def test_repo_features_config_loads():
     assert [c.name for c in cfg.channels if c.output][:2] == ["vis_064", "nir_16"]
 
 
-@pytest.mark.parametrize("script", ["build_features.py", "build_geography.py"])
-def test_feature_entry_scripts_import_nothing_outside_their_main_guard(script):
-    code = (f"import runpy, sys; runpy.run_path({script!r}, run_name='__mp_main__'); "
-            "print(sorted(m for m in ('zarr', 'goes_downloader') if m in sys.modules))")
-    out = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "[]"
-
-
 def test_config_without_features_section_is_rejected(tmp_path):
     raw = json.load(open(config(tmp_path)))
     del raw["features"]
@@ -468,15 +466,6 @@ def test_day_without_raw_store_is_reported(built):
     assert build_day(cfg, grid, "2025-06-05") == {"day": "2025-06-05", "status": "no raw store", "complete": False}
 
 
-def test_time_zone_of_slots(built, tmp_path):
-    cfg, grid = built
-    build_day(cfg, grid, DAY1)
-    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
-    t = F["time"][:]
-    assert t[0] == T1 and np.all(np.diff(t) == 15 * MIN) and len(t) == 96
-    assert datetime.fromtimestamp(t[0] / 1e9, timezone.utc).hour == 0
-
-
 def test_flash_just_before_midnight_counts_without_labels(built, tmp_path):
     """With no labels the GLM range ends at midnight; D (23:59:59) is in day 2's first file and must count."""
     cfg, grid = built
@@ -486,24 +475,22 @@ def test_flash_just_before_midnight_counts_without_labels(built, tmp_path):
     assert cells(F["flash_count"][287] > 0) == {(7, 7)} and cells(F["flash_extent"][287] > 0) == {(7, 7)}
 
 
-def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives(built, tmp_path):
+def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives_or_it_cannot_be_read(built, tmp_path):
     from goes_downloader.features.build import features_day_path, raw_neighbour_arrived
 
     cfg, grid = built
     assert build_day(cfg, grid, DAY2)["complete"]  # day 3 is outside the download range
     path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
     assert not raw_neighbour_arrived(cfg, path)
-    p3 = write_raw_day(str(tmp_path / "raw"), "2025-06-03")  # the range was extended and day 3 downloaded
+    raw = tmp_path / "raw"
+    shared = raw.resolve()
+    raw.unlink()
+    shutil.copytree(shared, raw)  # a private copy: the shared raw days must stay as they are
+    p3 = write_raw_day(str(raw), "2025-06-03")  # the range was extended and day 3 downloaded
     write_glm(p3, [], np.ones(4320))
     assert raw_neighbour_arrived(cfg, path)
-
-
-def test_unreadable_feature_store_is_rebuilt_instead_of_failing_the_run(built):
-    from goes_downloader.features.build import features_day_path, raw_neighbour_arrived
-
-    cfg, grid = built
-    path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
-    assert build_day(cfg, grid, DAY2)["complete"]
+    shutil.rmtree(p3)
+    assert not raw_neighbour_arrived(cfg, path)
     os.remove(os.path.join(path, ".zmetadata"))  # e.g. a store left behind by an older version
     assert raw_neighbour_arrived(cfg, path)
 

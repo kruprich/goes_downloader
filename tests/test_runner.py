@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import REPO
 from goes_downloader import runner
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture

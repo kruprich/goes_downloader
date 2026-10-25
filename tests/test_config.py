@@ -8,10 +8,9 @@ import sys
 import numpy as np
 import pytest
 
+from conftest import REPO
 from goes_downloader.config import load_config, unknown_keys
 from goes_downloader.crop import crop_slice
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def write_config(tmp_path, **changes):
@@ -87,10 +86,11 @@ def test_crop_slice_keeps_cells_overlapping_the_range():
         crop_slice(x, 20.0, 30.0, "x")
 
 
-def test_entry_script_imports_nothing_outside_its_main_guard():
-    """Spawned workers re-run download_raw.py; they must not load aiohttp or zarr through it."""
+@pytest.mark.parametrize("script", ["download_raw.py", "build_features.py", "build_geography.py"])
+def test_entry_script_imports_nothing_outside_its_main_guard(script):
+    """Spawned workers re-run the entry script; they must not load aiohttp or zarr through it."""
     code = (
-        "import runpy, sys; runpy.run_path('download_raw.py', run_name='__mp_main__'); "
+        f"import runpy, sys; runpy.run_path({script!r}, run_name='__mp_main__'); "
         "print(sorted(m for m in ('aiohttp', 'zarr', 'goes_downloader') if m in sys.modules))"
     )
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, check=True)

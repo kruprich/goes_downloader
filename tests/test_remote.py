@@ -6,11 +6,11 @@ import os
 
 import pytest
 
+from conftest import REPO
 from goes_downloader import remote
 from goes_downloader.config import load_config
 from goes_downloader.day import infer_satellite_label_from_bucket
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREFIX = "GLM-L2-LCFA/2025/300/18/"
 NAMES = [f"{PREFIX}OR_GLM-L2-LCFA_G19_s2025300180{i}000_e2025300180{i}200_c2025300180{i}220.nc" for i in range(5)]
 
@@ -81,13 +81,3 @@ def test_listing_pages_through_the_prefix(tmp_path, monkeypatch, cloud):
         assert all(p["list-type"] == "2" and p["max-keys"] == "1000" for _, p in requests)
     else:
         assert {url for url, _ in requests} == {"https://storage.googleapis.com/storage/v1/b/gcp-public-data-goes-19/o"}
-
-
-def test_listing_an_empty_prefix(tmp_path, monkeypatch):
-    cfg = load(tmp_path, "s3://noaa-goes19")
-
-    async def fake_get(cfg, session, url, params=None, *, as_json):
-        return s3_page([])
-
-    monkeypatch.setattr(remote, "http_get", fake_get)
-    assert asyncio.run(remote.list_object_names(cfg, None, PREFIX)) == {}

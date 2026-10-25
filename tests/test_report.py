@@ -6,11 +6,10 @@ from datetime import datetime, timezone
 
 import zarr
 
+from conftest import REPO
 from goes_downloader.config import load_config
 from goes_downloader.report import day_rows, problems, summary
 from goes_downloader.store import output_zarr_path_for_day
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def make_store(root_dir, day, complete=True, scans=None, glm_missing=0):

@@ -6,6 +6,7 @@ import threading
 import numpy as np
 import pytest
 
+from conftest import same
 from goes_downloader import ranges
 from goes_downloader.config import LatLonBounds
 from goes_downloader.crop import crop_slice, scan_angle_rect
@@ -13,11 +14,6 @@ from goes_downloader.decode import decode_abi_file, decode_glm_file
 
 CONUS = LatLonBounds(lat_min=24.0, lat_max=50.0, lon_min=-125.0, lon_max=-66.0)
 ABI_VARIABLES = [("CMI_C02", "DQF_C02", None), ("CMI_C13", "DQF_C13", 0.25)]
-
-
-def same(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    return a.shape == b.shape and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
 
 
 def test_range_bookkeeping_random(monkeypatch):

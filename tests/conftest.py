@@ -12,6 +12,14 @@ import pytest
 
 from goes_downloader import ranges
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def same(a, b):
+    """Equal shape and values, with NaNs equal."""
+    a, b = np.asarray(a), np.asarray(b)
+    return a.shape == b.shape and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
+
 
 def pytest_addoption(parser):
     parser.addoption("--network", action="store_true", help="also run tests that download real GOES files")

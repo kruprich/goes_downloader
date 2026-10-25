@@ -460,7 +460,7 @@ day from your own machine. A machine in AWS `us-east-1` is next to the data.
 
 ```bash
 pip install -e ".[dev]" -c requirements.lock
-pytest              # offline, a few seconds: small synthetic files and stores stand in for the GOES ones
+pytest              # offline, about 10 s: small synthetic files and stores stand in for the GOES ones
 pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~1 min)
 ```
 

@@ -132,6 +132,8 @@ def config(tmp_path, end=DAY2, **features):
             "labels": [
                 {"name": "ext30", "end_minutes": 30, "radius_cells": 1, "source": "extent"},
                 {"name": "cen15", "end_minutes": 15, "radius_cells": 0, "source": "centroid"},
+                # LightningCast's: from the scan's slot, on the 2 km pixels, peak of 1-minute densities
+                {"name": "lc60", "start_minutes": -5, "end_minutes": 55, "resolution_km": 2, "fed_minutes": 1},
             ],
             "geography": {"path": "geography.zarr", "cache_dir": str(tmp_path / "static"), "fields": [
                 {"name": "sat_zenith", "geometry": "satellite_zenith"},
@@ -158,13 +160,17 @@ def raw_days(tmp_path_factory):
     grid = make_grid(load_feature_config(config(shared)))
     lat, lon = grid_latlon(grid)
     at = lambda r, c: (float(lat[r, c]), float(lon[r, c]))  # noqa: E731
+    # Events 1/8 cell east of a cell centre: GLM's pixel here is 2.005 x 1.62 cells (glmtools' table), so a
+    # pixel covers its cell, 0.627 of the next one east and 0.377 west, and 0.31 of the rows either side;
+    # on the 2 km grid every partial share is likewise at least 0.12 from the 0.5 that rounding turns on
+    px = lambda r, c: scan_latlon(grid, grid.x()[c] + grid.coarsen * grid.x_step / 8, grid.y()[r])  # noqa: E731
     flashes1 = [
-        (T1 + 7 * MIN, at(5, 5), [at(5, 5)] * 3 + [at(5, 6)] * 2),  # A: footprint (5,5) and (5,6)
-        (T1 + 12 * MIN, at(10, 10), [at(5, 6), at(10, 10)]),        # B: footprint (5,6) and (10,10)
+        (T1 + 7 * MIN, at(5, 5), [px(5, 5)] * 3 + [px(5, 7)] * 2),  # A: pixels at (5,5) and (5,7), two GLM pixels apart
+        (T1 + 12 * MIN, at(10, 10), [px(5, 7), px(10, 10)]),        # B: pixels at (5,7) and (10,10)
     ]
     flashes2 = [
-        (T1 + NS_DAY - 10**9, at(7, 7), [at(7, 7)]),                # D: starts before midnight, in day 2's first file
-        (T1 + NS_DAY + 3 * MIN, at(3, 3), [at(3, 3)]),              # C: just after midnight
+        (T1 + NS_DAY - 10**9, at(7, 7), [px(7, 7)]),                # D: starts before midnight, in day 2's first file
+        (T1 + NS_DAY + 3 * MIN, at(3, 3), [px(3, 3)]),              # C: just after midnight
     ]
     cov2 = np.ones(4320)
     cov2[6 * 180 : 7 * 180] = 0  # no GLM data 06:00-07:00 on day 2
@@ -183,6 +189,22 @@ def built(tmp_path, raw_days):
 
 def cells(mask):
     return {tuple(int(v) for v in rc) for rc in np.argwhere(mask)}
+
+
+def scan_latlon(grid, x, y):
+    """The (lat, lon) GLM would report for scan angles (x, y) on the grid's ellipsoid."""
+    from pyproj import CRS, Transformer
+
+    from goes_downloader.crop import geos_crs
+
+    h = float(grid.projection["perspective_point_height"])
+    lon, lat = Transformer.from_crs(geos_crs(grid.projection), CRS.from_epsg(4326), always_xy=True).transform(x * h, y * h)
+    return float(lat), float(lon)
+
+
+def plus(points):
+    """Cells within 1 cell (the radius-1 disk) of any of `points`."""
+    return {(r + dr, c + dc) for r, c in points for dr, dc in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1))}
 
 
 def test_grid_is_blocks_of_the_finest_product(built):
@@ -257,17 +279,73 @@ def test_flash_centroids_footprints_and_labels(built, tmp_path):
     # 00:15 slot, issue 00:20: flashes of [00:05, 00:20) are A and B
     assert cells(F["flash_count"][1] > 0) == {(5, 5), (10, 10)}
     ext = F["flash_extent"][1]
-    assert cells(ext > 0) == {(5, 5), (5, 6), (10, 10)} and ext[5, 6] == 2 and ext[5, 5] == 1  # A's 3 events count once
-    assert F["flash_extent"][:].sum() == 4  # the orphan event at (12, 15) is in no footprint
-    np.testing.assert_array_equal(F["features"][1, 5], ext.astype(float))  # fed15 = the same window
+    # Row 5: A covers 0.377 of (5,4), (5,5) to (5,7) wholly -- (5,6) by both its pixels, but once -- and 0.627
+    # of (5,8); B adds (5,7) and 0.627 of (5,8) through the pixel they share, and 0.377 of (5,6). Rows 4 and 6
+    # get 0.31 of (4,7) from each, 0.62 together: a share no single flash rounds up to. A's three events at
+    # (5,5) are one pixel. The orphan event at (12, 15) is in no footprint.
+    assert cells(ext > 0) == {(5, 5), (5, 6), (5, 7), (5, 8), (4, 7), (6, 7), (10, 10), (10, 11)}
+    assert (ext[5, 5], ext[5, 6], ext[5, 7], ext[5, 8], ext[4, 7]) == (1, 1, 2, 1, 1)
+    assert F["flash_extent"][:].sum() == 9
+    # fed15 is the same window's density before rounding
+    np.testing.assert_array_equal(np.floor(F["features"][1, 5] + 0.5), ext.astype(float))
+    assert abs(F["features"][1, 5][5, 8] - 2 * 0.627) < 0.01 and abs(F["features"][1, 5][4, 7] - 0.62) < 0.01
     # Issue 00:05: extent within 1 cell in the next 30 min; centroids in the next 15 min
-    disk = {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)}
-    want = {(r + dr, c + dc) for r, c in {(5, 5), (5, 6), (10, 10)} for dr, dc in disk}
-    assert cells(F["labels"][0, 0] == 1) == want
+    assert cells(F["labels"][0, 0] == 1) == plus(cells(ext > 0))
     assert cells(F["labels"][0, 1] == 1) == {(5, 5), (10, 10)}
     # Issue 23:50: the window runs into day 2, which holds D (23:59:59) and C (00:03)
-    assert cells(F["labels"][95, 0] == 1) == {(r + dr, c + dc) for r, c in {(7, 7), (3, 3)} for dr, dc in disk}
+    assert cells(F["labels"][95, 0] == 1) == plus({(7, 7), (7, 8), (3, 3), (3, 4)})
     assert cells(F["labels"][95, 1] == 1) == {(7, 7), (3, 3)}  # [23:50, 00:05): D and C
+
+
+def test_lightningcast_label_is_the_peak_one_minute_density_on_the_2km_pixels(built, tmp_path):
+    cfg, grid = built
+    build_day(cfg, grid, DAY1)
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
+    assert list(F["label_fine"][:]) == ["lc60"] and list(F["label"][:]) == ["ext30", "cen15"]
+    assert F["labels_fine"].shape == (96, 1, 2 * grid.ny, 2 * grid.nx) and F.attrs["fine_grid"]["coarsen"] == 1
+    np.testing.assert_allclose(F["x_fine"][:].reshape(-1, 2).mean(axis=1), F["x"][:])  # 2 x 2 in each 4 km cell
+    # Issue 00:05, window [00:00, 01:00) from the scan's slot: A (00:07) and B (00:12) in different minutes.
+    # On 2 km pixels a GLM pixel covers 4.01 x 3.24: whole columns, 0.754 of the one west, 0.254 east, 0.62 of
+    # the rows above and below
+    a = {(r, c) for r in (10, 11) for c in range(9, 17)} | {(r, c) for r in (9, 12) for c in range(10, 17)}
+    b = ({(r, c) for r in (10, 11) for c in range(13, 17)} | {(r, c) for r in (9, 12) for c in range(14, 17)}
+         | {(r, c) for r in (20, 21) for c in range(19, 23)} | {(r, c) for r in (19, 22) for c in range(20, 23)})
+    lc = F["labels_fine"][:, 0]
+    assert cells(lc[0] == 1) == a | b
+    # (10, 17) has 0.254 from each flash: 0.51 over the hour, but each minute's density rounds to 0
+    assert lc[0][10, 17] == 0
+    assert not (lc[1] == 1).any()  # issue 00:20, window [00:15, 01:15): after both flashes
+
+
+def test_pixel_cover_spreads_pixels_by_area_once_per_flash():
+    from goes_downloader.features.glm import pixel_cover, round_density
+    from goes_downloader.features.grid import TargetGrid
+
+    # Cell (r, c) spans x in [c - 0.5, c + 0.5) and y in (-(r + 0.5), -(r - 0.5)]
+    g = TargetGrid("p", 1.0, 1.0, 1, 0.0, 1.0, 0.0, -1.0, 0, 0, 4, 5, {})
+    rect = lambda c0, c1, r0, r1: (c0 - 0.5, c1 - 0.5, -(r1 - 0.5), -(r0 - 0.5))  # noqa: E731  cells [c0, c1) x [r0, r1)
+    pixels = [  # (flash, minute, rectangle)
+        (0, 0, rect(1, 2.5, 1, 2)),     # (1,1) wholly, half of (1,2)
+        (0, 0, rect(2, 3, 1, 2)),       # the same flash covers (1,2) again: still once
+        (1, 0, rect(2.75, 3.5, 1, 2)),  # another flash in the same minute: a quarter of (1,2), half of (1,3)
+        (2, 3, rect(0, 1, 0.5, 1.5)),   # minute 3: half of (0,0) and of (1,0)
+    ]
+    flash, minute = np.array([p[0] for p in pixels]), np.array([p[1] for p in pixels])
+    west, east, south, north = (np.array([p[2][k] for p in pixels]) for k in range(4))
+    m, cell, cover = pixel_cover(g, flash, minute, west, east, south, north)
+    got = {(int(mm), divmod(int(c), 5)): round(float(v), 6) for mm, c, v in zip(m, cell, cover)}
+    assert got == {(0, (1, 1)): 1.0, (0, (1, 2)): 1.25, (0, (1, 3)): 0.5, (3, (0, 0)): 0.5, (3, (1, 0)): 0.5}
+    assert list(m) == sorted(m)
+    np.testing.assert_array_equal(round_density(np.array([0.49, 0.5, 1.25, 1.5])), [0, 1, 1, 2])
+
+
+def test_pixel_corners_follow_glmtools_table():
+    from goes_downloader.features.glm import PixelCorners
+
+    w, e, s, n = PixelCorners().rectangles(np.array([0.0, 0.1]), np.array([0.0, 0.1]))
+    assert abs((e - w)[0] - 224e-6) < 1e-6 and abs((n - s)[0] - 224e-6) < 1e-6  # 8 km at nadir
+    assert (e - w)[1] < 210e-6 and (n - s)[1] < 210e-6  # smaller in angle towards the edge
+    assert abs(w[0] + e[0]) < 1e-9 and abs(s[0] + n[0]) < 1e-9
 
 
 def test_glm_gaps_make_labels_unknown(built, tmp_path):
@@ -278,6 +356,23 @@ def test_glm_gaps_make_labels_unknown(built, tmp_path):
     assert (labels[23, 0] == 255).all()  # issue 05:50: 06:00-06:20 of its 30 min are missing
     assert (labels[22, 0] == 255).all() and (labels[21, 0] != 255).all()  # 05:35 misses 5 of 30 min; 05:20 none
     assert np.isnan(F["features"][24, 5]).all()  # fed15 during the gap is missing, not zero
+    fine = F["labels_fine"][:, 0]
+    assert (fine[21] == 255).all() and (fine[20] != 255).all()  # [05:15, 06:15) misses 15 of 60 min; [05:00, 06:00) none
+
+
+def test_label_resolutions_must_nest_in_the_grid(built, tmp_path):
+    from goes_downloader.features.build import fine_label_grid
+
+    cfg, grid = built
+    for res in (3, 8):
+        bad = load_feature_config(config(tmp_path, labels=[{"name": "l", "end_minutes": 30, "resolution_km": res}]))
+        with pytest.raises(ValueError, match="do not nest"):
+            fine_label_grid(bad, grid)
+    two = load_feature_config(config(tmp_path, labels=[{"name": "l", "end_minutes": 30, "resolution_km": 2},
+                                                       {"name": "m", "end_minutes": 30, "resolution_km": 1}]))
+    with pytest.raises(ValueError, match="one resolution besides"):
+        fine_label_grid(two, grid)
+    assert fine_label_grid(load_feature_config(config(tmp_path, labels=[{"name": "l", "end_minutes": 30, "resolution_km": 4}])), grid) is None
 
 
 def test_neighbour_days_decide_completeness(built, tmp_path):
@@ -435,6 +530,9 @@ def test_glm_mapping_round_trips_through_the_grid(built):
     ({"channels": [{"name": "a", "product": "p2"}, {"name": "x", "expr": "y + 1"}, {"name": "y", "expr": "lag(x, 5)"}]}, "cycle"),
     ({"channels": [{"name": "a", "product": "p2", "aggregaton": "min"}]}, "unknown keys"),
     ({"labels": [{"name": "l", "end_minutes": 30, "source": "density"}]}, "source must be"),
+    ({"labels": [{"name": "l", "start_minutes": -10, "end_minutes": 30}]}, "scan's own slot"),
+    ({"labels": [{"name": "l", "end_minutes": 30, "fed_minutes": 7}]}, "dividing the 30-minute window"),
+    ({"labels": [{"name": "l", "end_minutes": 30, "fed_minutes": 1, "source": "centroid"}]}, "needs source"),
     ({"grid": {"resolution_km": 4, "bound": None}}, "unknown keys"),
     ({"geography": {"fields": [{"name": "d", "borders": "distance_km", "file": "b.geojson"}]}}, "distance_km needs countries"),
     ({"compression": {"codec": "snappy"}}, "codec must be one of"),
@@ -472,7 +570,7 @@ def test_flash_just_before_midnight_counts_without_labels(built, tmp_path):
     nolabels = load_feature_config(config(tmp_path, labels=[], time_step_minutes=5, output_root_dir=str(tmp_path / "nolabels")))
     build_day(nolabels, grid, DAY1)
     F = zarr.open_consolidated(str(tmp_path / "nolabels/2025/2025152.zarr"), mode="r")
-    assert cells(F["flash_count"][287] > 0) == {(7, 7)} and cells(F["flash_extent"][287] > 0) == {(7, 7)}
+    assert cells(F["flash_count"][287] > 0) == {(7, 7)} and cells(F["flash_extent"][287] > 0) == {(7, 7), (7, 8)}
 
 
 def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives_or_it_cannot_be_read(built, tmp_path):

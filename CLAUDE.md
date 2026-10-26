@@ -217,11 +217,20 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   angle. A flash belongs to its file's day store but counts at its own first-event time: one that
   starts just before midnight is in the next day's first file. So `GlmTimeline` reads the files that
   start within 20 s of the range (`FILE_MARGIN_NS`), whichever day holds them, and only their events
-  (offsets from `glm/files/n_events`). Footprints are distinct (flash, cell) pairs.
-  Event `flash_index` is -1 for orphans (no flash in their file): mask it before indexing flashes,
-  or -1 silently picks the day's last flash.
-- Feature inputs end at the issue time (slot start + 5 min); label windows start there. Labels are
-  255 where GLM covered less than `glm.min_coverage`; GLM channels are NaN likewise.
+  (offsets from `glm/files/n_events`). Event `flash_index` is -1 for orphans (no flash in their
+  file): mask it before indexing flashes, or -1 silently picks the day's last flash.
+- **A footprint is pixels, never event points.** An event marks the centre of a GLM pixel 1.3–2 cells
+  across; putting each in the one cell under it leaves a lattice of holes that the labels, the `fed`
+  input and so the model all learn (README, "Flash footprints"). `pixel_cover` spreads glmtools'
+  pixel rectangles by area, one flash at most once per cell, and works per minute so a label can take
+  1-minute densities. Rounding happens once, over the window being reported: `sums("extent")` is the
+  unrounded density (it adds up over slots), `extent_peak` the rounded one. Rounding per slot and then
+  summing gives a different answer. The method is recorded in the store's `glm.footprint`, so stores
+  built before it can be told apart.
+- Feature inputs end at the issue time (slot start + 5 min); label windows start there, or at the
+  scan's own slot for a label with `start_minutes` -5, which is for evaluation only. Labels are 255
+  where GLM covered less than `glm.min_coverage`; GLM channels are NaN likewise. A label with a finer
+  `resolution_km` goes to `labels_fine`; its cells must nest in the grid's (`TargetGrid.finer`).
 - `flash_count` and `flash_extent` are written in full with `fill_value=None`; `features` uses NaN and
   `labels` 255. A feature day is complete only if every raw day it read inside the download range is;
   days next to the range's ends are rebuilt once a missing neighbour arrives (`raw_neighbour_arrived`).

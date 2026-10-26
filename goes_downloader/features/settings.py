@@ -49,12 +49,14 @@ class ChannelSpec:
 @dataclass(frozen=True)
 class LabelSpec:
     name: str
-    start_slots: int
+    start_slots: int  # from the issue time; down to minus one slot, the scan's own
     end_slots: int
     min_flashes: int
     radius_cells: float
     source: str = "extent"
     description: str = ""
+    resolution_km: Optional[float] = None  # None: the grid's cells; else finer cells nesting in them
+    fed_minutes: Optional[int] = None  # None: one flash-extent density over the window; else its peak over windows this long
 
 
 @dataclass(frozen=True)
@@ -114,7 +116,8 @@ CHANNEL_KEYS = {
     "solar": {"solar"},
     "expr": {"expr"},
 }
-LABEL_KEYS = {"name", "description", "start_minutes", "end_minutes", "min_flashes", "radius_cells", "source"}
+LABEL_KEYS = {"name", "description", "start_minutes", "end_minutes", "min_flashes", "radius_cells", "source", "resolution_km",
+              "fed_minutes"}
 GEOGRAPHY_FIELD_KEYS = {"name", "description", "geometry", "url", "file", "variable", "aggregation", "clip", "scale", "offset",
                         "borders", "countries", "within"}
 FEATURE_KEYS = {"output_root_dir", "start_date_utc", "end_date_utc", "overwrite_existing", "max_workers", "grid",
@@ -207,7 +210,13 @@ def parse_label(i: int, l: Any) -> LabelSpec:
     if not isinstance(name, str) or not name:
         raise ValueError(f"{where}.name must be a non-empty string")
     where = f"label {name!r}"
-    start = minutes_to_slots(l.get("start_minutes", 0), f"{where}: start_minutes")
+    # Down to the scan's own slot, which overlaps the inputs: for matching a definition anchored at the
+    # scan time (LightningCast's), not for training
+    start_minutes = l.get("start_minutes", 0)
+    if start_minutes == -SLOT_MINUTES:
+        start = -1
+    else:
+        start = minutes_to_slots(start_minutes, f"{where}: start_minutes (or -{SLOT_MINUTES}, the scan's own slot)")
     end = minutes_to_slots(l.get("end_minutes"), f"{where}: end_minutes", positive=True)
     if end <= start:
         raise ValueError(f"{where}: end_minutes must be greater than start_minutes")
@@ -220,7 +229,18 @@ def parse_label(i: int, l: Any) -> LabelSpec:
     source = l.get("source", "extent")
     if source not in LABEL_SOURCES:
         raise ValueError(f"{where}: source must be one of {LABEL_SOURCES}, got {source!r}")
-    return LabelSpec(name, start, end, min_flashes, float(radius), source, str(l.get("description", "")))
+    resolution_km = l.get("resolution_km")
+    if resolution_km is not None and (isinstance(resolution_km, bool) or not isinstance(resolution_km, (int, float)) or resolution_km <= 0):
+        raise ValueError(f"{where}: resolution_km must be a positive number")
+    fed_minutes = l.get("fed_minutes")
+    if fed_minutes is not None:
+        window = (end - start) * SLOT_MINUTES
+        if isinstance(fed_minutes, bool) or not isinstance(fed_minutes, int) or fed_minutes < 1 or window % fed_minutes:
+            raise ValueError(f"{where}: fed_minutes must be a positive number of minutes dividing the {window}-minute window")
+        if source != "extent":
+            raise ValueError(f"{where}: fed_minutes needs source \"extent\"")
+    return LabelSpec(name, start, end, min_flashes, float(radius), source, str(l.get("description", "")),
+                     None if resolution_km is None else float(resolution_km), fed_minutes)
 
 
 def parse_geography_field(i: int, f: Any) -> GeographySpec:

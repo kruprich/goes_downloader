@@ -355,7 +355,8 @@ It takes its values from exactly one of these sources:
     products such as TPW and DSI.
 - **`glm`**: per 5-minute slot and cell, one of:
   - `count`: flash centroids
-  - `extent`: flashes with an event in the cell (flash-extent density)
+  - `extent`: flashes over the cell, each weighted by the share of the cell its GLM pixels cover
+    (flash-extent density before rounding; see "Flash footprints")
   - `energy_fj`
   - `area_km2`
 
@@ -384,13 +385,67 @@ Each entry of `features.labels` is:
 - 0 where none did
 - 255 (unknown) where GLM covered less than `glm.min_coverage` (0.95) of the window
 
-With `"source": "extent"` (the default), a flash counts in every cell one of its events fell in.
-With `"centroid"`, it counts only in the cell of its centroid. Orphan events belong to no flash and
-are left out.
+With `"source": "extent"` (the default), flashes are counted by flash-extent density: the window's
+density, rounded, in each cell (see "Flash footprints"). With `"centroid"`, a flash counts only in
+the cell of its centroid. Orphan events belong to no flash and are left out.
+
+Three options exist for matching another definition rather than for training:
+
+- `start_minutes` may be -5, which starts the window at the scan's own slot instead of the issue
+  time. That window overlaps the inputs.
+- `fed_minutes` takes the density in windows of that many minutes and counts the largest, instead
+  of one density over the whole window.
+- `resolution_km` puts the label on finer cells that nest in the grid's (2 km on the 4 km grid).
+  Such labels go to `labels_fine`, apart from `labels`; all of them must share one resolution.
+
+The example config's `lightningcast_60min` uses all three to reproduce LightningCast's truth
+(Cintineo et al. 2022): at least one flash in a 1-minute glmtools flash-extent density of the 2 km
+pixel, within 60 minutes of the scan. Its window starts at the slot rather than the scan itself, a
+difference of 77 s in mode 6.
 
 `flash_count` (centroids) and `flash_extent` (footprints) hold the flashes in each time step's
 window ending at the issue time. From these you can derive other labels, persistence baselines and
 "new lightning" scores later.
+
+#### Flash footprints
+
+A GLM event is one lit pixel of GLM's sensor, 8 km across at nadir and 8–15 km over the grid,
+reported at the pixel's centre. A footprint made of the cells under those centres is a lattice: GLM's
+pixels are 1.3–2 cells of 4 km apart (more across the north of the grid than the south), so on
+2026-07-15 only 40% of the cells in the busiest 60 x 60 area were touched all day, and 13% of the
+cells labelled lightning had an unlit cell boxed in by lit ones.
+
+Footprints are therefore built as glmtools builds flash-extent density, the method behind
+LightningCast's truth and NOAA's gridded GLM products: each event's pixel is rebuilt from glmtools'
+table of pixel-corner offsets (`goes_downloader/features/glm_pixel_corners.npz`, see the licence
+file beside it), events of one flash closer than 28 µrad are one pixel, and the pixel is spread onto
+the cells by area. A cell's density over a window is the sum of those shares over the window's
+flashes, rounded half up; one flash covers a cell at most once. `fed`-type channels keep the sum
+before rounding, so it adds up exactly over any window; `flash_extent` and the labels round.
+
+What this was checked against, on 2026-07-15 (Kevin's workstation, 2026-10-26):
+
+- Holes in the 30-minute label fell from 13.2% to 0.04% of lit cells, and the busiest area's daily
+  coverage rose from 40% to 97%. The label's base rate rose from 0.0136 to 0.0190.
+- The table is GOES-16's, which glmtools uses for every satellite, and it fits GOES-19: the spacing of
+  GOES-19's pixels, measured on four days of 2026 (04-10, 05-30, 07-15, 08-18), is 0.996 of the table's
+  pixel size along each axis, within 0.5% in every ninth of the grid. Measure it after merging each
+  pixel's repeated positions (below): without that, the nearest neighbour is often a repeat of the
+  neighbouring pixel, and the spacing comes out 5–6% short.
+- GLM reports one pixel at several positions a step or two of NOAA's lat/lon packing apart (5.6 µrad
+  each) as the navigation drifts: 177k distinct positions over a day are 31k pixels. glmtools' 28 µrad
+  bins leave some of a flash's repeats as separate pixels. Merging a flash's positions closer than
+  40 µrad instead (real pixels are at least 145 µrad apart) changed the 60-minute label's base rate from
+  0.0248 to 0.0247, the LightningCast label's not at all, and the footprint area by 1.5%, so the
+  footprints keep glmtools' bins, as LightningCast's truth did.
+- Footprint area is 1.17 times GLM's own `flash_area` over the day's grid, and the difference is in
+  `flash_area`. NOAA's area per pixel (`group_area` over the group's events: a group is one 2 ms frame,
+  so it holds no repeats) barely varies, 66–77 km² (median 72.6) over 115k groups on 2026-07-15
+  20:00–20:23, while the ground area of the pixels, which tile the field at the measured spacing, grows
+  away from nadir from 69 to 114 km². The two agree near the middle of the grid (0.97 at 0.06–0.08 rad
+  from the sub-satellite point) and part towards its northern edge (0.84 at 0.10–0.13 rad). So
+  `flash_area` is not a ground area there, and the `area_km2` channel, built from it, inherits that.
+- A day builds in 26–28 s (2026-07-15), with workers peaking at 1.8 GB.
 
 - `glm.quality_flags` (`null` = all) filters flashes. Flag 3 marks large flashes, not false ones.
 - `glm.lightning_ellipsoid_km` (14/6) is the ellipsoid GLM geolocates flashes on. Reading their

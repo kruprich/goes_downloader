@@ -446,12 +446,13 @@
       {"name": "cape", "product": "dsi_cape", "fill_gaps_minutes": 60, "description": "J/kg; clear sky only, last value kept up to 60 min"},
       {"name": "lifted_index", "product": "dsi_li", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
       {"name": "k_index", "product": "dsi_ki", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
-      {"name": "fed", "glm": "extent", "output": false, "description": "flashes touching each cell in the 5-min slot (helper)"},
-      {"name": "fed_past_15min", "expr": "sum_past(fed, 15)", "description": "flash-extent density: flashes touching the cell in the 15 min before the issue time"}
+      {"name": "fed", "glm": "extent", "output": false, "description": "flashes over each cell in the 5-min slot, each weighted by the share of the cell its GLM pixels cover (helper)"},
+      {"name": "fed_past_15min", "expr": "sum_past(fed, 15)", "description": "flash-extent density (glmtools' method, before rounding): flashes over the cell in the 15 min before the issue time, each weighted by the share of the cell its GLM pixels cover"}
     ],
     "labels": [
       {"name": "lightning_next_30min", "start_minutes": 0, "end_minutes": 30, "radius_cells": 1, "source": "extent", "description": "a flash footprint within 1 cell in the 30 min after the issue time"},
-      {"name": "lightning_next_60min", "start_minutes": 0, "end_minutes": 60, "radius_cells": 1, "source": "extent", "description": "a flash footprint within 1 cell in the 60 min after the issue time"}
+      {"name": "lightning_next_60min", "start_minutes": 0, "end_minutes": 60, "radius_cells": 1, "source": "extent", "description": "a flash footprint within 1 cell in the 60 min after the issue time"},
+      {"name": "lightningcast_60min", "start_minutes": -5, "end_minutes": 55, "resolution_km": 2, "fed_minutes": 1, "radius_cells": 0, "source": "extent", "description": "LightningCast's truth (Cintineo et al. 2022, Weather and Forecasting 37, 1239): a 1-minute flash-extent density of at least 1 flash in the 2 km pixel within 60 min of the scan's slot; for evaluation only"}
     ],
     "geography": {
       "path": "geography.zarr",

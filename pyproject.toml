@@ -27,6 +27,9 @@ dev = ["pyflakes", "pytest"]
 [tool.setuptools.packages.find]
 include = ["goes_downloader*"]
 
+[tool.setuptools.package-data]
+"goes_downloader.features" = ["glm_pixel_corners.npz", "glm_pixel_corners_LICENSE.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

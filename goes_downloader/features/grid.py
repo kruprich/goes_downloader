@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -48,15 +48,35 @@ class TargetGrid:
     def y(self) -> np.ndarray:
         return self.y_origin + self._centres(self.row0, self.ny) * self.y_step
 
+    def fractional(self, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Scan angles (rad) -> (col, row) in cell units: cell (r, c) spans [c, c + 1) x [r, r + 1). Row grows southward."""
+        col = ((x - self.x_origin) / self.x_step + 0.5) / self.coarsen - self.col0
+        row = ((y - self.y_origin) / self.y_step + 0.5) / self.coarsen - self.row0
+        return col, row
+
     def cells_of(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         """Flat cell index for scan angles (rad); -1 outside the grid or off the Earth."""
-        col = np.floor(((x - self.x_origin) / self.x_step + 0.5) / self.coarsen) - self.col0
-        row = np.floor(((y - self.y_origin) / self.y_step + 0.5) / self.coarsen) - self.row0
+        col, row = self.fractional(x, y)
+        col, row = np.floor(col), np.floor(row)
         with np.errstate(invalid="ignore"):
             ok = np.isfinite(col) & np.isfinite(row) & (col >= 0) & (col < self.nx) & (row >= 0) & (row < self.ny)
         cells = np.full(np.shape(x), -1, dtype=np.int64)
         cells[ok] = row[ok].astype(np.int64) * self.nx + col[ok].astype(np.int64)
         return cells
+
+    def finer(self, resolution_km: float) -> "TargetGrid":
+        """
+        The same area in smaller cells of `resolution_km`, which must be a whole number of reference pixels
+        dividing this grid's cells, so each of these cells holds exactly factor x factor of the finer ones.
+        """
+        coarsen_f = resolution_km / self.reference_km
+        coarsen = int(round(coarsen_f))
+        if coarsen < 1 or abs(coarsen_f - coarsen) > 1e-6 or self.coarsen % coarsen:
+            raise ValueError(f"{resolution_km:g} km cells do not nest in the {self.resolution_km:g} km grid "
+                             f"(they must be a whole number of {self.reference_km:g} km {self.reference_product} pixels dividing it)")
+        f = self.coarsen // coarsen
+        return replace(self, resolution_km=resolution_km, coarsen=coarsen, row0=self.row0 * f, col0=self.col0 * f,
+                       ny=self.ny * f, nx=self.nx * f)
 
     def same_cells(self, other: "TargetGrid") -> bool:
         """The same cells: shape and scan-angle centres (to well under a pixel)."""

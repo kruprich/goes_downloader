@@ -24,7 +24,7 @@ from ..progress import format_duration, log
 from ..store import _write_array, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 from .expressions import Evaluator, make_plan
 from .geography import build_geography, geography_grid
-from .glm import SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
+from .glm import FOOTPRINT, SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
 from .grid import SourceFrame, SolarGeometry, TargetGrid, aggregate, grid_latlon, make_grid
 from .raw import EPOCH, RawTimeline, day_of_index
 from .settings import SLOT_MINUTES, ChannelSpec, FeatureConfig, LabelSpec, geography_store_path, load_feature_config
@@ -116,7 +116,23 @@ def channel_attrs(c: ChannelSpec) -> Dict[str, Any]:
 def label_attrs(l: LabelSpec) -> Dict[str, Any]:
     d = {"name": l.name, "start_minutes": l.start_slots * SLOT_MINUTES, "end_minutes": l.end_slots * SLOT_MINUTES,
          "min_flashes": l.min_flashes, "radius_cells": l.radius_cells, "source": l.source}
+    if l.resolution_km is not None:
+        d["resolution_km"] = l.resolution_km
+    if l.fed_minutes is not None:
+        d["fed_minutes"] = l.fed_minutes
     return {**d, "description": l.description} if l.description else d
+
+
+def is_fine(l: LabelSpec, grid: TargetGrid) -> bool:
+    return l.resolution_km is not None and abs(l.resolution_km - grid.resolution_km) > 1e-9
+
+
+def fine_label_grid(cfg: FeatureConfig, grid: TargetGrid) -> Optional[TargetGrid]:
+    """The finer grid of the labels whose resolution_km is not the grid's, or None. They must share one."""
+    res = sorted({l.resolution_km for l in cfg.labels if is_fine(l, grid)})
+    if len(res) > 1:
+        raise ValueError(f"labels may use one resolution besides the grid's {grid.resolution_km:g} km, not {res}")
+    return grid.finer(res[0]) if res else None
 
 
 def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, Any]:
@@ -138,12 +154,16 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     out_slots = list(range(s_day, s_day + SLOTS_PER_DAY, step))
     outputs = [c for c in cfg.channels if c.output]
 
+    fine = fine_label_grid(cfg, grid)
+    coarse_labels = [l for l in cfg.labels if not is_fine(l, grid)]
+    fine_labels = [l for l in cfg.labels if is_fine(l, grid)]
     glm: Optional[GlmTimeline] = None
     if cfg.uses_glm:
-        # Inputs from the lookback, flash windows ending at each issue time, label windows after it
-        glm_s0 = min(s0, s_day + 1 - step)
+        # Inputs from the lookback, flash windows ending at each issue time, label windows after it (or
+        # from the scan's own slot)
+        glm_s0 = min(s0, s_day + 1 - step, s_day + 1 + min((l.start_slots for l in cfg.labels), default=0))
         glm_s1 = out_slots[-1] + 1 + plan.lookahead
-        glm = GlmTimeline(cfg, grid, raw, glm_s0, max(glm_s1, s_day + SLOTS_PER_DAY))
+        glm = GlmTimeline(cfg, grid, raw, glm_s0, max(glm_s1, s_day + SLOTS_PER_DAY), fine)
 
     # --- store (built at *.tmp and moved into place when done)
     tmp_path = out_path + ".tmp"
@@ -162,7 +182,13 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         return a
 
     features = frames("features", [len(outputs)], cfg.dtype, np.nan, ["time", "channel", "y", "x"])
-    labels_arr = frames("labels", [len(cfg.labels)], np.uint8, LABEL_UNKNOWN, ["time", "label", "y", "x"]) if cfg.labels else None
+    labels_arr = frames("labels", [len(coarse_labels)], np.uint8, LABEL_UNKNOWN, ["time", "label", "y", "x"]) if coarse_labels else None
+    fine_arr = None
+    if fine is not None:
+        fine_arr = root.create_dataset("labels_fine", shape=(n_t, len(fine_labels), fine.ny, fine.nx),
+                                       chunks=(1, len(fine_labels), fine.ny, fine.nx), dtype=np.uint8,
+                                       fill_value=LABEL_UNKNOWN, compressor=compressor, overwrite=True)
+        fine_arr.attrs.update({"_ARRAY_DIMENSIONS": ["time", "label_fine", "y_fine", "x_fine"]})
     # Every slot is written, so no fill value: zarr's default of 0 would make xarray read 0 flashes as missing
     flash_arr = frames("flash_count", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
     extent_arr = frames("flash_extent", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
@@ -260,22 +286,28 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         if glm is not None:
             a = s + 1 - step
             flash_arr[k] = np.minimum(glm.sums(a, s + 1).reshape(shape), u16).astype(np.uint16)
-            extent_arr[k] = np.minimum(glm.sums(a, s + 1, "extent").reshape(shape), u16).astype(np.uint16)
+            extent_arr[k] = np.minimum(glm.extent_peak(a, s + 1, step * SLOT_MINUTES).reshape(shape), u16).astype(np.uint16)
             glm_coverage[k] = glm.coverage_mean(a, s + 1)
             n_flashes += glm.n_flashes(a, s + 1)
-        if labels_arr is not None:
-            out = np.empty((len(cfg.labels), *shape), dtype=np.uint8)
-            for i, l in enumerate(cfg.labels):
+        for arr, these, on_fine in ((labels_arr, coarse_labels, False), (fine_arr, fine_labels, True)):
+            if arr is None:
+                continue
+            lshape = (fine.ny, fine.nx) if on_fine else shape
+            out = np.empty((len(these), *lshape), dtype=np.uint8)
+            for i, l in enumerate(these):
                 a, b = s + 1 + l.start_slots, s + 1 + l.end_slots
                 if glm.coverage_mean(a, b) < cfg.glm_min_coverage:
                     out[i] = LABEL_UNKNOWN
                     continue
-                counts = glm.sums(a, b, "extent" if l.source == "extent" else "count").reshape(shape)
-                hits = neighbourhood_sum(counts, label_offsets[l.name]) >= l.min_flashes
+                if l.source == "extent":
+                    counts = glm.extent_peak(a, b, l.fed_minutes or (b - a) * SLOT_MINUTES, on_fine)
+                else:
+                    counts = glm.sums(a, b, "count")
+                hits = neighbourhood_sum(counts.reshape(lshape), label_offsets[l.name]) >= l.min_flashes
                 out[i] = hits
                 label_counts[l.name][0] += hits.size
                 label_counts[l.name][1] += int(hits.sum())
-            labels_arr[k] = out
+            arr[k] = out
 
     # --- coordinates, per-time arrays, attrs
     slot_ns = np.array(out_slots, dtype=np.int64) * SLOT_NS
@@ -286,8 +318,12 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     _write_array(root, "lat", lat, ["y", "x"], units="degrees_north")
     _write_array(root, "lon", lon, ["y", "x"], units="degrees_east")
     _write_array(root, "channel_valid_fraction", valid_fraction, ["time", "channel"])
-    if cfg.labels:
-        _write_array(root, "label", np.array([l.name for l in cfg.labels]), ["label"])
+    if coarse_labels:
+        _write_array(root, "label", np.array([l.name for l in coarse_labels]), ["label"])
+    if fine is not None:
+        _write_array(root, "label_fine", np.array([l.name for l in fine_labels]), ["label_fine"])
+        _write_array(root, "x_fine", fine.x(), ["x_fine"], units="rad", long_name="ABI fixed grid E/W scan angle")
+        _write_array(root, "y_fine", fine.y(), ["y_fine"], units="rad", long_name="ABI fixed grid N/S scan angle")
     if glm is not None:
         _write_array(root, "glm_coverage", glm_coverage, ["time"])
 
@@ -306,13 +342,14 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "complete": complete,
             "raw_days": raw_days,
             "grid": asdict(grid),
+            **({"fine_grid": asdict(fine)} if fine is not None else {}),
             "time_step_minutes": step * SLOT_MINUTES,
             "issue_offset_minutes": SLOT_MINUTES,
             "channels": [channel_attrs(c) for c in outputs],
             "helper_channels": [channel_attrs(c) for c in cfg.channels if not c.output],
             "labels": [label_attrs(l) for l in cfg.labels],
             "glm": {"quality_flags": cfg.glm_quality_flags, "lightning_ellipsoid_km": cfg.glm_ellipsoid_km,
-                    "min_coverage": cfg.glm_min_coverage, "extent": glm is not None},
+                    "min_coverage": cfg.glm_min_coverage, "extent": glm is not None, "footprint": FOOTPRINT},
             "geography_path": cfg.geography_path,
             "channel_stats": {name: st.as_dict() for name, st in stats.items()},
             "label_stats": {name: {"n_known": n, "n_positive": p} for name, (n, p) in label_counts.items()},
@@ -358,6 +395,7 @@ def run_build(cfg: FeatureConfig) -> None:
     days = [d.date().isoformat() for d in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc)]
     grid = make_grid(cfg)
     check_geography(cfg, grid)
+    fine_label_grid(cfg, grid)  # a label resolution that doesn't nest fails here, not in every worker
     plan = make_plan(cfg.channels, [l.end_slots for l in cfg.labels])
     outputs = [c.name for c in cfg.channels if c.output]
     lat, lon = grid_latlon(grid)

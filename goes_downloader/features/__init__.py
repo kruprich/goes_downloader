@@ -22,9 +22,12 @@ Time: slot t holds the ABI scan starting in [t, t+5 min). The issue time is the 
 the middle of the slot.
 
 GLM: "count" channels and centroid labels use each flash's centroid. "extent" channels and labels use its
-footprint: every cell one of its events fell in (the flash-extent density of LightningCast's labels).
-Orphan events (flash_index -1 in the raw store: NOAA's file lacks their group or flash) are skipped.
-A label with min_flashes > 1 counts flash-cell hits within its radius.
+footprint, built as glmtools builds flash-extent density (LightningCast's truth): each event's GLM pixel,
+rebuilt from glmtools' pixel-corner table, spread onto the cells by area, each flash at most once per
+cell. "extent" channels hold that density before rounding; flash_extent and extent labels round it half
+up over their window (README, "Flash footprints"). Orphan events (flash_index -1 in the raw store: NOAA's
+file lacks their group or flash) are skipped. A label with min_flashes > 1 counts flash-cell hits within
+its radius.
 
 Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
   time[time]                           datetime64 slot start, every time_step_minutes
@@ -33,9 +36,12 @@ Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
                                        chunk_yx), compressed with Blosc features.compression
   labels[time, label, y, x]            uint8 1 = lightning in the window, 0 = none, 255 = unknown (GLM covered
                                        less than glm.min_coverage of the window)
+  labels_fine[time, label_fine, y_fine, x_fine]   the same for labels with a finer resolution_km (for
+                                       evaluation), each grid cell holding factor x factor of their cells;
+                                       label_fine[label_fine], x_fine[x_fine], y_fine[y_fine] as below
   flash_count[time, y, x]              uint16 flashes (quality-filtered) whose centroid is in the cell and whose
                                        first event is in [issue - time_step, issue)
-  flash_extent[time, y, x]             uint16 flashes in the same window with an event in the cell (with GLM
+  flash_extent[time, y, x]             uint16 flash-extent density over the same window, rounded (from GLM
                                        events); these two let other labels, baselines and scores be derived later
   glm_coverage[time]                   float32 fraction of that window covered by GLM files
   channel_valid_fraction[time, channel] float32 fraction of cells that are not NaN
@@ -48,7 +54,8 @@ Root attrs:
   never will be, so it counts as unavailable instead: its slots are NaN / unknown. Incomplete days are
   rebuilt from scratch on the next run.
   channel_stats / label_stats: per-day sums for normalisation and class balance (combine with --stats).
-  grid, channels, helper_channels, labels, glm, time_step_minutes, geography_path: how the store was built.
+  grid, fine_grid (with labels_fine), channels, helper_channels, labels, glm (with the footprint method),
+  time_step_minutes, geography_path: how the store was built.
 
 The geography store (<output_root_dir>/geography.zarr, one for all days) is described in geography.py.
 """

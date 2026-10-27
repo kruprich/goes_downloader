@@ -2,6 +2,7 @@
 goes_raw*/
 goes_features*/
 goes_static/
+mrms_raw*/
 goes_abi_glm/
 *.zarr
 *.zarr.tmp

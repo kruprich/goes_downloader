@@ -12,8 +12,11 @@ lightning-prediction training dataset: it deliberately does **no** time binning,
 quality filtering. That is the feature step (`goes_downloader/features/`, run by
 `build_geography.py` once and `build_features.py`), which turns the raw stores into CNN inputs and
 lightning labels on one grid, one feature store per day, for the model in the separate
-`goes_lightning_model` repository. `report.py` summarizes what the raw stores hold. The docstrings
-of `goes_downloader/store.py` (raw stores), `goes_downloader/features/__init__.py` (feature stores)
+`goes_lightning_model` repository. `report.py` summarizes what the raw stores hold. A separate
+downloader (`download_mrms.py` → `goes_downloader/mrms.py`, the config's `mrms` section) mirrors MRMS
+radar mosaics from `s3://noaa-mrms-pds` into their own raw day stores the same way; the feature step
+doesn't read them yet. The docstrings of `goes_downloader/store.py` (raw stores),
+`goes_downloader/mrms.py` (MRMS stores), `goes_downloader/features/__init__.py` (feature stores)
 and `goes_downloader/features/geography.py` (the geography store) are the authoritative layouts;
 README.md covers setup, usage, reading, assumptions about the source data, and measured sizes and
 speeds.
@@ -28,12 +31,13 @@ certificates: prefix anything that touches the network with `SSL_CERT_FILE=/etc/
 ```bash
 .venv/bin/python -m pip install -e ".[dev]" -c requirements.lock   # without [dev] to only run it
 .venv/bin/python download_raw.py --config config.json     # a full run; prints a data report at the end
+.venv/bin/python download_mrms.py --config config.json    # MRMS radar day stores (about 40 s a day)
 .venv/bin/python report.py --config config.json           # which days are complete / need attention
 .venv/bin/python build_geography.py --config config.json  # once: static fields on the feature grid
 .venv/bin/python build_features.py --config config.json   # feature stores; --start/--end/--workers/--stats
 .venv/bin/python -m pytest                                # offline tests, about 10 s
 .venv/bin/python -m pytest --network                      # + real files and the test hour (~0.5 GB, ~30 s)
-.venv/bin/python -m pyflakes goes_downloader tests download_raw.py report.py build_features.py build_geography.py
+.venv/bin/python -m pyflakes goes_downloader tests download_raw.py download_mrms.py report.py build_features.py build_geography.py
 ```
 
 `pyproject.toml` holds the package definition, `requires-python`, the direct dependencies and the
@@ -58,8 +62,12 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   listing pages through continuation tokens.
 - `test_decode.py`: rounding of packed values; linking GLM events to flashes and its errors.
 - `test_store.py`: GLM tables (flash order, event links after sorting, counts, coverage).
-- `test_config.py`: config validation and IR-band precision; `crop_slice`; the three entry
-  scripts importing nothing outside their main guards.
+- `test_config.py`: config validation and IR-band precision; `crop_slice`; the entry scripts
+  importing nothing outside their main guards.
+- `test_mrms.py`: GRIB2 files built like MRMS's (lat/lon grid, a real 16-bit PNG, signed packing
+  exponents) decode to their packed values; other packings are refused; the crop; a day against a
+  fake bucket (a failed download leaves the day incomplete and its row at the fill, the rerun
+  completes it, a complete day downloads nothing; a file on another grid is an error); config errors.
 - `test_report.py`, `test_runner.py`: the report's rules; the report after a run, `--no-report`,
   Ctrl-C.
 - `test_features.py`: the feature step on two synthetic raw days on the real fixed grid (a 2 km
@@ -80,7 +88,10 @@ formula instead of pyproj (skipping orphan events, `flash_index` -1). Write them
 **Network tests** (`test_network.py`, `--network`) decode two real files of every configured
 product both ways and run the reference hour through the whole pipeline with both
 `download_method` values, requiring identical stores, all from the configured `bucket`; and list the
-reference hour on both clouds in 50-object pages, requiring the same names and sizes.
+reference hour on both clouds in 50-object pages, requiring the same names and sizes; and download
+the reference hour of every configured MRMS product from AWS (30 files on the 0.01° grid, cropped).
+The MRMS decoder was also checked once against eccodes (identical values on five files, 2025–2026);
+eccodes isn't a dependency, so repeat that in a scratch venv if `decode_mrms` changes.
 
 For a short real download, write a harness script that sets `remote.LIST_HOURS` and run it with
 `.venv/bin/python` (the package is installed in `.venv`, so the script can live anywhere). It must
@@ -122,6 +133,12 @@ if __name__ == "__main__":
 - `runner`: `run_all_days`; `main` handles Ctrl-C and prints the report unless `--no-report`.
 - `report`: `day_rows`, `problems`, `print_report`.
 - `common`: shared constants. `progress`: `log` and the progress line (`progress.current`).
+- `mrms`: the MRMS downloader on its own: its config section (`load_mrms_config`, sharing the GOES
+  dates, bounds and HTTP settings), a GRIB2 reader for MRMS's one layout (`decode_mrms`: template 3.0
+  grid, 5.41 PNG packing decoded by Pillow, no bitmap; anything else is refused), `crop_window`,
+  `process_mrms_day` and `main`. It reuses `remote`'s listing and `http_get` and decodes in threads
+  (gzip, Pillow and Blosc release the GIL), so it has no process pool and none of the worker import
+  rules below. It filters files by `remote.LIST_HOURS` too, so the short-run harness works for it.
 
 Pool workers import only `ranges`/`decode` and what they need: `download_raw.py` keeps its imports
 inside the main guard, and `remote` imports aiohttp inside `http_get`, so workers skip aiohttp and
@@ -263,3 +280,7 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   the core count (12), which builds a day in 11.9 s against 15.8 s for 4 workers with Blosc threading
   over every core. A day on its own takes ~27 s and 113 CPU-seconds. Much slower next to a download:
   use far fewer `--workers` then.
+- MRMS goes to `mrms.output_root_dir` (`./mrms_raw`, git-ignored). Current config: the -10 °C
+  reflectivity only, 720 files a day, ~1 GB/day downloaded and ~0.8 GB stored (zstd with byte
+  shuffle: bitshuffle stored 53% more), 37–39 s a day with 8 threads and ~0.9 GB peak memory, so
+  about 5.5 h and 400–430 GB for the range.

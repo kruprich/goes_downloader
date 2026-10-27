@@ -414,6 +414,14 @@
     "product_prefix": "GLM-L2-LCFA",
     "filename_must_contain": "GLM-L2-LCFA"
   },
+  "mrms": {
+    "bucket": "s3://noaa-mrms-pds",
+    "output_root_dir": "./mrms_raw",
+    "threads": 8,
+    "products": [
+      {"key": "refl_m10c", "prefix": "CONUS/Reflectivity_-10C_00.50", "description": "radar reflectivity (dBZ) at the -10 C isotherm, 0.01 deg, every 2 min; LightningCast v2's radar input; -999 outside radar coverage, -99 no echo"}
+    ]
+  },
   "features": {
     "output_root_dir": "./goes_features",
     "start_date_utc": null,

@@ -101,3 +101,26 @@ def test_hour_is_the_same_with_whole_files_and_byte_ranges(tmp_path, monkeypatch
     assert len(names) > 30
     for name in names:
         assert same(a[name][:], b[name][:]), name
+
+
+def test_mrms_hour_downloads_from_aws(tmp_path, monkeypatch):
+    """The configured MRMS products for the reference hour: every 2 min, on the 0.01 deg CONUS grid, cropped."""
+    from goes_downloader import mrms
+
+    raw = json.load(open(os.path.join(REPO, "config.json")))
+    raw.update(start_date_utc="2025-10-27", end_date_utc="2025-10-27")
+    raw["mrms"]["output_root_dir"] = str(tmp_path / "mrms")
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    monkeypatch.setattr(remote, "LIST_HOURS", [HOUR])
+    cfg = mrms.load_mrms_config(str(path))
+    asyncio.run(mrms.run_all_days(cfg))
+    root = zarr.open_consolidated(str(tmp_path / "mrms" / "2025" / "2025300.zarr"), mode="r")
+    assert root.attrs["complete"]
+    for p in cfg.products:
+        g = root[p.key]
+        assert g.attrs["n_present"] == g.attrs["n_files"] == 30 and g.attrs["source_shape"] == [3500, 7000]
+        lat, lon = g["lat"][:], g["lon"][:]
+        assert abs(lat[0] - 49.995) < 1e-6 and abs(lat[-1] - 24.005) < 1e-6 and abs(lon[0] + 124.995) < 1e-6 and abs(lon[-1] + 66.005) < 1e-6
+        frame = g["value"][0] * g["scale_factor"][0] + g["add_offset"][0]
+        assert frame.min() == -999.0 and (frame == -99.0).any()  # outside radar coverage; covered, no echo

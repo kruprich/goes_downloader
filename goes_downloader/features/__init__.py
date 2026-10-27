@@ -54,6 +54,8 @@ Root attrs:
   never will be, so it counts as unavailable instead: its slots are NaN / unknown. Incomplete days are
   rebuilt from scratch on the next run.
   channel_stats / label_stats: per-day sums for normalisation and class balance (combine with --stats).
+  label_stats counts each label's cells on its own grid (n_cells, n_known, n_positive), so a labels_fine
+  label has factor x factor as many as the grid.
   grid, fine_grid (with labels_fine), channels, helper_channels, labels, glm (with the footprint method),
   time_step_minutes, geography_path: how the store was built.
 

@@ -18,6 +18,7 @@ multidict==6.9.1
 netcdf4==1.7.4
 numcodecs==0.15.1
 numpy==2.5.3
+pillow==13.0.0
 propcache==0.5.4
 pyproj==3.8.0
 wrapt==2.4.1

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "goes-downloader"
 version = "0.1.0"
-description = "Mirror GOES-19 ABI and GLM data into one raw Zarr store per UTC day"
+description = "Mirror GOES-19 ABI and GLM data, and MRMS radar, into one raw Zarr store per UTC day"
 readme = "README.md"
 # The tested versions in requirements.lock need 3.12 (numpy 2.5, pyproj 3.8), and 3.14 is excluded
 # because zarr<3 needs numcodecs<0.16, which has no Python 3.14 wheel
@@ -15,6 +15,7 @@ dependencies = [
     "h5py",
     "netCDF4",
     "numpy",
+    "pillow",  # the PNG images inside MRMS GRIB2 files
     "pyproj",
     "zarr>=2.18,<3",
 ]

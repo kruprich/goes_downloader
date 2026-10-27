@@ -68,6 +68,11 @@ def test_bad_settings_are_rejected(tmp_path):
         load_config(write_config(tmp_path, download_method="torrent"))
     with pytest.raises(ValueError, match="unknown"):
         load_config(write_config(tmp_path, download=["cmip_c99"]))
+    with pytest.raises(ValueError, match="after end_date_utc"):
+        load_config(write_config(tmp_path, start_date_utc="2025-05-02", end_date_utc="2025-05-01"))
+    with pytest.raises(ValueError, match="overwrite_existing"):
+        load_config(write_config(tmp_path, overwrite_existing="false"))
+    assert load_config(write_config(tmp_path, start_date_utc="2025-05-01", end_date_utc="2025-05-01")).end_date_utc == "2025-05-01"
 
 
 def test_byte_range_workers_each_get_a_file_in_flight(tmp_path):

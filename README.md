@@ -112,7 +112,8 @@ python report.py --config config.json --all --csv days.csv
   (`gs://gcp-public-data-goes-19`), so the stored data is identical either way. Both buckets are
   read anonymously over HTTPS; no cloud account is needed. See
   [Choosing a cloud](#choosing-a-cloud).
-- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included.
+- `start_date_utc`, `end_date_utc` (`YYYY-MM-DD`): the UTC days to download, both included
+  (the start can't be after the end).
   - NOAA declared GOES-19 operational as GOES-East on 2025-04-07.
   - Its data is on the operational 75.0°W grid from 2025-04-02.
   - Before 2025-03-20 it came from the 89.5°W test position. Don't mix the two positions in one
@@ -121,7 +122,7 @@ python report.py --config config.json --all --csv days.csv
   To add newer days, move the end date forward and run again.
 - `raw_output_root_dir` (default `./goes_raw`): where the day stores go, relative to the directory
   you run the command from.
-- `overwrite_existing` (default `false`): rebuild days that are already complete, for example after
+- `overwrite_existing` (`true` or `false`, default `false`): rebuild days that are already complete, for example after
   changing the products or `bounds`.
 - `download`: the product keys to fetch (see [Choosing products](#choosing-products)).
 

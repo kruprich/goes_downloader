@@ -152,7 +152,7 @@ product's `product_prefix` is the top-level folder, the same on both clouds.
 read each band's own file, `mcmip_*` read one band from the all-band MCMIPC file at 2 km, which
 is only practical with `"byte_ranges"` (~59 MB per whole file; `run_all_days` warns otherwise).
 The `download` list selects which to fetch; it currently holds LightningCast's bands 2, 5, 13 and
-15 (`mcmip_*`). `cmip_precision` applies to infrared CMIP bands 7–16 (band number from
+15 (`mcmip_*`), the 10 km `acha`, `tpw`, `dsi_cape`, `dsi_li` and `dsi_ki`, and `glm`. `cmip_precision` applies to infrared CMIP bands 7–16 (band number from
 `filename_must_contain`, or from the `CMI_Cnn` data variable for MCMIPC); a product's own
 `precision` overrides it. `bounds` crops ABI only. `load_config` logs every key it doesn't read
 (`unknown_keys`; `_`-prefixed keys are notes): a new setting must be added to `TOP_LEVEL_KEYS` (or

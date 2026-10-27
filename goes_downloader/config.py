@@ -39,7 +39,8 @@ class RawConfig:
     raw_output_root_dir: str
     overwrite_existing: bool
 
-    # Total open connections (listing + downloads, all days); every request goes to one host
+    # Open connections in the main process (listing, and downloads with "whole_files"), all days;
+    # every request goes to one host. Byte-range workers open their own.
     max_concurrent_http_requests: int
     http_timeout_seconds: int
     http_retries: int
@@ -179,8 +180,13 @@ def load_config(config_path: str) -> RawConfig:
 
     start_date_utc = _require(raw, "start_date_utc", str)
     end_date_utc = _require(raw, "end_date_utc", str)
-    datetime.strptime(start_date_utc, "%Y-%m-%d")
-    datetime.strptime(end_date_utc, "%Y-%m-%d")
+    if datetime.strptime(start_date_utc, "%Y-%m-%d") > datetime.strptime(end_date_utc, "%Y-%m-%d"):
+        raise ValueError(f"start_date_utc {start_date_utc} is after end_date_utc {end_date_utc}")
+
+    # bool("false") is True, which would rebuild every complete day
+    overwrite_existing = raw.get("overwrite_existing", False)
+    if not isinstance(overwrite_existing, bool):
+        raise ValueError(f"overwrite_existing must be true or false, got {overwrite_existing!r}")
 
     download_method = raw.get("download_method", "whole_files")
     if download_method not in ("whole_files", "byte_ranges"):
@@ -195,7 +201,7 @@ def load_config(config_path: str) -> RawConfig:
         start_date_utc=start_date_utc,
         end_date_utc=end_date_utc,
         raw_output_root_dir=str(raw.get("raw_output_root_dir", "./goes_raw")),
-        overwrite_existing=bool(raw.get("overwrite_existing", False)),
+        overwrite_existing=overwrite_existing,
         max_concurrent_http_requests=max_concurrent_http_requests,
         http_timeout_seconds=int(raw.get("http_timeout_seconds", 60)),
         http_retries=max(1, int(raw.get("http_retries", 5))),

@@ -303,7 +303,7 @@ python build_features.py --config config.json --start 2025-04-10 --end 2025-12-3
 - Days already complete are skipped, so the command can run again as the download adds days.
 - `--stats` builds nothing. It combines the per-day sums over the range into
   `stats_<start>_<end>.json`: mean, std, min, max and valid fraction per channel, and positive
-  fraction per label.
+  and known fraction per label (counted on the label's own cells, so a 2 km label's on the 2 km grid).
 
 A day is `complete` when its raw store and every neighbouring raw day it read are complete: the day
 before for lags and gap filling, and the day after for labels. Neighbours outside the download date

@@ -360,6 +360,20 @@ def test_glm_gaps_make_labels_unknown(built, tmp_path):
     assert (fine[21] == 255).all() and (fine[20] != 255).all()  # [05:15, 06:15) misses 15 of 60 min; [05:00, 06:00) none
 
 
+def test_stats_count_each_label_on_its_own_grid(built, tmp_path):
+    from goes_downloader.features.build import run_stats
+
+    cfg, grid = built
+    build_day(cfg, grid, DAY2)  # with its GLM gap, so some labels are unknown
+    run_stats(replace(cfg, start_date_utc=DAY2, end_date_utc=DAY2))
+    stats = json.loads((tmp_path / f"features/stats_{DAY2}_{DAY2}.json").read_text())["labels"]
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025153.zarr"), mode="r")
+    for name, labels in (("ext30", F["labels"][:, 0]), ("lc60", F["labels_fine"][:, 0])):  # 4 km and 2 km cells
+        known = labels != 255
+        assert abs(stats[name]["known_fraction"] - known.mean()) < 1e-12
+        assert abs(stats[name]["positive_fraction"] - (labels == 1).sum() / known.sum()) < 1e-12
+
+
 def test_label_resolutions_must_nest_in_the_grid(built, tmp_path):
     from goes_downloader.features.build import fine_label_grid
 

@@ -199,7 +199,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     gap_state: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     dqf_luts: Dict[Tuple[Any, Any], np.ndarray] = {}
     stats = {c.name: ChannelStats() for c in outputs}
-    label_counts = {l.name: [0, 0] for l in cfg.labels}  # [n_known, n_positive]
+    label_counts = {l.name: [0, 0, 0] for l in cfg.labels}  # [n_cells, n_known, n_positive], on the label's own grid
     label_offsets = {l.name: disk_offsets(l.radius_cells) for l in cfg.labels}
     valid_fraction = np.zeros((n_t, len(outputs)), dtype=np.float32)
     glm_coverage = np.zeros(n_t, dtype=np.float32)
@@ -295,6 +295,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             lshape = (fine.ny, fine.nx) if on_fine else shape
             out = np.empty((len(these), *lshape), dtype=np.uint8)
             for i, l in enumerate(these):
+                label_counts[l.name][0] += lshape[0] * lshape[1]
                 a, b = s + 1 + l.start_slots, s + 1 + l.end_slots
                 if glm.coverage_mean(a, b) < cfg.glm_min_coverage:
                     out[i] = LABEL_UNKNOWN
@@ -305,8 +306,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
                     counts = glm.sums(a, b, "count")
                 hits = neighbourhood_sum(counts.reshape(lshape), label_offsets[l.name]) >= l.min_flashes
                 out[i] = hits
-                label_counts[l.name][0] += hits.size
-                label_counts[l.name][1] += int(hits.sum())
+                label_counts[l.name][1] += hits.size
+                label_counts[l.name][2] += int(hits.sum())
             arr[k] = out
 
     # --- coordinates, per-time arrays, attrs
@@ -352,7 +353,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
                     "min_coverage": cfg.glm_min_coverage, "extent": glm is not None, "footprint": FOOTPRINT},
             "geography_path": cfg.geography_path,
             "channel_stats": {name: st.as_dict() for name, st in stats.items()},
-            "label_stats": {name: {"n_known": n, "n_positive": p} for name, (n, p) in label_counts.items()},
+            "label_stats": {name: {"n_cells": c, "n_known": n, "n_positive": p} for name, (c, n, p) in label_counts.items()},
             "n_cells_per_time": grid.ny * grid.nx,
             "n_flashes": n_flashes,
             "float16_overflow": {k: v for k, v in n_overflow.items() if v},
@@ -475,9 +476,10 @@ def run_stats(cfg: FeatureConfig) -> None:
             if st["count"]:
                 acc["min"], acc["max"] = min(acc["min"], st["min"]), max(acc["max"], st["max"])
         for name, st in attrs["label_stats"].items():
-            acc_l = labels.setdefault(name, [0, 0])
-            acc_l[0] += st["n_known"]
-            acc_l[1] += st["n_positive"]
+            acc_l = labels.setdefault(name, [0, 0, 0])
+            acc_l[0] += st["n_cells"]  # a label on finer cells (labels_fine) has more of them than the grid
+            acc_l[1] += st["n_known"]
+            acc_l[2] += st["n_positive"]
 
     if not used and not incomplete:
         raise SystemExit(f"no feature stores between {cfg.start_date_utc} and {cfg.end_date_utc}")
@@ -495,8 +497,8 @@ def run_stats(cfg: FeatureConfig) -> None:
         "days_incomplete": incomplete,
         "days_missing": missing,
         "channels": channels,
-        "labels": {name: {"positive_fraction": p / n if n else None, "known_fraction": n / cells if cells else None}
-                   for name, (n, p) in labels.items()},
+        "labels": {name: {"positive_fraction": p / n if n else None, "known_fraction": n / c if c else None}
+                   for name, (c, n, p) in labels.items()},
     }
     out = os.path.join(cfg.output_root_dir, f"stats_{cfg.start_date_utc}_{cfg.end_date_utc}.json")
     with open(out, "w", encoding="utf-8") as f:

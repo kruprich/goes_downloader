@@ -86,7 +86,7 @@ def test_crop_slice_keeps_cells_overlapping_the_range():
         crop_slice(x, 20.0, 30.0, "x")
 
 
-@pytest.mark.parametrize("script", ["download_raw.py", "build_features.py", "build_geography.py"])
+@pytest.mark.parametrize("script", ["download_raw.py", "download_mrms.py", "build_features.py", "build_geography.py"])
 def test_entry_script_imports_nothing_outside_its_main_guard(script):
     """Spawned workers re-run the entry script; they must not load aiohttp or zarr through it."""
     code = (

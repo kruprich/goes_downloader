@@ -27,6 +27,7 @@ including every attribute.
 | Path | What it is |
 |---|---|
 | `download_raw.py` | Runs the download |
+| `download_mrms.py` | Downloads MRMS radar products from AWS into their own day stores (see [MRMS radar](#mrms-radar)) |
 | `report.py` | Shows which days the stores hold and how complete they are |
 | `build_geography.py` | Puts terrain, land/water, viewing angle and country borders on the feature grid, once |
 | `build_features.py` | Builds the per-day feature stores (CNN inputs and lightning labels) |
@@ -284,6 +285,41 @@ With the example config a day stores about 2.1 GB:
 Speed is usually limited by the internet connection. With `"byte_ranges"`, much fewer than ~48
 workers leaves bandwidth unused. GLM files are small, so fetching them is limited by request round
 trips rather than bandwidth.
+
+## MRMS radar
+
+`download_mrms.py` mirrors MRMS radar mosaics from NOAA's AWS bucket (`s3://noaa-mrms-pds`) into
+their own per-day raw stores, `<mrms.output_root_dir>/YYYY/YYYYDDD.zarr` (`./mrms_raw`):
+
+```bash
+python download_mrms.py --config config.json
+```
+
+It uses the config's dates, `bounds`, `overwrite_existing` and HTTP settings, and its `mrms` section:
+
+- `products`: each a `key` (the store group), a `prefix` (the bucket folder holding one folder per
+  day) and a `description`. The example config downloads `CONUS/Reflectivity_-10C_00.50`, the
+  reflectivity at the -10 °C isotherm that LightningCast v2 added to its inputs.
+- `threads` (8): files decoded at once. Each holds a ~50 MB field while it decodes.
+- `bucket` (`s3://noaa-mrms-pds`) and `output_root_dir` (`./mrms_raw`).
+
+Every file is kept: one every 2 minutes for the CONUS mosaics, on its 0.01° lat/lon grid, cropped to
+the pixels whose cell overlaps `bounds`. Values stay packed as published (16-bit integers, with each
+file's scale and offset), as for ABI. MRMS marks its own gaps: in the reflectivity products, -999 is
+outside radar coverage and -99 is covered with no echo. Days are marked `complete` by the same rule
+as the GOES stores. The docstring of `goes_downloader/mrms.py` describes the layout.
+
+The files are GRIB2 with the field packed as a PNG image; Pillow decodes the image, and the decoded
+values match eccodes exactly (checked on five files from 2025-04-10 to 2026-09-25).
+
+Measured with 8 threads on Kevin's 12-core workstation (2026-10-26), one run per day, 720 files each:
+
+| Day | Downloaded | Stored | Time | Peak memory |
+|---|---|---|---|---|
+| 2026-07-14 | 0.94 GB | 0.76 GB | 39 s | 0.89 GB |
+| 2025-10-27 | 1.08 GB | 0.81 GB | 37 s | 0.95 GB |
+
+At that rate the configured 534 days take about 5.5 hours and 400–430 GB of disk.
 
 ## Building features
 

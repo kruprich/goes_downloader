@@ -93,6 +93,7 @@ TOP_LEVEL_KEYS = {
     "http_retries", "max_decode_processes", "max_days_in_flight", "max_inflight_payloads",
     "bounds", "cmip_precision", "download", "abi_products", "glm_product",
     "features",  # read by the feature step (goes_downloader/features)
+    "mrms",  # read by download_mrms.py (goes_downloader/mrms.py)
 }
 ABI_PRODUCT_KEYS = {"key", "description", "product_prefix", "filename_must_contain", "data_variable", "dqf_variable", "precision"}
 GLM_PRODUCT_KEYS = {"key", "description", "product_prefix", "filename_must_contain"}

@@ -18,10 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import zarr
+from zarr.codecs import BloscCodec
 
 from ..common import SLOTS_PER_DAY, TIME_ATTRS, iter_days_utc
 from ..progress import format_duration, log
-from ..store import _write_array, directory_size, output_zarr_path_for_day, zarr_store_is_complete
+from ..store import _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 from .expressions import Evaluator, make_plan
 from .geography import build_geography, geography_grid
 from .glm import FOOTPRINT, SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
@@ -55,25 +56,17 @@ def raw_neighbour_arrived(cfg: FeatureConfig, path: str) -> bool:
 
 
 def _exit_now(*_: Any) -> None:
-    from multiprocessing import util
-
-    # Unregisters the lock numcodecs creates when a worker imports zarr; otherwise the resource tracker
-    # warns about "leaked semaphore objects". Exiting through Python instead would let the pool's
-    # worker loop catch the exit and start the next day.
-    util._run_finalizers(0)
+    # Exiting through Python instead would let the pool's worker loop catch the exit and start the next day
     os._exit(1)
 
 
 def _init_worker() -> None:
     """
-    Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM). One Blosc thread per
-    worker: building is CPU-bound and max_workers already fills the cores (README: Size and speed).
+    Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM). Building is CPU-bound
+    and max_workers fills the cores; zarr runs Blosc on one thread (README: Size and speed).
     """
-    import numcodecs
-
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, _exit_now)
-    numcodecs.blosc.set_nthreads(1)
 
 
 class ChannelStats:
@@ -169,29 +162,30 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     tmp_path = out_path + ".tmp"
     shutil.rmtree(tmp_path, ignore_errors=True)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    root = zarr.open_group(zarr.DirectoryStore(tmp_path), mode="w")
+    root = zarr.open_group(tmp_path, mode="w", zarr_format=3)
     n_t = len(out_slots)
     cy, cx = (grid.ny, grid.nx) if cfg.chunk_yx is None else (min(cfg.chunk_yx[0], grid.ny), min(cfg.chunk_yx[1], grid.nx))
     codec, level, shuffle = cfg.compression
-    compressor = zarr.Blosc(cname=codec, clevel=level, shuffle={"byte": zarr.Blosc.SHUFFLE, "bit": zarr.Blosc.BITSHUFFLE, "none": zarr.Blosc.NOSHUFFLE}[shuffle])
+    compressor = BloscCodec(cname=codec, clevel=level, shuffle={"byte": "shuffle", "bit": "bitshuffle", "none": "noshuffle"}[shuffle])
 
-    def frames(name: str, lead: List[int], dtype: Any, fill: Any, dims: List[str]) -> Any:
-        a = root.create_dataset(name, shape=(n_t, *lead, *shape), chunks=(1, *lead, cy, cx), dtype=dtype,
-                                fill_value=fill, compressor=compressor, overwrite=True)
-        a.attrs.update({"_ARRAY_DIMENSIONS": dims, "coordinates": "lat lon"})
-        return a
+    def frames(name: str, lead: List[int], dtype: Any, fill: Any, dims: List[str], **attrs: Any) -> Any:
+        return root.create_array(name, shape=(n_t, *lead, *shape), chunks=(1, *lead, cy, cx), dtype=dtype, fill_value=fill,
+                                 compressors=compressor, dimension_names=dims, attributes={"coordinates": "lat lon", **attrs},
+                                 overwrite=True)
 
+    # A label fill is also the _FillValue attribute: xarray masks that, not a Zarr v3 array's fill value
     features = frames("features", [len(outputs)], cfg.dtype, np.nan, ["time", "channel", "y", "x"])
-    labels_arr = frames("labels", [len(coarse_labels)], np.uint8, LABEL_UNKNOWN, ["time", "label", "y", "x"]) if coarse_labels else None
+    labels_arr = (frames("labels", [len(coarse_labels)], np.uint8, LABEL_UNKNOWN, ["time", "label", "y", "x"], _FillValue=LABEL_UNKNOWN)
+                  if coarse_labels else None)
     fine_arr = None
     if fine is not None:
-        fine_arr = root.create_dataset("labels_fine", shape=(n_t, len(fine_labels), fine.ny, fine.nx),
-                                       chunks=(1, len(fine_labels), fine.ny, fine.nx), dtype=np.uint8,
-                                       fill_value=LABEL_UNKNOWN, compressor=compressor, overwrite=True)
-        fine_arr.attrs.update({"_ARRAY_DIMENSIONS": ["time", "label_fine", "y_fine", "x_fine"]})
-    # Every slot is written, so no fill value: zarr's default of 0 would make xarray read 0 flashes as missing
-    flash_arr = frames("flash_count", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
-    extent_arr = frames("flash_extent", [], np.uint16, None, ["time", "y", "x"]) if glm is not None else None
+        fine_arr = root.create_array("labels_fine", shape=(n_t, len(fine_labels), fine.ny, fine.nx),
+                                     chunks=(1, len(fine_labels), fine.ny, fine.nx), dtype=np.uint8, fill_value=LABEL_UNKNOWN,
+                                     compressors=compressor, dimension_names=["time", "label_fine", "y_fine", "x_fine"],
+                                     attributes={"_FillValue": LABEL_UNKNOWN}, overwrite=True)
+    # Every slot is written. Without a _FillValue attribute xarray doesn't read 0 flashes as missing
+    flash_arr = frames("flash_count", [], np.uint16, 0, ["time", "y", "x"]) if glm is not None else None
+    extent_arr = frames("flash_extent", [], np.uint16, 0, ["time", "y", "x"]) if glm is not None else None
 
     # --- evaluate every channel slot by slot, from the lookback to the end of the day
     cache: Dict[str, Dict[int, np.ndarray]] = {c.name: {} for c in cfg.channels}
@@ -360,9 +354,9 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "built_utc": datetime.now(timezone.utc).isoformat(),
         }
     )
-    zarr.consolidate_metadata(root.store)
+    consolidate(root)
     # Rename the old store aside rather than deleting it in place: a worker killed mid-delete could
-    # leave .zattrs (complete: true) without its arrays, and the day would never be rebuilt.
+    # leave zarr.json (complete: true) without its arrays, and the day would never be rebuilt.
     old_path = out_path + ".old"
     shutil.rmtree(old_path, ignore_errors=True)
     if os.path.exists(out_path):
@@ -462,7 +456,7 @@ def run_stats(cfg: FeatureConfig) -> None:
     used, incomplete, missing, cells = [], [], [], 0
     for day in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc):
         path = features_day_path(cfg, day)
-        if not os.path.exists(os.path.join(path, ".zgroup")):
+        if not os.path.exists(os.path.join(path, "zarr.json")):
             missing.append(day.date().isoformat())
             continue
         attrs = zarr.open_consolidated(path, mode="r").attrs

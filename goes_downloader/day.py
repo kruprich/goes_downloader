@@ -23,6 +23,7 @@ from .ranges import ranged_decode_abi_file, ranged_decode_glm_file
 from .remote import RemoteFile, http_get, list_day_names, object_url, select_files
 from .store import (
     AbiProductState,
+    consolidate,
     directory_size,
     output_zarr_path_for_day,
     write_abi_frame,
@@ -104,7 +105,7 @@ async def process_single_day(
     tmp_path = out_path + ".tmp"
     shutil.rmtree(tmp_path, ignore_errors=True)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    root = zarr.open_group(zarr.DirectoryStore(tmp_path), mode="w")
+    root = zarr.open_group(tmp_path, mode="w", zarr_format=3)
     root.attrs.update(
         {
             "day_utc": day.date().isoformat(),
@@ -217,7 +218,7 @@ async def process_single_day(
     )
 
     # One metadata file per day, so opening many days with xarray is fast
-    zarr.consolidate_metadata(root.store)
+    consolidate(root)
 
     shutil.rmtree(out_path, ignore_errors=True)
     shutil.move(tmp_path, out_path)

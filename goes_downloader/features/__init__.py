@@ -29,13 +29,14 @@ up over their window (README, "Flash footprints"). Orphan events (flash_index -1
 file lacks their group or flash) are skipped. A label with min_flashes > 1 counts flash-cell hits within
 its radius.
 
-Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr
+Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr (Zarr format 3, like the raw stores)
   time[time]                           datetime64 slot start, every time_step_minutes
   channel[channel], label[label]       names in config order (channels with "output": false excluded)
   features[time, channel, y, x]        float16 (or float32); NaN = missing. One chunk per time step (or
                                        chunk_yx), compressed with Blosc features.compression
   labels[time, label, y, x]            uint8 1 = lightning in the window, 0 = none, 255 = unknown (GLM covered
-                                       less than glm.min_coverage of the window)
+                                       less than glm.min_coverage of the window; also the _FillValue attribute,
+                                       so xarray reads it as NaN)
   labels_fine[time, label_fine, y_fine, x_fine]   the same for labels with a finer resolution_km (for
                                        evaluation), each grid cell holding factor x factor of their cells;
                                        label_fine[label_fine], x_fine[x_fine], y_fine[y_fine] as below

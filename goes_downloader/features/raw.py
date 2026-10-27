@@ -44,7 +44,7 @@ class RawProduct:
 class RawDay:
     def __init__(self, path: str, grid: TargetGrid):
         self.grid = grid
-        self.root = zarr.open_consolidated(path, mode="r") if os.path.exists(os.path.join(path, ".zgroup")) else None
+        self.root = zarr.open_consolidated(path, mode="r") if os.path.exists(os.path.join(path, "zarr.json")) else None
         self.complete = bool(self.root.attrs.get("complete", False)) if self.root is not None else False
         self.products: Dict[str, Optional[RawProduct]] = {}
 

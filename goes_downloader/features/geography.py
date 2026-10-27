@@ -16,7 +16,7 @@ chosen countries' land; "distance_km" is the great-circle distance from the cell
 centre of a cell at least half on that land (0 for those cells). "within" keeps only polygons with a
 vertex in a lat/lon box, e.g. the contiguous US without Alaska and Hawaii.
 
-Layout of geography.zarr
+Layout of geography.zarr (Zarr format 3)
   <field>[y, x]      float32 one array per configured field, in config order (NaN off the Earth's disk)
   x[x], y[y]         float64 cell-centre scan angles (rad), the same as the feature stores'
   lat[y, x], lon[y, x] float32 cell centres (deg)
@@ -42,7 +42,7 @@ import zarr
 
 from ..crop import latlon_to_scan_angle
 from ..progress import log
-from ..store import COMPRESSOR, _write_array
+from ..store import COMPRESSOR, _write_array, consolidate
 from .grid import TargetGrid, grid_latlon, satellite_zenith_deg
 from .settings import FeatureConfig, GeographySpec, geography_store_path
 
@@ -387,9 +387,9 @@ def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
     tmp = path + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    root = zarr.open_group(zarr.DirectoryStore(tmp), mode="w")
+    root = zarr.open_group(tmp, mode="w", zarr_format=3)
     for name, v in fields.items():
-        _write_array(root, name, v.astype(np.float32), ["y", "x"], coordinates="lat lon", zarr=dict(compressor=COMPRESSOR))
+        _write_array(root, name, v.astype(np.float32), ["y", "x"], coordinates="lat lon", zarr=dict(compressors=COMPRESSOR))
     _write_array(root, "x", grid.x(), ["x"], units="rad", long_name="ABI fixed grid E/W scan angle")
     _write_array(root, "y", grid.y(), ["y"], units="rad", long_name="ABI fixed grid N/S scan angle")
     _write_array(root, "lat", lat, ["y", "x"], units="degrees_north")
@@ -401,7 +401,7 @@ def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
         "grid": asdict(grid),
         "built_utc": datetime.now(timezone.utc).isoformat(),
     })
-    zarr.consolidate_metadata(root.store)
+    consolidate(root)
     shutil.rmtree(path, ignore_errors=True)
     shutil.move(tmp, path)
     return path
@@ -409,6 +409,6 @@ def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
 
 def geography_grid(path: str) -> Any:
     """The TargetGrid a geography store was built on, or None if there is no store."""
-    if not os.path.exists(os.path.join(path, ".zgroup")):
+    if not os.path.exists(os.path.join(path, "zarr.json")):
         return None
     return TargetGrid(**zarr.open_consolidated(path, mode="r").attrs["grid"])

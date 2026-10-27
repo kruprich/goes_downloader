@@ -96,8 +96,7 @@ def test_hour_is_the_same_with_whole_files_and_byte_ranges(tmp_path, monkeypatch
     a, b = stores["whole_files"], stores["byte_ranges"]
     assert a.attrs["complete"] and b.attrs["complete"] and a.attrs["n_glm_events"] > 0
 
-    names = []
-    a.visitvalues(lambda v: names.append(v.path) if isinstance(v, zarr.Array) else None)
+    names = [name for name, v in a.members(max_depth=None) if isinstance(v, zarr.Array)]
     assert len(names) > 30
     for name in names:
         assert same(a[name][:], b[name][:]), name

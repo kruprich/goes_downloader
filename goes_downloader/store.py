@@ -6,8 +6,9 @@ binning, regridding and quality filtering can all happen later, in the feature s
 
 Layout of <raw_output_root_dir>/YYYY/YYYYDDD.zarr
 
-Every array names its dimensions and each day's metadata is consolidated, so xarray can open the
-stores (see "Reading with xarray" below).
+Zarr format 3. Every array names its dimensions and each day's metadata is consolidated into its root
+zarr.json, so xarray can open the stores (see "Reading with xarray" below). ABI frames and GLM columns are
+encoded with pcodec (8-bit ones with Blosc zstd), so reading them needs numcodecs' pcodec package.
 
 ABI: one group per configured product, one slot per 5-min CONUS scan (288 per day).
 Each product keeps its source grid (CMIP bands 1, 3, 5: 1 km and band 2: 0.5 km in their own files, every
@@ -18,9 +19,10 @@ other band and every band of the all-band MCMIP file: 2 km, 1500x2500; ACM, ACTP
                                               configured "precision" (physical units) if one is set
                                               physical = value * scale_factor[slot] + add_offset[slot]
                                               value == attrs["fill_value"] means no data (for files without a
-                                              _FillValue the store uses 65535)
+                                              _FillValue the store uses 65535); it is the array's fill value
+                                              and its _FillValue attribute
   abi/<key>/dqf[slot, y, x]          uint8    data quality flags as in the file (uint16 for products with
-                                              16-bit flags; attrs["dqf_fill_value"] = fill)
+                                              16-bit flags; attrs["dqf_fill_value"] = fill, likewise)
   abi/<key>/scale_factor[slot]       float64
   abi/<key>/add_offset[slot]         float64
   abi/<key>/quantization_step[slot]  float64  physical step between stored values after rounding
@@ -86,12 +88,15 @@ Reading with xarray (one product or GLM table across several days):
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import zarr
+from zarr.codecs import BloscCodec
+from zarr.codecs.numcodecs import PCodec
 
 from .common import GLM_WINDOW_SECONDS, GLM_WINDOWS_PER_DAY, NAT_NS, SLOTS_PER_DAY, TIME_ATTRS, to_ns
 from .config import ProductSpec
@@ -108,7 +113,7 @@ def directory_size(path: str) -> int:
 
 
 def zarr_store_is_complete(path: str) -> bool:
-    if not os.path.exists(os.path.join(path, ".zgroup")):
+    if not os.path.exists(os.path.join(path, "zarr.json")):
         return False
     try:
         return bool(zarr.open_group(path, mode="r").attrs.get("complete", False))
@@ -116,17 +121,38 @@ def zarr_store_is_complete(path: str) -> bool:
         return False
 
 
-COMPRESSOR = zarr.Blosc(cname="zstd", clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+def consolidate(group: Any) -> None:
+    """
+    Copies every array's and group's metadata into the root zarr.json, so opening many days is fast.
+    zarr warns that consolidated metadata isn't in the Zarr v3 specification yet: zarr-python reads it,
+    and marks it so that other readers may ignore it and read each node's zarr.json.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Consolidated metadata", UserWarning)
+        zarr.consolidate_metadata(group.store)
+
+
+COMPRESSOR = BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")
+
+
+def frame_codecs(dtype: Any) -> Dict[str, Any]:
+    """
+    create_array options for ABI frames and GLM columns. pcodec stores a raw day 18% smaller than Blosc
+    zstd with bitshuffle for the same CPU (README: Size and speed), but has no 8-bit types: those (DQF,
+    quality_flag) keep Blosc.
+    """
+    if np.dtype(dtype).itemsize == 1:
+        return {"compressors": COMPRESSOR}
+    return {"serializer": PCodec(level=8), "compressors": None}
 
 
 def _write_array(group: Any, name: str, data: np.ndarray, dims: List[str], **attrs: Any) -> Any:
     """
-    Writes a fully populated array with its dimension names for xarray. fill_value=None matters:
-    zarr's default fill of 0 would make xarray read every legitimate 0 as missing.
+    Writes a fully populated array with its dimension names for xarray. Its fill value is zarr's
+    default (0), which xarray ignores in Zarr v3, so legitimate zeros aren't read as missing.
     """
-    array = group.create_dataset(name, data=data, fill_value=None, overwrite=True, **attrs.pop("zarr", {}))
-    array.attrs.update({"_ARRAY_DIMENSIONS": dims, **attrs})
-    return array
+    options = attrs.pop("zarr", {})
+    return group.create_array(name, data=data, dimension_names=dims, attributes=attrs, overwrite=True, **options)
 
 
 GLM_FLASH_COLUMNS = {
@@ -191,13 +217,18 @@ class AbiProductState:
                     "crop_x0": self.xs.start or 0,
                 }
             )
-            common = dict(overwrite=True, compressor=COMPRESSOR, chunks=(1, shape[0], shape[1]))
-            self.value_array = g.create_dataset("value", shape=(SLOTS_PER_DAY, *shape), dtype="u2", fill_value=storage_fill, **common)
-            self.dqf_array = g.create_dataset(
-                "dqf", shape=(SLOTS_PER_DAY, *shape), dtype=dec["dqf"].dtype, fill_value=dec["dqf_fill_value"], **common
+            common = dict(overwrite=True, chunks=(1, shape[0], shape[1]), dimension_names=["time", "y", "x"])
+            coordinates = "x_scan_angle_rad y_scan_angle_rad"
+            # The fills are also the _FillValue attributes: xarray masks those, not a Zarr v3 array's fill value
+            self.value_array = g.create_array(
+                "value", shape=(SLOTS_PER_DAY, *shape), dtype="u2", fill_value=storage_fill,
+                attributes={"_FillValue": storage_fill, "coordinates": coordinates}, **frame_codecs("u2"), **common
             )
-            for array in (self.value_array, self.dqf_array):
-                array.attrs.update({"_ARRAY_DIMENSIONS": ["time", "y", "x"], "coordinates": "x_scan_angle_rad y_scan_angle_rad"})
+            self.dqf_array = g.create_array(
+                "dqf", shape=(SLOTS_PER_DAY, *shape), dtype=dec["dqf"].dtype, fill_value=dec["dqf_fill_value"],
+                attributes={"_FillValue": dec["dqf_fill_value"], "coordinates": coordinates},
+                **frame_codecs(dec["dqf"].dtype), **common
+            )
             _write_array(g, "x_scan_angle_rad", x.astype(np.float64), ["x"], units="rad")
             _write_array(g, "y_scan_angle_rad", y.astype(np.float64), ["y"], units="rad")
             self.full_shape, self.fill_value, self.x, self.y = full_shape, dec["fill_value"], dec["x"], dec["y"]
@@ -276,7 +307,7 @@ def write_glm_tables(
     _write_array(fg, "n_orphan_events", n_orphans, ["file"])
 
     def write_column(group: Any, name: str, arr: np.ndarray, dim: str, **attrs: Any) -> None:
-        _write_array(group, name, arr, [dim], **attrs, zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), compressor=COMPRESSOR))
+        _write_array(group, name, arr, [dim], **attrs, zarr=dict(chunks=(max(1, min(len(arr), 1 << 20)),), **frame_codecs(arr.dtype)))
 
     # Flashes, sorted by the time of their first event
     file_indices = sorted(tables)

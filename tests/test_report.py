@@ -9,7 +9,7 @@ import zarr
 from conftest import REPO
 from goes_downloader.config import load_config
 from goes_downloader.report import day_rows, problems, summary
-from goes_downloader.store import output_zarr_path_for_day
+from goes_downloader.store import consolidate, output_zarr_path_for_day
 
 
 def make_store(root_dir, day, complete=True, scans=None, glm_missing=0):
@@ -22,7 +22,7 @@ def make_store(root_dir, day, complete=True, scans=None, glm_missing=0):
     )
     for key, n in scans.items():
         g.require_group(f"abi/{key}").attrs["n_present"] = n
-    zarr.consolidate_metadata(g.store)
+    consolidate(g)
 
 
 def test_report_statuses_and_problems(tmp_path):

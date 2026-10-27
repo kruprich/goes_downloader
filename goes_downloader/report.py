@@ -26,7 +26,7 @@ def day_rows(cfg: RawConfig) -> Iterator[Dict[str, Any]]:
     for day in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc):
         path = output_zarr_path_for_day(cfg.raw_output_root_dir, day)
         row: Dict[str, Any] = {"date": day.date().isoformat()}
-        if not os.path.exists(os.path.join(path, ".zmetadata")):
+        if not os.path.exists(os.path.join(path, "zarr.json")):
             # A .tmp store is a day that was being built when a run stopped
             row["status"] = "interrupted" if os.path.exists(path + ".tmp") else "missing"
             yield row

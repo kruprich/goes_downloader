@@ -10,11 +10,12 @@ settings are the GOES download's. A product is a folder of the bucket holding on
 (YYYYMMDD) of gzipped GRIB2 files, one field each, every 2 minutes for the CONUS mosaics, e.g.
 CONUS/Reflectivity_-10C_00.50 (reflectivity at the -10 C isotherm, LightningCast v2's radar input).
 
-Layout of <mrms.output_root_dir>/YYYY/YYYYDDD.zarr, one group per product:
+Layout of <mrms.output_root_dir>/YYYY/YYYYDDD.zarr (Zarr format 3, like the GOES stores), one group per product:
   <key>/time[file]             datetime64 the file's time (from its name), ns since 1970
   <key>/value[file, y, x]      uint16  packed values as in the file's PNG image; rows run north to south
                                        physical = value * scale_factor[file] + add_offset[file]
-                                       65535 (attrs fill_value) = file not downloaded or decoded (present 0)
+                                       65535 (attrs fill_value; the array's fill value and _FillValue
+                                       attribute) = file not downloaded or decoded (present 0)
   <key>/scale_factor[file]     float64 2**E / 10**D of the file's GRIB2 packing
   <key>/add_offset[file]       float64 R / 10**D
   <key>/present[file]          uint8   1 if the file was downloaded and decoded
@@ -28,7 +29,7 @@ Root attrs: day_utc, complete (every listing and file succeeded and the day ende
 incomplete days are rebuilt from scratch on the next run), too_recent, completed_utc, n_listing_errors,
 n_file_errors, source_bucket, product_keys, bounds.
 
-Decoding runs in threads: gzip, Pillow's PNG decoder and Blosc release the GIL, so no process pool is
+Decoding runs in threads: gzip, Pillow's PNG decoder and zstd release the GIL, so no process pool is
 needed (README: MRMS).
 """
 
@@ -53,20 +54,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import zarr
 from PIL import Image
+from zarr.codecs import ZstdCodec
 
 from . import remote
 from .common import TIME_ATTRS, iter_days_utc, to_ns
 from .config import BUCKET_PATTERN, LatLonBounds, RawConfig, load_config
 from .day import MIN_AGE_FOR_COMPLETE, MAX_ERRORS_LOGGED_PER_DAY
 from .progress import format_duration, log
-from .store import _write_array, directory_size, output_zarr_path_for_day, zarr_store_is_complete
+from .store import _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 
 MRMS_KEYS = {"bucket", "output_root_dir", "threads", "products"}
 MRMS_PRODUCT_KEYS = {"key", "prefix", "description"}
 FILE_TIME = re.compile(r"_(\d{8})-(\d{6})\.grib2\.gz$")
 FILL_VALUE = int(np.iinfo(np.uint16).max)
-# Byte shuffle, not the GOES stores' bitshuffle: a frame is mostly two sentinels and stores a third smaller
-COMPRESSOR = zarr.Blosc(cname="zstd", clevel=3, shuffle=zarr.Blosc.SHUFFLE)
+# A frame is mostly two sentinels. Plain zstd 9 stores it 9% smaller than Blosc zstd 3 with byte shuffle and
+# decodes twice as fast; Blosc zstd 3 with bitshuffle stored 52% more than with byte shuffle, pcodec 19% more
+COMPRESSOR = ZstdCodec(level=9)
 
 
 @dataclass(frozen=True)
@@ -231,9 +234,10 @@ class ProductDay:
         shape = (self.ys.stop - self.ys.start, self.xs.stop - self.xs.start)
         g = root.require_group(self.product.key)
         g.attrs.update({"source_shape": list(dec["value"].shape), "crop_y0": self.ys.start, "crop_x0": self.xs.start})
-        self.value = g.create_dataset("value", shape=(len(self.files), *shape), chunks=(1, *shape), dtype="u2",
-                                      fill_value=FILL_VALUE, compressor=COMPRESSOR, overwrite=True)
-        self.value.attrs.update({"_ARRAY_DIMENSIONS": ["time", "y", "x"], "coordinates": "lat lon"})
+        # The fill is also the _FillValue attribute: xarray masks that, not a Zarr v3 array's fill value
+        self.value = g.create_array("value", shape=(len(self.files), *shape), chunks=(1, *shape), dtype="u2",
+                                    fill_value=FILL_VALUE, compressors=COMPRESSOR, dimension_names=["time", "y", "x"],
+                                    attributes={"_FillValue": FILL_VALUE, "coordinates": "lat lon"}, overwrite=True)
 
     def write(self, i: int, dec: Dict[str, Any]) -> None:
         # One chunk per file, so concurrent writes never touch the same chunk
@@ -276,7 +280,7 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     tmp_path = out_path + ".tmp"
     shutil.rmtree(tmp_path, ignore_errors=True)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    root = zarr.open_group(zarr.DirectoryStore(tmp_path), mode="w")
+    root = zarr.open_group(tmp_path, mode="w", zarr_format=3)
     root.attrs.update({"day_utc": label, "source_bucket": cfg.raw.bucket, "product_keys": [p.key for p in cfg.products],
                        "bounds": vars(cfg.raw.bounds) if cfg.raw.bounds is not None else None, "complete": False})
 
@@ -308,7 +312,7 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     complete = n_listing_errors == 0 and not errors and not too_recent
     root.attrs.update({"n_listing_errors": n_listing_errors, "n_file_errors": len(errors), "too_recent": too_recent,
                        "complete": complete, "completed_utc": datetime.now(timezone.utc).isoformat() if complete else None})
-    zarr.consolidate_metadata(root.store)
+    consolidate(root)
     shutil.rmtree(out_path, ignore_errors=True)
     shutil.move(tmp_path, out_path)
 

@@ -21,6 +21,7 @@ from goes_downloader.features.build import build_day, check_geography
 from goes_downloader.features.geography import EARTH_RADIUS_KM, build_geography, rasterize_rings, regrid_source
 from goes_downloader.features.grid import SolarGeometry, grid_latlon, make_grid, satellite_zenith_deg
 from goes_downloader.features.settings import GeographySpec, load_feature_config
+from goes_downloader.store import consolidate
 
 X0, DX, Y0, DY = -0.101332, 5.6e-5, 0.128212, -5.6e-5  # uncropped CONUS 2 km pixel centres (rad)
 CROP_Y0, CROP_X0, H, W = 600, 1200, 30, 40  # 2 km pixels kept; the 10 km product covers the same area
@@ -38,7 +39,7 @@ def write_raw_day(root_dir: str, day: str, missing_slot: int = -1):
     """ABI part of a raw store: a 2 km product with bad DQF and fill pixels, and a 10 km product."""
     d = datetime.strptime(day, "%Y-%m-%d")
     path = os.path.join(root_dir, str(d.year), f"{d.year}{d.timetuple().tm_yday:03d}.zarr")
-    root = zarr.open_group(zarr.DirectoryStore(path), mode="w")
+    root = zarr.open_group(path, mode="w")
     base = (d - datetime(1970, 1, 1)).days * SLOTS_PER_DAY
     yy, xx = np.meshgrid(CROP_Y0 + np.arange(H), CROP_X0 + np.arange(W), indexing="ij")
     v2 = np.stack([p2_value(base + s, yy, xx) for s in range(SLOTS_PER_DAY)]).astype(np.uint16)
@@ -56,18 +57,18 @@ def write_raw_day(root_dir: str, day: str, missing_slot: int = -1):
     for key, values, dqf, factor, (sf, ao) in (("p2", v2, q2, 1, (0.1, 200.0)), ("p10", v10, np.zeros_like(v10, np.uint8), 5, (1.0, 0.0))):
         g = root.require_group(f"abi/{key}")
         n, h, w = values.shape
-        g.array("value", values, chunks=(1, h, w))
-        g.array("dqf", dqf, chunks=(1, h, w))
-        g.array("scale_factor", np.full(n, sf))
-        g.array("add_offset", np.full(n, ao))
-        g.array("present", present)
+        g.create_array("value", data=values, chunks=(1, h, w))
+        g.create_array("dqf", data=dqf, chunks=(1, h, w))
+        g.create_array("scale_factor", data=np.full(n, sf))
+        g.create_array("add_offset", data=np.full(n, ao))
+        g.create_array("present", data=present)
         # A 10 km pixel is 5x5 2 km pixels: its centre is the third 2 km centre
-        g.array("x_scan_angle_rad", X0 + (factor - 1) / 2 * DX + (CROP_X0 // factor + np.arange(w)) * factor * DX)
-        g.array("y_scan_angle_rad", Y0 + (factor - 1) / 2 * DY + (CROP_Y0 // factor + np.arange(h)) * factor * DY)
+        g.create_array("x_scan_angle_rad", data=X0 + (factor - 1) / 2 * DX + (CROP_X0 // factor + np.arange(w)) * factor * DX)
+        g.create_array("y_scan_angle_rad", data=Y0 + (factor - 1) / 2 * DY + (CROP_Y0 // factor + np.arange(h)) * factor * DY)
         g.attrs.update(fill_value=65535, dqf_fill_value=255, crop_y0=CROP_Y0 // factor, crop_x0=CROP_X0 // factor, has_frames=True,
                        goes_imager_projection=PROJECTION, uncropped_shape=[1500 // factor, 2500 // factor])
     root.attrs.update(day_utc=day, complete=True)
-    zarr.consolidate_metadata(zarr.DirectoryStore(path))
+    consolidate(root)
     return path
 
 
@@ -79,28 +80,28 @@ def write_glm(path: str, flashes, covered: np.ndarray, orphans=()):
     root = zarr.open_group(path, mode="a")
     g = root.require_group("glm")
     f = g.require_group("flashes")
-    f.array("time_first_ns", np.array([t for t, _, _ in flashes], np.int64))
-    f.array("lat", np.array([c[0] for _, c, _ in flashes], np.float32))
-    f.array("lon", np.array([c[1] for _, c, _ in flashes], np.float32))
-    f.array("energy_j", np.full(len(flashes), 1e-13, np.float32))
-    f.array("area_m2", np.full(len(flashes), 1e8, np.float32))
-    f.array("quality_flag", np.zeros(len(flashes), np.uint8))
+    f.create_array("time_first_ns", data=np.array([t for t, _, _ in flashes], np.int64))
+    f.create_array("lat", data=np.array([c[0] for _, c, _ in flashes], np.float32))
+    f.create_array("lon", data=np.array([c[1] for _, c, _ in flashes], np.float32))
+    f.create_array("energy_j", data=np.full(len(flashes), 1e-13, np.float32))
+    f.create_array("area_m2", data=np.full(len(flashes), 1e8, np.float32))
+    f.create_array("quality_flag", data=np.zeros(len(flashes), np.uint8))
     e = g.require_group("events")
     ev = [(la, lo, i) for i, (_, _, events) in enumerate(flashes) for la, lo in events]
     n0 = len(flashes[0][2]) if flashes else 0
     ev[n0:n0] = [(la, lo, -1) for la, lo in orphans]
-    e.array("lat", np.array([x[0] for x in ev], np.float32))
-    e.array("lon", np.array([x[1] for x in ev], np.float32))
-    e.array("flash_index", np.array([x[2] for x in ev], np.int32))
+    e.create_array("lat", data=np.array([x[0] for x in ev], np.float32))
+    e.create_array("lon", data=np.array([x[1] for x in ev], np.float32))
+    e.create_array("flash_index", data=np.array([x[2] for x in ev], np.int32))
     # One file per flash, starting at its 20 s window, but never before the store's day: a flash that
     # starts just before midnight is in the next day's first file, as in NOAA's data
     day_start = int(np.datetime64(root.attrs["day_utc"], "ns").astype(np.int64))
     w = 20 * 10**9
     fl = g.require_group("files")
-    fl.array("start_ns", np.array([max(day_start, t // w * w) for t, _, _ in flashes], np.int64))
-    fl.array("n_events", np.array([len(evs) + (len(orphans) if i == 0 else 0) for i, (_, _, evs) in enumerate(flashes)], np.int32))
-    g.require_group("coverage").array("covered", covered.astype(np.uint8))
-    zarr.consolidate_metadata(zarr.DirectoryStore(path))
+    fl.create_array("start_ns", data=np.array([max(day_start, t // w * w) for t, _, _ in flashes], np.int64))
+    fl.create_array("n_events", data=np.array([len(evs) + (len(orphans) if i == 0 else 0) for i, (_, _, evs) in enumerate(flashes)], np.int32))
+    g.require_group("coverage").create_array("covered", data=covered.astype(np.uint8))
+    consolidate(root)
 
 
 def config(tmp_path, end=DAY2, **features):
@@ -247,12 +248,18 @@ def test_frames_are_stored_whole_with_the_configured_compression(built, tmp_path
     F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
     for name in ("features", "labels", "flash_count", "flash_extent"):
         a = F[name]
-        assert a.chunks == (1, *a.shape[1:]) and (a.compressor.cname, a.compressor.clevel, a.compressor.shuffle) == ("lz4hc", 5, 1)
+        (c,) = a.compressors
+        assert a.chunks == (1, *a.shape[1:]) and (c.cname, c.clevel, c.shuffle) == ("lz4hc", 5, "shuffle")
+    # xarray masks only the _FillValue attribute in Zarr v3: unknown labels, never 0 flashes (NaN marks itself)
+    assert F["labels"].fill_value == F["labels"].attrs["_FillValue"] == 255
+    assert all("_FillValue" not in F[name].attrs for name in ("features", "flash_count", "flash_extent", "time", "lat"))
+    assert F["features"].metadata.dimension_names == ("time", "channel", "y", "x") and F["lat"].metadata.dimension_names == ("y", "x")
     other = load_feature_config(config(tmp_path, chunk_yx=[8, 8], compression={"codec": "zstd", "level": 3, "shuffle": "bit"},
                                        output_root_dir=str(tmp_path / "other")))
     build_day(other, grid, DAY1)
     G = zarr.open_consolidated(str(tmp_path / "other/2025/2025152.zarr"), mode="r")
-    assert G["features"].chunks[2:] == (8, 8) and (G["features"].compressor.cname, G["features"].compressor.shuffle) == ("zstd", 2)
+    (c,) = G["features"].compressors
+    assert G["features"].chunks[2:] == (8, 8) and (c.cname, c.shuffle) == ("zstd", "bitshuffle")
     np.testing.assert_array_equal(G["features"][:], F["features"][:])
 
 
@@ -303,6 +310,8 @@ def test_lightningcast_label_is_the_peak_one_minute_density_on_the_2km_pixels(bu
     F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
     assert list(F["label_fine"][:]) == ["lc60"] and list(F["label"][:]) == ["ext30", "cen15"]
     assert F["labels_fine"].shape == (96, 1, 2 * grid.ny, 2 * grid.nx) and F.attrs["fine_grid"]["coarsen"] == 1
+    assert F["labels_fine"].fill_value == F["labels_fine"].attrs["_FillValue"] == 255
+    assert F["labels_fine"].metadata.dimension_names == ("time", "label_fine", "y_fine", "x_fine")
     np.testing.assert_allclose(F["x_fine"][:].reshape(-1, 2).mean(axis=1), F["x"][:])  # 2 x 2 in each 4 km cell
     # Issue 00:05, window [00:00, 01:00) from the scan's slot: A (00:07) and B (00:12) in different minutes.
     # On 2 km pixels a GLM pixel covers 4.01 x 3.24: whole columns, 0.754 of the one west, 0.254 east, 0.62 of
@@ -603,7 +612,12 @@ def test_complete_day_is_rebuilt_when_its_missing_neighbour_arrives_or_it_cannot
     assert raw_neighbour_arrived(cfg, path)
     shutil.rmtree(p3)
     assert not raw_neighbour_arrived(cfg, path)
-    os.remove(os.path.join(path, ".zmetadata"))  # e.g. a store left behind by an older version
+    meta_path = os.path.join(path, "zarr.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    del meta["consolidated_metadata"]  # e.g. a store left behind by an older version
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
     assert raw_neighbour_arrived(cfg, path)
 
 
@@ -614,7 +628,7 @@ def test_rebuilding_a_day_replaces_the_store_without_leaving_one_behind(built):
     path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
     for _ in range(2):  # the second build publishes over the first one's store
         assert build_day(cfg, grid, DAY2)["complete"]
-    assert os.path.exists(os.path.join(path, ".zmetadata"))
+    assert zarr.open_consolidated(path, mode="r").attrs["complete"]
     assert not os.path.exists(path + ".old") and not os.path.exists(path + ".tmp")
 
 

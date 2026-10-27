@@ -126,6 +126,8 @@ def test_a_day_stores_every_file_cropped_and_is_rebuilt_until_complete(tmp_path,
     np.testing.assert_array_equal(g["value"][0], field(1)[10:21, 10:21])
     np.testing.assert_array_equal(g["value"][2], field(3)[10:21, 10:21])
     assert (g["value"][1] == mrms.FILL_VALUE).all() and np.isnan(g["scale_factor"][1])
+    assert g["value"].attrs["_FillValue"] == mrms.FILL_VALUE and g["value"].metadata.dimension_names == ("time", "y", "x")
+    assert [c["name"] for c in g["value"].metadata.to_dict()["codecs"]] == ["bytes", "zstd"] and g["value"].compressors[0].level == 9
     assert (g.attrs["crop_y0"], g.attrs["crop_x0"], g.attrs["source_shape"]) == (10, 10, [NJ, NI])
     np.testing.assert_allclose(g["lat"][:], 50.9 - 0.01 * np.arange(11))
     assert len(fetched) == 3

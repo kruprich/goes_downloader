@@ -1,4 +1,4 @@
-# The offline tests and pyflakes on every push and pull request, on both supported Pythons.
+# The offline tests and pyflakes on every push and pull request, on every supported Python.
 # The network tests (pytest --network) download real data and are run by hand.
 name: tests
 
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

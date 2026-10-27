@@ -23,9 +23,8 @@ speeds.
 
 ## Commands
 
-Shells here don't activate the virtual environment, so call its Python directly. Python 3.12–3.13
-only (`requires-python` in pyproject.toml): the locked numpy and pyproj need 3.12, and 3.14 can't
-install `numcodecs<0.16`. On the Mac checkout the venv uses python.org's 3.12, which has no CA
+Shells here don't activate the virtual environment, so call its Python directly. Python 3.12–3.14
+(`requires-python` in pyproject.toml): the locked numpy and pyproj need 3.12. On the Mac checkout the venv uses python.org's 3.12, which has no CA
 certificates: prefix anything that touches the network with `SSL_CERT_FILE=/etc/ssl/cert.pem`.
 
 ```bash
@@ -61,7 +60,9 @@ serve them to the byte-range code through a fake remote whose buffers start as r
 - `test_remote.py`: object URLs and `bucket` validation for both clouds; S3 (XML) and GCS (JSON)
   listing pages through continuation tokens.
 - `test_decode.py`: rounding of packed values; linking GLM events to flashes and its errors.
-- `test_store.py`: GLM tables (flash order, event links after sorting, counts, coverage).
+- `test_store.py`: ABI frames (unwritten slots read as the fill, which is also their `_FillValue`;
+  dimension names; pcodec, Blosc for 8-bit; `consolidate` raises no warning); GLM tables (flash order,
+  event links after sorting, counts, coverage, codecs; a day without GLM data).
 - `test_config.py`: config validation and IR-band precision; `crop_slice`; the entry scripts
   importing nothing outside their main guards.
 - `test_mrms.py`: GRIB2 files built like MRMS's (lat/lon grid, a real 16-bit PNG, signed packing
@@ -128,7 +129,8 @@ if __name__ == "__main__":
 - `decode`: NetCDF → packed ABI arrays and GLM flash/event tables; `DecodePool`.
 - `crop`: the bounds → scan-angle rectangle → pixel window.
 - `ranges`: byte-range fetching and decoding in the pool workers (`_RangeFile`).
-- `store`: the layout docstring; Zarr writing (`AbiProductState`, `write_glm_tables`).
+- `store`: the layout docstring; Zarr writing (`AbiProductState`, `write_glm_tables`, `consolidate`,
+  `frame_codecs`).
 - `day`: `process_single_day`.
 - `runner`: `run_all_days`; `main` handles Ctrl-C and prints the report unless `--no-report`.
 - `report`: `day_rows`, `problems`, `print_report`.
@@ -137,7 +139,7 @@ if __name__ == "__main__":
   dates, bounds and HTTP settings), a GRIB2 reader for MRMS's one layout (`decode_mrms`: template 3.0
   grid, 5.41 PNG packing decoded by Pillow, no bitmap; anything else is refused), `crop_window`,
   `process_mrms_day` and `main`. It reuses `remote`'s listing and `http_get` and decodes in threads
-  (gzip, Pillow and Blosc release the GIL), so it has no process pool and none of the worker import
+  (gzip, Pillow and zstd release the GIL), so it has no process pool and none of the worker import
   rules below. It filters files by `remote.LIST_HOURS` too, so the short-run harness works for it.
 
 Pool workers import only `ranges`/`decode` and what they need: `download_raw.py` keeps its imports
@@ -196,17 +198,26 @@ values forward with `fill_gaps`, or read by such a channel) are computed at ever
 at output slots, which cut a day from 42–44 s to 32 s with identical output. The cache keeps only
 the slots `lag`/`*_past` still need. `run_build` rebuilds a complete day when a raw day it recorded
 as missing or incomplete has since completed, or when its store can't be read (`raw_neighbour_arrived`);
-on Ctrl-C it terminates the workers, which run multiprocessing's finalizers before exiting (`_exit_now`)
-so numcodecs' lock isn't reported as a leaked semaphore, and the pool is always shut down so its atexit
-hook can't join the queued days. `build_day` publishes by renaming any existing store to `<day>.zarr.old`
+on Ctrl-C it terminates the workers, which exit at once (`_exit_now`: exiting through Python would let
+the pool's worker loop start the next day), and the pool is always shut down so its atexit hook can't
+join the queued days. `build_day` publishes by renaming any existing store to `<day>.zarr.old`
 before moving `.tmp` into place, so a worker killed mid-publish can't leave a store that reads as
 complete with its arrays deleted; `run_build` removes leftover `.old` directories.
 
 **Invariants that are easy to break:**
-- Arrays written in full must use `_write_array` (`fill_value=None` + `_ARRAY_DIMENSIONS`).
-  zarr's default fill of 0 makes xarray read every legitimate 0 as missing.
+- Every store is Zarr format 3 (`zarr.open_group(..., zarr_format=3)`); code tells a store exists by
+  its `zarr.json`, so format-2 stores from before count as missing and are rebuilt. Every array names
+  its dimensions (`dimension_names`); arrays written in full use `_write_array`. Consolidate with
+  `store.consolidate`, which silences zarr's warning that consolidated metadata isn't in the v3 spec.
 - Frame arrays (`value`, `dqf`) keep a real fill value because unwritten slots must read as
   missing; products whose files lack `_FillValue` use 65535.
+- Raw ABI frames and GLM columns take their codec from `frame_codecs(dtype)`: pcodec 8, except 8-bit
+  arrays (DQF, `quality_flag`), which pcodec can't encode and keep Blosc zstd 3 with bitshuffle. MRMS
+  frames use plain zstd 9 and feature frames the configured Blosc (`features.compression`).
+- xarray ignores a Zarr v3 array's fill value and masks only a `_FillValue` attribute. Integer frames
+  with a fill (ABI `value`/`dqf`, MRMS `value`, `labels`, `labels_fine`) repeat it as `_FillValue`,
+  so xarray reads fills as NaN as it did with format 2. Arrays written in full (fill 0) must not have
+  one, or legitimate zeros would read as missing; NaN fills need none.
 - Values stay packed (`physical = value * scale_factor + add_offset`, stored per slot). The user
   decided against storing physical values or CF packing attributes.
 - The `bounds` rectangle comes from the first ABI scan decoded each day (all ABI products share
@@ -248,8 +259,8 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   scan's own slot for a label with `start_minutes` -5, which is for evaluation only. Labels are 255
   where GLM covered less than `glm.min_coverage`; GLM channels are NaN likewise. A label with a finer
   `resolution_km` goes to `labels_fine`; its cells must nest in the grid's (`TargetGrid.finer`).
-- `flash_count` and `flash_extent` are written in full with `fill_value=None`; `features` uses NaN and
-  `labels` 255. A feature day is complete only if every raw day it read inside the download range is;
+- `flash_count` and `flash_extent` are written in full (fill 0, no `_FillValue`); `features` uses NaN
+  and `labels` 255. A feature day is complete only if every raw day it read inside the download range is;
   days next to the range's ends are rebuilt once a missing neighbour arrives (`raw_neighbour_arrived`).
 - The entry scripts import nothing outside their main guard (spawn workers re-run them).
 
@@ -266,21 +277,26 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   `goes_raw*/` is git-ignored). `goes_raw/` holds 28 days from an older product list (bands 8, 11,
   13, 15; no GLM events) that the user kept; don't mix it with `goes_raw2/`. Current config:
   2025-04-10 (GOES-19 became operational as GOES-East on 2025-04-07) to 2026-09-25, 534 days, about
-  2.1 GB/day stored
-  with the NOAA CONUS bounds (~1.12–1.24 TB). With `"byte_ranges"` a day downloads 4.9 GB and
+  1.7 GB/day stored (2025-10-27; 2.0 GB on 2025-07-15) with the NOAA CONUS bounds and pcodec, so
+  ~0.9–1.0 TB for the range (Blosc zstd 3 with bitshuffle stored 18% more, the same CPU). With `"byte_ranges"` a day downloads 4.9 GB and
   took 95–110 s from Google Cloud on a ~60 MB/s connection (14–16 h for the range); `"whole_files"`
   would download 16.1 GB/day because of the MCMIPC files. README's speed and memory figures are from
   Google Cloud except its "Choosing a cloud" section: on the 8-core, 16 GB Mac with 24 processes a day
   took 2 min 53 s from AWS and 4 min 01 s from Google Cloud (one run each, identical stores).
 - Features go to `features.output_root_dir` (`./goes_features`, git-ignored) with `geography.zarr`
-  in it; geography sources are cached in `./goes_static`. Current config: about 0.37 GB/day
-  (~200 GB for the range), stored as whole-frame LZ4 9 chunks (reads 0.85 ms/frame, as fast as LZ4HC
-  and 11x faster than zstd in 256x256 chunks; LZ4HC 5 stores 14% less for 8.9 CPU-seconds a day).
-  Building is CPU-bound: each pool worker gets one Blosc thread (`_init_worker`) and `max_workers` is
-  the core count (12), which builds a day in 11.9 s against 15.8 s for 4 workers with Blosc threading
-  over every core. A day on its own takes ~27 s and 113 CPU-seconds. Much slower next to a download:
-  use far fewer `--workers` then.
+  in it; geography sources are cached in `./goes_static`. Current config: about 0.32 GB/day
+  (~175 GB for the range), stored as whole-frame LZ4HC 5 chunks. On 2025-07-15 with zarr 3 that stored
+  13% less than LZ4 9 and read a whole frame in 2.7 ms against 3.1 ms, for ~7 more CPU-seconds a day;
+  zstd 3 stored 3% less but read in 5.4 ms, pcodec as little but in 9.1 ms (zarr 2: whole-frame chunks
+  read 11x faster than zstd in 256x256 chunks).
+  Building is CPU-bound and zarr 3 runs Blosc on one thread, so `max_workers` is the core count (12).
+  Measured with zarr 2 and one Blosc thread per worker, that built a day in 11.9 s against 15.8 s for
+  4 workers with Blosc threading over every core, and a day on its own took ~27 s and 113 CPU-seconds.
+  zarr 3 measured 3–9% slower than zarr 2 on identical output (October 2026, 2025-07-15 alone: 47.0 s
+  against 43.2 s; 3 days on 3 workers: 65.3 s against 62.6 s). Much slower next to a download: use
+  far fewer `--workers` then.
 - MRMS goes to `mrms.output_root_dir` (`./mrms_raw`, git-ignored). Current config: the -10 °C
-  reflectivity only, 720 files a day, ~1 GB/day downloaded and ~0.8 GB stored (zstd with byte
-  shuffle: bitshuffle stored 53% more), 37–39 s a day with 8 threads and ~0.9 GB peak memory, so
-  about 5.5 h and 400–430 GB for the range.
+  reflectivity only, 720 files a day, ~1 GB/day downloaded and ~0.72 GB stored with plain zstd 9
+  (Blosc zstd 3 stored 10% more with byte shuffle and 67% more with bitshuffle, pcodec 31% more),
+  45–47 s a day with 8 threads and ~1.1 GB peak memory (zstd 9 costs ~1.5 s of that; on 2026-10-26
+  the network was slower than for the earlier 37–39 s), so about 7 h and 370–400 GB for the range.

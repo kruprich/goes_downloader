@@ -194,7 +194,7 @@ def make_grid(cfg: FeatureConfig) -> TargetGrid:
     groups: Dict[str, Any] = {}
     for day in iter_days_utc(cfg.start_date_utc, cfg.end_date_utc):
         path = output_zarr_path_for_day(cfg.raw.raw_output_root_dir, day)
-        if not os.path.exists(os.path.join(path, ".zgroup")):
+        if not os.path.exists(os.path.join(path, "zarr.json")):
             continue
         root = zarr.open_consolidated(path, mode="r")
         groups = {k: root[f"abi/{k}"] for k in products if f"abi/{k}" in root and root[f"abi/{k}"].attrs.get("has_frames")}

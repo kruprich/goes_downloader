@@ -20,7 +20,8 @@ For each UTC day it:
    files late. Incomplete days are rebuilt on the next run.
 
 The docstring at the top of `goes_downloader/store.py` describes the full store layout,
-including every attribute.
+including every attribute. Every store is Zarr format 3. Stores written in Zarr format 2 by earlier
+versions of this code count as missing: `report.py` lists them so, and the next run rebuilds them.
 
 ## Files
 
@@ -38,8 +39,7 @@ including every attribute.
 
 ## Setup
 
-Use Python 3.12 or 3.13. Python 3.14 is not supported: `zarr<3` needs `numcodecs<0.16`, which
-has no 3.14 wheel.
+Use Python 3.12, 3.13 or 3.14.
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate
@@ -52,7 +52,8 @@ work the same way.
 What a run needs with the example config. These figures were measured on one October day, read
 from Google Cloud on a 12-core machine with a ~60 MB/s connection:
 
-- **Disk:** about 2.1 GB per day. Summer days hold more daylight imagery and take more.
+- **Disk:** about 1.7 GB per day (re-measured on 2025-10-27 after the switch to pcodec). Summer days
+  hold more daylight imagery and take more: 2.0 GB on 2025-07-15.
 - **Network:** about 4.9 GB per day. A day took 95–110 s.
 - **Memory:** about 10 GB in total. The 48 byte-range workers use 7.2–7.7 GB. The main process
   uses up to 1.9 GB, because it holds a day's GLM events until the day is written. Lower
@@ -162,9 +163,11 @@ new products, delete them or set `overwrite_existing`.
 
 ## Reading the data
 
-Reading needs `xarray` and `dask` (`pip install xarray dask`), which the downloader doesn't
-install. Each day store opens directly with xarray, one product or GLM table at a time, and
-several days combine into one time series:
+Reading needs `xarray` and `dask`, which the downloader doesn't install, in releases that read Zarr
+format 3 with zarr 3 (these examples were checked with xarray 2026.9 and dask 2026.8). ABI frames and
+GLM columns are pcodec-encoded, so an environment without the downloader also needs
+`numcodecs[pcodec]`: `pip install xarray dask "numcodecs[pcodec]"`. Each day store opens directly with
+xarray, one product or GLM table at a time, and several days combine into one time series:
 
 ```python
 import glob, xarray as xr
@@ -249,13 +252,18 @@ its data through September 2026.
   - The example config uses 24–50°N, 125–66°W, NOAA NCEI's contiguous-US box, which keeps about
     65% of the ABI pixels.
 
-With the example config a day stores about 2.1 GB:
+With the example config a day stores about 1.7 GB (2025-10-27):
 
 | Product | Per day |
 |---|---|
-| Bands 13 and 15 | 0.46 GB each |
-| Bands 2 and 5 | 0.37 GB each (they shrink to about a tenth at night) |
-| GLM | 0.24 GB |
+| Bands 13 and 15 | 0.37 GB each |
+| Bands 2 and 5 | 0.36–0.37 GB each (they shrink to about a tenth at night) |
+| ACHA, TPW and the three DSI indices (10 km) | 0.13 GB together |
+| GLM | 0.13 GB |
+
+ABI frames and GLM columns are stored with pcodec, and the 8-bit quality flags with Blosc zstd. On
+2025-07-15 that stored 18% less than Blosc zstd 3 with bitshuffle everywhere (2.02 against 2.45 GB),
+for the same CPU time to write and read. Stronger Blosc settings saved at most 11% at 27 times the CPU.
 
 ## Config options for speed
 
@@ -317,10 +325,13 @@ Measured with 8 threads on Kevin's 12-core workstation (2026-10-26), one run per
 
 | Day | Downloaded | Stored | Time | Peak memory |
 |---|---|---|---|---|
-| 2026-07-14 | 0.94 GB | 0.76 GB | 39 s | 0.89 GB |
-| 2025-10-27 | 1.08 GB | 0.81 GB | 37 s | 0.95 GB |
+| 2026-07-14 | 0.94 GB | 0.70 GB | 47 s | 1.16 GB |
+| 2025-10-27 | 1.08 GB | 0.74 GB | 47 s | 1.04 GB |
 
-At that rate the configured 534 days take about 5.5 hours and 400–430 GB of disk.
+At that rate the configured 534 days take about 7 hours and 370–400 GB of disk. The frames are
+stored with plain zstd 9. Blosc zstd 3 with byte shuffle, used before, stored 10% more (0.81 GB on
+2025-10-27) and took 43.6–44.5 s against 45.5–45.9 s for zstd 9 in two runs each; the rest of the
+difference from the 37–39 s measured earlier the same day was the network.
 
 ## Building features
 
@@ -364,10 +375,12 @@ folder.
   step.
 - `dtype` (`float16`), `chunk_yx` (`null`: one chunk per time step) and `compression` (Blosc
   `codec`, `level`, `shuffle`): how the frames are stored.
-  - Training reads whole frames, which one chunk per frame makes fast: about 0.85 ms per frame with
-    LZ4, against 9.8 ms with zstd in 256x256 chunks.
-  - LZ4HC 5 (the default) reads just as fast and stores 14% less than LZ4 9, but compresses more
-    slowly.
+  - Training reads whole frames, which one chunk per frame makes fast (an earlier zarr 2 measurement:
+    about 0.85 ms per frame with LZ4, against 9.8 ms with zstd in 256x256 chunks).
+  - LZ4HC 5 (the default and the example config's) stores 13% less than LZ4 9 and reads as fast. On
+    2025-07-15 with zarr 3, a whole frame of 11 channels read in 2.7 ms against 3.1 ms, for about 7
+    more CPU-seconds per day to build. zstd 3 stored 3% less than LZ4HC 5 but read in 5.4 ms, and
+    pcodec stored as little as zstd 3 but read in 9.1 ms.
 
 Time `t` is the start of a 5-minute ABI slot. The **issue time** is `t + 5 min`: every input ends
 there, and every label window starts there.
@@ -530,12 +543,14 @@ The example config defines these fields:
 
 ### Size and speed
 
-With the example config (11 stored channels, 4 km cells, every 15 minutes, float16, LZ4 9), a day
-stores about 0.37 GB.
+With the example config (11 stored channels, 4 km cells, every 15 minutes, float16, LZ4HC 5), a day
+stores about 0.32 GB: 0.35 GB on 2025-07-15, against 0.41 GB with LZ4 9, which stored about 0.37 GB
+on an average day.
 
-Building is CPU-bound. On its own a day takes about 27 s. With `max_workers` set to the core count,
-12 workers on 12 cores built a day every ~12 s. Building next to a running download is much slower,
-so use far fewer `--workers` then. The geography store takes about 16 s once its sources are cached.
+Building is CPU-bound. On its own 2025-07-15 took 51 s (zarr 3, LZ4HC 5). With `max_workers` set to
+the core count, 12 workers on 12 cores built a day every ~12 s (an earlier measurement, with zarr 2
+and LZ4 9). Building next to a running download is much slower, so use far fewer `--workers` then.
+The geography store takes about 16 s once its sources are cached.
 
 ## Choosing a cloud
 
@@ -557,11 +572,11 @@ pytest --network    # also real files and a full test hour both ways (~0.5 GB, ~
 ```
 
 The network tests read from the configured `bucket`, and check that both clouds list the same files
-for the test hour. GitHub Actions runs pyflakes and the offline tests on Python 3.12 and 3.13.
+for the test hour. GitHub Actions runs pyflakes and the offline tests on Python 3.12, 3.13 and 3.14.
 
 ## Troubleshooting
 
-- **"requires a different Python" when installing:** use Python 3.12 or 3.13.
+- **"requires a different Python" when installing:** use Python 3.12, 3.13 or 3.14.
 - **`CERTIFICATE_VERIFY_FAILED` (every listing fails):** the python.org installer for macOS comes
   without CA certificates. Run its `Install Certificates.command` once, or start the commands with
   `SSL_CERT_FILE=/etc/ssl/cert.pem`.

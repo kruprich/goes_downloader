@@ -61,7 +61,7 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   listing pages through continuation tokens.
 - `test_decode.py`: rounding of packed values; linking GLM events to flashes and its errors.
 - `test_store.py`: ABI frames (unwritten slots read as the fill, which is also their `_FillValue`;
-  dimension names; pcodec, Blosc for 8-bit; `consolidate` raises no warning); GLM tables (flash order,
+  dimension names; pcodec, Blosc for 8-bit; chunks are flat files; `consolidate` raises no warning); GLM tables (flash order,
   event links after sorting, counts, coverage, codecs; a day without GLM data).
 - `test_config.py`: config validation and IR-band precision; `crop_slice`; the entry scripts
   importing nothing outside their main guards.
@@ -207,8 +207,12 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
 **Invariants that are easy to break:**
 - Every store is Zarr format 3 (`zarr.open_group(..., zarr_format=3)`); code tells a store exists by
   its `zarr.json`, so format-2 stores from before count as missing and are rebuilt. Every array names
-  its dimensions (`dimension_names`); arrays written in full use `_write_array`. Consolidate with
+  its dimensions (`dimension_names`); arrays written in full use `_write_array`. Every array passes
+  `chunk_key_encoding=CHUNK_KEYS` (`c.<slot>.0.0` files): zarr 3's default nests each chunk in two 4 KB
+  directories, ~28 GB over the range (`chunk_dirs` in the tests finds them). Consolidate with
   `store.consolidate`, which silences zarr's warning that consolidated metadata isn't in the v3 spec.
+  zarr 3 refuses numpy scalars in attributes (only `np.float64` passes) and a failed write leaves the
+  group unable to write attributes: convert values with `int()`/`float()` first.
 - Frame arrays (`value`, `dqf`) keep a real fill value because unwritten slots must read as
   missing; products whose files lack `_FillValue` use 65535.
 - Raw ABI frames and GLM columns take their codec from `frame_codecs(dtype)`: pcodec 8, except 8-bit

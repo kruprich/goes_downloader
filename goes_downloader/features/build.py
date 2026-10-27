@@ -22,7 +22,7 @@ from zarr.codecs import BloscCodec
 
 from ..common import SLOTS_PER_DAY, TIME_ATTRS, iter_days_utc
 from ..progress import format_duration, log
-from ..store import _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
+from ..store import CHUNK_KEYS, _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 from .expressions import Evaluator, make_plan
 from .geography import build_geography, geography_grid
 from .glm import FOOTPRINT, SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
@@ -169,9 +169,9 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     compressor = BloscCodec(cname=codec, clevel=level, shuffle={"byte": "shuffle", "bit": "bitshuffle", "none": "noshuffle"}[shuffle])
 
     def frames(name: str, lead: List[int], dtype: Any, fill: Any, dims: List[str], **attrs: Any) -> Any:
-        return root.create_array(name, shape=(n_t, *lead, *shape), chunks=(1, *lead, cy, cx), dtype=dtype, fill_value=fill,
-                                 compressors=compressor, dimension_names=dims, attributes={"coordinates": "lat lon", **attrs},
-                                 overwrite=True)
+        return root.create_array(name, shape=(n_t, *lead, *shape), chunks=(1, *lead, cy, cx), chunk_key_encoding=CHUNK_KEYS,
+                                 dtype=dtype, fill_value=fill, compressors=compressor, dimension_names=dims,
+                                 attributes={"coordinates": "lat lon", **attrs}, overwrite=True)
 
     # A label fill is also the _FillValue attribute: xarray masks that, not a Zarr v3 array's fill value
     features = frames("features", [len(outputs)], cfg.dtype, np.nan, ["time", "channel", "y", "x"])
@@ -180,7 +180,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     fine_arr = None
     if fine is not None:
         fine_arr = root.create_array("labels_fine", shape=(n_t, len(fine_labels), fine.ny, fine.nx),
-                                     chunks=(1, len(fine_labels), fine.ny, fine.nx), dtype=np.uint8, fill_value=LABEL_UNKNOWN,
+                                     chunks=(1, len(fine_labels), fine.ny, fine.nx), chunk_key_encoding=CHUNK_KEYS,
+                                     dtype=np.uint8, fill_value=LABEL_UNKNOWN,
                                      compressors=compressor, dimension_names=["time", "label_fine", "y_fine", "x_fine"],
                                      attributes={"_FillValue": LABEL_UNKNOWN}, overwrite=True)
     # Every slot is written. Without a _FillValue attribute xarray doesn't read 0 flashes as missing

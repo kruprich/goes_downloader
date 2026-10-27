@@ -61,7 +61,7 @@ from .common import TIME_ATTRS, iter_days_utc, to_ns
 from .config import BUCKET_PATTERN, LatLonBounds, RawConfig, load_config
 from .day import MIN_AGE_FOR_COMPLETE, MAX_ERRORS_LOGGED_PER_DAY
 from .progress import format_duration, log
-from .store import _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
+from .store import CHUNK_KEYS, _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 
 MRMS_KEYS = {"bucket", "output_root_dir", "threads", "products"}
 MRMS_PRODUCT_KEYS = {"key", "prefix", "description"}
@@ -235,8 +235,8 @@ class ProductDay:
         g = root.require_group(self.product.key)
         g.attrs.update({"source_shape": list(dec["value"].shape), "crop_y0": self.ys.start, "crop_x0": self.xs.start})
         # The fill is also the _FillValue attribute: xarray masks that, not a Zarr v3 array's fill value
-        self.value = g.create_array("value", shape=(len(self.files), *shape), chunks=(1, *shape), dtype="u2",
-                                    fill_value=FILL_VALUE, compressors=COMPRESSOR, dimension_names=["time", "y", "x"],
+        self.value = g.create_array("value", shape=(len(self.files), *shape), chunks=(1, *shape), chunk_key_encoding=CHUNK_KEYS,
+                                    dtype="u2", fill_value=FILL_VALUE, compressors=COMPRESSOR, dimension_names=["time", "y", "x"],
                                     attributes={"_FillValue": FILL_VALUE, "coordinates": "lat lon"}, overwrite=True)
 
     def write(self, i: int, dec: Dict[str, Any]) -> None:

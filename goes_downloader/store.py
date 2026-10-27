@@ -8,7 +8,8 @@ Layout of <raw_output_root_dir>/YYYY/YYYYDDD.zarr
 
 Zarr format 3. Every array names its dimensions and each day's metadata is consolidated into its root
 zarr.json, so xarray can open the stores (see "Reading with xarray" below). ABI frames and GLM columns are
-encoded with pcodec (8-bit ones with Blosc zstd), so reading them needs numcodecs' pcodec package.
+encoded with pcodec (8-bit ones with Blosc zstd), so reading them needs numcodecs' pcodec package. Chunk
+keys use "." (abi/<key>/value/c.<slot>.0.0), so each array's chunks are files in its own directory.
 
 ABI: one group per configured product, one slot per 5-min CONUS scan (288 per day).
 Each product keeps its source grid (CMIP bands 1, 3, 5: 1 km and band 2: 0.5 km in their own files, every
@@ -133,6 +134,9 @@ def consolidate(group: Any) -> None:
 
 
 COMPRESSOR = BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")
+# Chunk files c.<slot>.0.0 in the array's directory. zarr 3's default "/" makes c/<slot>/0/0, two 4 KB
+# directories per frame chunk: ~28 GB over the configured range of raw, MRMS and feature days
+CHUNK_KEYS = {"name": "default", "separator": "."}
 
 
 def frame_codecs(dtype: Any) -> Dict[str, Any]:
@@ -152,7 +156,8 @@ def _write_array(group: Any, name: str, data: np.ndarray, dims: List[str], **att
     default (0), which xarray ignores in Zarr v3, so legitimate zeros aren't read as missing.
     """
     options = attrs.pop("zarr", {})
-    return group.create_array(name, data=data, dimension_names=dims, attributes=attrs, overwrite=True, **options)
+    return group.create_array(name, data=data, dimension_names=dims, attributes=attrs, chunk_key_encoding=CHUNK_KEYS,
+                              overwrite=True, **options)
 
 
 GLM_FLASH_COLUMNS = {
@@ -217,7 +222,7 @@ class AbiProductState:
                     "crop_x0": self.xs.start or 0,
                 }
             )
-            common = dict(overwrite=True, chunks=(1, shape[0], shape[1]), dimension_names=["time", "y", "x"])
+            common = dict(overwrite=True, chunks=(1, shape[0], shape[1]), chunk_key_encoding=CHUNK_KEYS, dimension_names=["time", "y", "x"])
             coordinates = "x_scan_angle_rad y_scan_angle_rad"
             # The fills are also the _FillValue attributes: xarray masks those, not a Zarr v3 array's fill value
             self.value_array = g.create_array(

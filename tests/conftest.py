@@ -21,6 +21,11 @@ def same(a, b):
     return a.shape == b.shape and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
 
 
+def chunk_dirs(store):
+    """Directories in a Zarr store that are neither a group nor an array: chunk directories (store.CHUNK_KEYS avoids them)."""
+    return [d for d, _, files in os.walk(store) if "zarr.json" not in files]
+
+
 def pytest_addoption(parser):
     parser.addoption("--network", action="store_true", help="also run tests that download real GOES files")
 

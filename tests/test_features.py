@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import zarr
 
-from conftest import PROJECTION, REPO
+from conftest import PROJECTION, REPO, chunk_dirs
 from goes_downloader.common import SLOTS_PER_DAY
 from goes_downloader.crop import latlon_to_scan_angle
 from goes_downloader.features.build import build_day, check_geography
@@ -261,6 +261,8 @@ def test_frames_are_stored_whole_with_the_configured_compression(built, tmp_path
     (c,) = G["features"].compressors
     assert G["features"].chunks[2:] == (8, 8) and (c.cname, c.shuffle) == ("zstd", "bitshuffle")
     np.testing.assert_array_equal(G["features"][:], F["features"][:])
+    # Chunks are files in their array's directory, also with several chunks per frame
+    assert chunk_dirs(str(tmp_path / "features/2025/2025152.zarr")) == chunk_dirs(str(tmp_path / "other/2025/2025152.zarr")) == []
 
 
 def test_lag_reads_the_previous_day_and_mask_follows_the_sun(built, tmp_path):

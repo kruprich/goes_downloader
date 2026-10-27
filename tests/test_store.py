@@ -1,11 +1,13 @@
 """Writing the stores: ABI frames and their fill values; the GLM tables (flash order, event links, per-file counts, coverage)."""
 
+import os
 import warnings
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import zarr
 
+from conftest import chunk_dirs
 from goes_downloader.common import GLM_WINDOWS_PER_DAY, SLOT_SECONDS, SLOTS_PER_DAY, to_ns
 from goes_downloader.config import ProductSpec
 from goes_downloader.decode import decode_abi_file
@@ -110,3 +112,5 @@ def test_abi_frames_keep_their_fill_for_zarr_and_xarray(tmp_path, abi_bytes):
     for name in ("time", "present", "scale_factor", "scan_start_ns"):
         assert g[name].metadata.dimension_names == ("time",) and "_FillValue" not in g[name].attrs
     assert g["present"][:].tolist() == [0] * 5 + [1] + [0] * (SLOTS_PER_DAY - 6) and g.attrs["n_present"] == 1
+    # Chunks are files in their array's directory (c.5.0.0), not zarr 3's default c/5/0/0 directories
+    assert os.path.isfile(os.path.join(path, "abi/c13/value/c.5.0.0")) and chunk_dirs(path) == []

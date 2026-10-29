@@ -315,8 +315,10 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
 - MRMS goes to `mrms.output_root_dir` (`./mrms_raw`, git-ignored). Current config: the -10 °C
   reflectivity only, 720 files a day, ~1 GB/day downloaded and ~0.72 GB stored with plain zstd 9
   (Blosc zstd 3 stored 10% more with byte shuffle and 67% more with bitshuffle, pcodec 31% more),
-  45–47 s a day with 8 threads and ~1.1 GB peak memory (zstd 9 costs ~1.5 s of that; on 2026-10-26
-  the network was slower than for the earlier 37–39 s), so about 7 h and 370–400 GB for the range.
+  24–28 s a day with 8 threads and ~2.2 GB peak memory (2026-10-28; zstd 9 costs ~1.5 s of that), so
+  about 4 h and 370–400 GB for the range. Decoding was the limit: `decode_mrms` crops in Pillow before
+  the numpy conversion, as whole-field copies (~50 MB each) page-faulted and kept 8 threads to ~20
+  files/s (the day took 45–47 s at ~1.1 GB peak).
   The feature config's `refl_m10c_max` reads it, so download MRMS before building features: a feature
   day is incomplete until the MRMS days it reads are, and is built again when they arrive. The channel
   adds ~9 MB and 6–14 s per feature day.

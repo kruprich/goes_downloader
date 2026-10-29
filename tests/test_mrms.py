@@ -58,7 +58,12 @@ def test_grib2_png_fields_decode_to_the_packed_values():
     assert dec["scale_factor"] == 0.05 and dec["add_offset"] == -999.0  # 2**-1 / 10, -9990 / 10
     np.testing.assert_allclose(dec["lat"], 51.0 - 0.01 * np.arange(NJ))
     np.testing.assert_allclose(dec["lon"], -100.0 + 0.01 * np.arange(NI))
+    assert dec["source_shape"] == (NJ, NI) and (dec["ys"], dec["xs"]) == (slice(0, NJ), slice(0, NI))
     assert mrms.decode_mrms(grib2(values, lat1=-10.0))["lat"][0] == -10.0  # a negative latitude: sign bit
+    cropped = mrms.decode_mrms(grib2(values), LatLonBounds(50.80, 50.90, -99.90, -99.85))  # cropped in Pillow
+    assert (cropped["ys"], cropped["xs"]) == (slice(10, 21), slice(10, 16))
+    np.testing.assert_array_equal(cropped["value"], values[10:21, 10:16])
+    assert len(cropped["lat"]) == NJ and cropped["source_shape"] == (NJ, NI)
 
 
 def test_other_packings_are_refused():

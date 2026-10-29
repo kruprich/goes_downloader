@@ -134,9 +134,10 @@ def _signed(b: bytes) -> int:
     return -(v - top) if v & top else v
 
 
-def decode_mrms(payload: bytes) -> Dict[str, Any]:
+def decode_mrms(payload: bytes, bounds: Optional[LatLonBounds] = None) -> Dict[str, Any]:
     """
-    One gzipped MRMS GRIB2 file -> {value [lat, lon] uint16 as packed, scale_factor, add_offset, lat, lon}.
+    One gzipped MRMS GRIB2 file -> {value [y, x] uint16 as packed, cropped to the bounds (crop_window: ys, xs),
+    scale_factor, add_offset, lat, lon (the file's whole grid), source_shape}.
     MRMS files hold one field on a regular lat/lon grid (template 3.0, rows north to south) packed as a
     16-bit PNG image (template 5.41) without a bitmap; anything else is refused rather than misread.
     """
@@ -163,15 +164,25 @@ def decode_mrms(payload: bytes) -> Dict[str, Any]:
     di, dj = int.from_bytes(s3[63:67], "big") * 1e-6, int.from_bytes(s3[67:71], "big") * 1e-6
     reference = struct.unpack(">f", s5[11:15])[0]
     e, d = _signed(s5[15:17]), _signed(s5[17:19])
-    value = np.asarray(Image.open(io.BytesIO(s7[5:])))
-    if value.shape != (nj, ni) or value.dtype != np.uint16:
-        raise ValueError(f"PNG image is {value.dtype} {value.shape}, expected uint16 {(nj, ni)}")
+    lat, lon = lat1 - dj * np.arange(nj), (lon1 + di * np.arange(ni) + 180.0) % 360.0 - 180.0
+    ys, xs = crop_window(lat, lon, bounds)
+    image = Image.open(io.BytesIO(s7[5:]))
+    if image.size != (ni, nj):
+        raise ValueError(f"PNG image is {image.size[1]} x {image.size[0]}, expected {nj} x {ni}")
+    # Cropping before the conversion to numpy doubled the decoding rate on 8 threads: the whole field
+    # (~50 MB) is otherwise copied several times into fresh memory, and those page faults don't run in parallel
+    value = np.asarray(image.crop((xs.start, ys.start, xs.stop, ys.stop)))
+    if value.dtype != np.uint16:
+        raise ValueError(f"PNG image is {value.dtype}, expected uint16")
     return {
         "value": value,
+        "ys": ys,
+        "xs": xs,
+        "source_shape": (nj, ni),
         "scale_factor": 2.0**e / 10.0**d,
         "add_offset": reference / 10.0**d,
-        "lat": lat1 - dj * np.arange(nj),
-        "lon": (lon1 + di * np.arange(ni) + 180.0) % 360.0 - 180.0,
+        "lat": lat,
+        "lon": lon,
     }
 
 
@@ -224,17 +235,16 @@ class ProductDay:
         self.scale_factor, self.add_offset = np.full(n, np.nan), np.full(n, np.nan)
         self.present = np.zeros(n, np.uint8)
 
-    def accept(self, root: Any, dec: Dict[str, Any], bounds: Optional[LatLonBounds]) -> None:
+    def accept(self, root: Any, dec: Dict[str, Any]) -> None:
         """Creates the frame array from the first file decoded; later files must be on its grid."""
         if self.value is not None:
             if not (np.array_equal(dec["lat"], self.lat) and np.array_equal(dec["lon"], self.lon)):
                 raise ValueError(f"{self.product.key}: grid differs from the day's first file")
             return
-        self.lat, self.lon = dec["lat"], dec["lon"]
-        self.ys, self.xs = crop_window(self.lat, self.lon, bounds)
-        shape = (self.ys.stop - self.ys.start, self.xs.stop - self.xs.start)
+        self.lat, self.lon, self.ys, self.xs = dec["lat"], dec["lon"], dec["ys"], dec["xs"]
+        shape = dec["value"].shape
         g = root.require_group(self.product.key)
-        g.attrs.update({"source_shape": list(dec["value"].shape), "crop_y0": self.ys.start, "crop_x0": self.xs.start})
+        g.attrs.update({"source_shape": list(dec["source_shape"]), "crop_y0": self.ys.start, "crop_x0": self.xs.start})
         # The fill is also the _FillValue attribute: xarray masks that, not a Zarr v3 array's fill value
         self.value = g.create_array("value", shape=(len(self.files), *shape), chunks=(1, *shape), chunk_key_encoding=CHUNK_KEYS,
                                     dtype="u2", fill_value=FILL_VALUE, compressors=COMPRESSOR, dimension_names=["time", "y", "x"],
@@ -242,7 +252,7 @@ class ProductDay:
 
     def write(self, i: int, dec: Dict[str, Any]) -> None:
         # One chunk per file, so concurrent writes never touch the same chunk
-        self.value[i] = dec["value"][self.ys, self.xs]
+        self.value[i] = dec["value"]
         self.scale_factor[i], self.add_offset[i] = dec["scale_factor"], dec["add_offset"]
         self.present[i] = 1
 
@@ -289,8 +299,9 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     root.attrs.update({"day_utc": label, "source_bucket": cfg.raw.bucket, "product_keys": [p.key for p in cfg.products],
                        "bounds": vars(cfg.raw.bounds) if cfg.raw.bounds is not None else None, "complete": False})
 
-    # Downloads run ahead of the decoding threads by at most as many files again
-    inflight = asyncio.Semaphore(2 * cfg.threads)
+    # Up to max_concurrent_http_requests files download while the threads decode and write others: with only as
+    # many again as threads, the files being decoded held half the slots and a day downloaded at ~22 MB/s
+    inflight = asyncio.Semaphore(cfg.threads + cfg.raw.max_concurrent_http_requests)
     errors: List[str] = []
     downloaded = 0
 
@@ -302,9 +313,9 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
                 downloaded += len(payload)
                 if progress is not None:
                     progress.add_bytes(label, sizes[name], len(payload))
-                dec = await asyncio.to_thread(decode_mrms, payload)
+                dec = await asyncio.to_thread(decode_mrms, payload, cfg.raw.bounds)
                 del payload
-                state.accept(root, dec, cfg.raw.bounds)  # in the event loop, so the first file creates the array once
+                state.accept(root, dec)  # in the event loop, so the first file creates the array once
                 await asyncio.to_thread(state.write, i, dec)
             except Exception as e:
                 errors.append(name)

@@ -321,19 +321,24 @@ as the GOES stores. The docstring of `goes_downloader/mrms.py` describes the lay
 these stores through `mrms` channels (see [MRMS channels](#mrms-channels)).
 
 The files are GRIB2 with the field packed as a PNG image; Pillow decodes the image, and the decoded
-values match eccodes exactly (checked on five files from 2025-04-10 to 2026-09-25).
+values match eccodes exactly (checked on five files from 2025-04-10 to 2026-09-25). Pillow crops the
+image to `bounds` before it becomes a numpy array: converting the whole 7000 × 3500 field first copied
+~50 MB per file into fresh memory several times, and those page faults kept 8 threads to ~20 files/s
+(45 files/s cropped first). Up to `max_concurrent_http_requests` files download while the threads
+decode others.
 
-Measured with 8 threads on Kevin's 12-core workstation (2026-10-26), one run per day, 720 files each:
+Measured with 8 threads on Kevin's 12-core workstation (2026-10-28), 720 files a day:
 
 | Day | Downloaded | Stored | Time | Peak memory |
 |---|---|---|---|---|
-| 2026-07-14 | 0.94 GB | 0.70 GB | 47 s | 1.16 GB |
-| 2025-10-27 | 1.08 GB | 0.74 GB | 47 s | 1.04 GB |
+| 2026-07-14 | 0.94 GB | 0.70 GB | 24 s (one run) | 2.2 GB |
+| 2025-10-27 | 1.08 GB | 0.74 GB | 25–28 s (three runs) | 2.2 GB |
 
-At that rate the configured 534 days take about 7 hours and 370–400 GB of disk. The frames are
-stored with plain zstd 9. Blosc zstd 3 with byte shuffle, used before, stored 10% more (0.81 GB on
-2025-10-27) and took 43.6–44.5 s against 45.5–45.9 s for zstd 9 in two runs each; the rest of the
-difference from the 37–39 s measured earlier the same day was the network.
+Before both changes the same days took 45–47 s with 1.0–1.4 GB peak memory, and the stores are
+identical. Letting only `threads` decoded files wait to be written brought the peak to 1.7 GB, but a
+day took 32 s. At ~25 s a day, the configured 534 days take about 4 hours and 370–400 GB of disk. The
+frames are stored with plain zstd 9: Blosc zstd 3 with byte shuffle, used before, stored 10% more
+(0.81 GB on 2025-10-27) and saved ~1.5 s a day.
 
 ## Building features
 

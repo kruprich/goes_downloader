@@ -13,7 +13,7 @@ import zarr
 from PIL import Image
 
 from conftest import chunk_dirs
-from goes_downloader import mrms, remote
+from goes_downloader import mrms, progress, remote
 from goes_downloader.config import LatLonBounds
 
 DAY = datetime(2025, 6, 1, tzinfo=timezone.utc)
@@ -136,7 +136,12 @@ def test_a_day_stores_every_file_cropped_and_is_rebuilt_until_complete(tmp_path,
 
     # The next run rebuilds the incomplete day; once complete, a run downloads nothing
     fetched = fake_bucket(monkeypatch, files)
+    monkeypatch.setattr(progress, "current", progress.Progress(1))
     assert asyncio.run(mrms.process_mrms_day(cfg, DAY, None))[0]
+    day_bytes = sum(len(data) for n, data in files.items() if "/20250601/" in n)
+    assert progress.current.day_total["2025-06-01"] == progress.current.day_done["2025-06-01"] == day_bytes
+    assert progress.current.bytes_downloaded == day_bytes and progress.current.bytes_saved > 0
+    monkeypatch.setattr(progress, "current", None)
     assert list(zarr.open_consolidated(str(tmp_path / "mrms/2025/2025152.zarr"), mode="r")["refl/present"][:]) == [1, 1, 1]
     fetched = fake_bucket(monkeypatch, files)
     assert asyncio.run(mrms.process_mrms_day(cfg, DAY, None)) == (True, 0) and fetched == []

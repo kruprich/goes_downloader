@@ -60,7 +60,8 @@ from . import remote
 from .common import TIME_ATTRS, iter_days_utc, to_ns
 from .config import BUCKET_PATTERN, LatLonBounds, RawConfig, load_config
 from .day import MIN_AGE_FOR_COMPLETE, MAX_ERRORS_LOGGED_PER_DAY
-from .progress import format_duration, log
+from . import progress as progress_module
+from .progress import Progress, format_duration, log
 from .store import CHUNK_KEYS, _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 
 MRMS_KEYS = {"bucket", "output_root_dir", "threads", "products"}
@@ -269,13 +270,17 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     listings = await asyncio.gather(
         *(remote.list_object_names(cfg.raw, session, f"{p.prefix}/{day:%Y%m%d}/") for p in cfg.products), return_exceptions=True
     )
-    states, n_listing_errors = [], 0
+    states, n_listing_errors, sizes = [], 0, {}
     for p, objects in zip(cfg.products, listings):
         if isinstance(objects, BaseException):
             n_listing_errors += 1
             log(f"!! listing failed for {p.prefix}/{day:%Y%m%d}/: {objects!r}")
             objects = {}
+        sizes.update(objects)
         states.append(ProductDay(p, day_files(objects, day)))
+    progress = progress_module.current
+    if progress is not None:
+        progress.start_day(label, sum(sizes[name] for st in states for _, name in st.files))
 
     tmp_path = out_path + ".tmp"
     shutil.rmtree(tmp_path, ignore_errors=True)
@@ -295,6 +300,8 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
             try:
                 payload = await remote.http_get(cfg.raw, session, remote.object_url(cfg.raw.bucket, name), as_json=False)
                 downloaded += len(payload)
+                if progress is not None:
+                    progress.add_bytes(label, sizes[name], len(payload))
                 dec = await asyncio.to_thread(decode_mrms, payload)
                 del payload
                 state.accept(root, dec, cfg.raw.bounds)  # in the event loop, so the first file creates the array once
@@ -320,7 +327,10 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     status = "OK" if complete else (
         "INCOMPLETE (ended less than 24 h ago; rerun later)" if too_recent and n_listing_errors == 0 and not errors
         else f"INCOMPLETE (listing errors={n_listing_errors}, file errors={len(errors)}; rerun to retry)")
-    log(f"-> {label} {status}: {counts}, {downloaded / 1e9:.2f} GB downloaded, {directory_size(out_path) / 1e9:.2f} GB stored")
+    stored = directory_size(out_path)
+    if progress is not None:
+        progress.add_saved(stored)
+    log(f"-> {label} {status}: {counts}, {downloaded / 1e9:.2f} GB downloaded, {stored / 1e9:.2f} GB stored")
     return complete, downloaded
 
 
@@ -331,15 +341,30 @@ async def run_all_days(cfg: MrmsConfig) -> None:
     days = list(iter_days_utc(cfg.raw.start_date_utc, cfg.raw.end_date_utc))
     t0, ok, failed, total = time.monotonic(), [], [], 0
     connector = aiohttp.TCPConnector(limit=cfg.raw.max_concurrent_http_requests, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for day in days:
-            try:
-                good, n = await process_mrms_day(cfg, day, session)
-            except Exception as e:
-                log(f"!! {day.date().isoformat()} failed: {e!r}")
-                good, n = False, 0
-            (ok if good else failed).append(day.date().isoformat())
-            total += n
+    progress = progress_module.current = Progress(len(days))
+
+    async def redraw() -> None:
+        while True:
+            progress.draw()
+            await asyncio.sleep(1.0)
+
+    redraw_task = asyncio.create_task(redraw())
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for day in days:
+                label = day.date().isoformat()
+                try:
+                    good, n = await process_mrms_day(cfg, day, session)
+                except Exception as e:
+                    log(f"!! {label} failed: {e!r}")
+                    good, n = False, 0
+                progress.finish_day(label)
+                (ok if good else failed).append(label)
+                total += n
+    finally:
+        redraw_task.cancel()
+        progress.close()
+        progress_module.current = None
 
     print("\n" + "=" * 72)
     print(f"Days complete:   {len(ok)} of {len(days)}")

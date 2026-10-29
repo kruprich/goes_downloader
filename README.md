@@ -304,6 +304,7 @@ their own per-day raw stores, `<mrms.output_root_dir>/YYYY/YYYYDDD.zarr` (`./mrm
 python download_mrms.py --config config.json
 ```
 
+It shows the same progress bar as `download_raw.py` (a line a minute when output goes to a file).
 It uses the config's dates, `bounds`, `overwrite_existing` and HTTP settings, and its `mrms` section:
 
 - `products`: each a `key` (the store group), a `prefix` (the bucket folder holding one folder per

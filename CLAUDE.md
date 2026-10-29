@@ -15,7 +15,7 @@ lightning labels on one grid, one feature store per day, for the model in the se
 `goes_lightning_model` repository. `report.py` summarizes what the raw stores hold. A separate
 downloader (`download_mrms.py` → `goes_downloader/mrms.py`, the config's `mrms` section) mirrors MRMS
 radar mosaics from `s3://noaa-mrms-pds` into their own raw day stores the same way; the feature step
-doesn't read them yet. The docstrings of `goes_downloader/store.py` (raw stores),
+reads them through `mrms` channels. The docstrings of `goes_downloader/store.py` (raw stores),
 `goes_downloader/mrms.py` (MRMS stores), `goes_downloader/features/__init__.py` (feature stores)
 and `goes_downloader/features/geography.py` (the geography store) are the authoritative layouts;
 README.md covers setup, usage, reading, assumptions about the source data, and measured sizes and
@@ -77,13 +77,20 @@ serve them to the byte-range code through a fake remote whose buffers start as r
   the sun, flash centroids and footprints, labels (including a flash stored in the next day's first
   file and a GLM gap), completeness, geography regridding, borders rasterized by the even-odd rule
   (holes, a `within` filter) and their distances against brute force, sun and satellite geometry against
-  astropy/spherical values, config errors. The raw days are written once per module (`raw_days`) and
-  each test's `raw/` links to them: a test that adds raw days must copy them first.
+  astropy/spherical values, config errors. MRMS channels on two synthetic MRMS days (`mrms_days`): max
+  and mean against the pixels, the no-echo and outside-coverage markers, a beacon pixel at a flash's
+  centroid landing in the flash's cell on the lightning ellipsoid, the newest file before the issue time
+  (gaps, a failed file, the previous day's last file), and a missing MRMS day leaving the day incomplete
+  until it arrives. The raw and MRMS days are written once per module (`raw_days`, `mrms_days`) and
+  each test's `raw/` (and `mrms/`) links to them: a test that adds days must copy them first.
 
 For changes to the feature step, also build a few real days (with 2–3 `--workers` while a download
 runs) and compare against values recomputed from the raw arrays: block means of the 2 km frames,
 the 10 km pixel under each cell centre, and flash footprints mapped from `glm/events` with NOAA's
-formula instead of pyproj (skipping orphan events, `flash_index` -1). Write them to a scratch `output_root_dir`; avoid raw days that have a
+formula instead of pyproj (skipping orphan events, `flash_index` -1), and the MRMS channels' cell
+maxima from the raw MRMS frames, with each pixel placed on the lightning ellipsoid by the same formula.
+For MRMS placement, match radar cores against flash footprints from before and after the radar time,
+so storm motion cancels (README, "MRMS channels"). Write them to a scratch `output_root_dir`; avoid raw days that have a
 `.tmp` next to them (the downloader is rebuilding them).
 
 **Network tests** (`test_network.py`, `--network`) decode two real files of every configured
@@ -189,7 +196,8 @@ the product/bounds key sets) as well as read.
 **Feature step (`goes_downloader/features/`).** `settings` (the `features` section; unknown keys are
 errors), `expressions` (derived channels and the evaluation `Plan`), `grid` (`TargetGrid`,
 `make_grid`, `axis_map`/`reduce2d`/`aggregate`, `SolarGeometry`, `satellite_zenith_deg`), `raw`
-(`RawTimeline`: raw frames by global 5-min slot across days), `glm` (`GlmTimeline`: centroids,
+(`RawTimeline`: raw frames by global 5-min slot across days), `mrms` (`MrmsTimeline`: MRMS pixels
+sorted by the cell they land in, `PixelCells`, and the newest file before each issue time), `glm` (`GlmTimeline`: centroids,
 footprints from events, coverage), `geography` (the one-time static fields, including country borders
 rasterized from GeoJSON by scanline: `rasterize_rings`, `distance_to_km`), `build` (`build_day` in
 spawn workers, `run_build`, `run_stats`, the CLIs). `build_day` goes slot by slot from `lookback`
@@ -251,6 +259,11 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   start within 20 s of the range (`FILE_MARGIN_NS`), whichever day holds them, and only their events
   (offsets from `glm/files/n_events`). Event `flash_index` is -1 for orphans (no flash in their
   file): mask it before indexing flashes, or -1 silently picks the day's last flash.
+- MRMS pixels go through GLM's mapping (`glm_projection`), so radar lands on the cells of the flashes
+  above it. "The point at the ellipsoid's height above the pixel" sounds more correct but isn't: the
+  lightning ellipsoid is flatter than the Earth, and that placement put flashes up to 1.2 rows south of
+  the radar cores on two measured days (README, "MRMS channels"). A feature day is complete only if the
+  MRMS days it read are (`mrms_days`), as for the raw days.
 - **A footprint is pixels, never event points.** An event marks the centre of a GLM pixel 1.3–2 cells
   across; putting each in the one cell under it leaves a lattice of holes that the labels, the `fed`
   input and so the model all learn (README, "Flash footprints"). `pixel_cover` spreads glmtools'
@@ -304,3 +317,6 @@ complete with its arrays deleted; `run_build` removes leftover `.old` directorie
   (Blosc zstd 3 stored 10% more with byte shuffle and 67% more with bitshuffle, pcodec 31% more),
   45–47 s a day with 8 threads and ~1.1 GB peak memory (zstd 9 costs ~1.5 s of that; on 2026-10-26
   the network was slower than for the earlier 37–39 s), so about 7 h and 370–400 GB for the range.
+  The feature config's `refl_m10c_max` reads it, so download MRMS before building features: a feature
+  day is incomplete until the MRMS days it reads are, and is built again when they arrive. The channel
+  adds ~9 MB and 6–14 s per feature day.

@@ -27,7 +27,8 @@ from .expressions import Evaluator, make_plan
 from .geography import build_geography, geography_grid
 from .glm import FOOTPRINT, SLOT_NS, GlmTimeline, disk_offsets, neighbourhood_sum
 from .grid import SourceFrame, SolarGeometry, TargetGrid, aggregate, grid_latlon, make_grid
-from .raw import EPOCH, RawTimeline, day_of_index
+from .mrms import MAX_AGE_NS, MINUTE_NS, MrmsTimeline
+from .raw import EPOCH, RawTimeline, day_states
 from .settings import SLOT_MINUTES, ChannelSpec, FeatureConfig, LabelSpec, geography_store_path, load_feature_config
 
 LABEL_UNKNOWN = 255
@@ -40,18 +41,21 @@ def features_day_path(cfg: FeatureConfig, day: datetime) -> str:
 
 def raw_neighbour_arrived(cfg: FeatureConfig, path: str) -> bool:
     """
-    Whether a complete feature store must be rebuilt because a raw day it recorded as missing or
-    incomplete is now complete. Days next to the ends of the raw date range are marked complete
-    without their neighbours (which won't arrive unless the range is extended); when it is, this
-    rebuilds them.
+    Whether a complete feature store must be rebuilt because a raw (GOES or MRMS) day it recorded as
+    missing or incomplete is now complete. Days next to the ends of the raw date range are marked
+    complete without their neighbours (which won't arrive unless the range is extended); when it is,
+    this rebuilds them.
     """
     try:
-        raw_days = zarr.open_consolidated(path, mode="r").attrs.get("raw_days", {})
+        attrs = zarr.open_consolidated(path, mode="r").attrs
     except Exception:  # an unreadable store is rebuilt anyway; never abort the run over one day
         return True
+    sources = [(attrs.get("raw_days", {}), cfg.raw.raw_output_root_dir)]
+    if cfg.mrms_root_dir is not None:
+        sources.append((attrs.get("mrms_days", {}), cfg.mrms_root_dir))
     return any(
-        st != "complete" and zarr_store_is_complete(output_zarr_path_for_day(cfg.raw.raw_output_root_dir, datetime.strptime(d, "%Y-%m-%d")))
-        for d, st in raw_days.items()
+        st != "complete" and zarr_store_is_complete(output_zarr_path_for_day(root_dir, datetime.strptime(d, "%Y-%m-%d")))
+        for days, root_dir in sources for d, st in days.items()
     )
 
 
@@ -97,6 +101,9 @@ def channel_attrs(c: ChannelSpec) -> Dict[str, Any]:
             d["values"] = list(c.values)
         d.update(valid_dqf=None if c.valid_dqf is None else list(c.valid_dqf), min_valid_fraction=c.min_valid_fraction,
                  fill_gaps_minutes=c.fill_gaps_slots * SLOT_MINUTES)
+    elif c.kind == "mrms":
+        d = {"name": c.name, "mrms": c.mrms, "aggregation": c.aggregation, "min_valid_fraction": c.min_valid_fraction,
+             "no_echo": c.no_echo}
     elif c.kind == "glm":
         d = {"name": c.name, "glm": c.glm_stat}
     elif c.kind == "solar":
@@ -143,6 +150,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     shape = (grid.ny, grid.nx)
     lat, lon = grid_latlon(grid)
     solar = SolarGeometry(lat, lon) if any(c.kind == "solar" for c in cfg.channels) else None
+    mrms = MrmsTimeline(cfg, grid) if cfg.mrms_root_dir is not None else None
     s0 = s_day - plan.lookback
     out_slots = list(range(s_day, s_day + SLOTS_PER_DAY, step))
     outputs = [c for c in cfg.channels if c.output]
@@ -246,6 +254,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
                 frame = product_frame(ch, s, per_slot)
                 if ch.fill_gaps_slots:
                     frame = fill_gaps(ch, s, frame)
+            elif ch.kind == "mrms":
+                frame = mrms.frame(ch, s, per_slot)
             elif ch.kind == "solar":
                 if "solar" not in per_slot:  # at the middle of the slot, close to the scan time
                     per_slot["solar"] = solar.frames(s * SLOT_NS + SLOT_NS // 2)
@@ -323,13 +333,13 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
     if glm is not None:
         _write_array(root, "glm_coverage", glm_coverage, ["time"])
 
-    raw_days = {}
-    for d, rd in sorted(raw.days.items()):
-        raw_days[day_of_index(d).date().isoformat()] = "missing" if rd.root is None else ("complete" if rd.complete else "incomplete")
+    raw_days = day_states(raw.days)
+    mrms_days = day_states(mrms.days) if mrms is not None else {}
     raw_start = datetime.strptime(cfg.raw.start_date_utc, "%Y-%m-%d").date()
     raw_end = datetime.strptime(cfg.raw.end_date_utc, "%Y-%m-%d").date()
-    # Days outside the download range will never arrive, so they don't hold the day back
-    blocking = [d for d, st in raw_days.items() if st != "complete" and raw_start <= datetime.strptime(d, "%Y-%m-%d").date() <= raw_end]
+    # Days outside the download range (MRMS downloads the same days) will never arrive, so they don't hold the day back
+    blocking = [d for days in (raw_days, mrms_days) for d, st in days.items()
+                if st != "complete" and raw_start <= datetime.strptime(d, "%Y-%m-%d").date() <= raw_end]
     complete = raw_days[day_iso] == "complete" and not blocking
 
     root.attrs.update(
@@ -337,6 +347,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "day_utc": day_iso,
             "complete": complete,
             "raw_days": raw_days,
+            **({"mrms_days": mrms_days, "mrms": {"lightning_ellipsoid_km": cfg.glm_ellipsoid_km, "max_age_minutes": MAX_AGE_NS // MINUTE_NS}}
+               if mrms is not None else {}),
             "grid": asdict(grid),
             **({"fine_grid": asdict(fine)} if fine is not None else {}),
             "time_step_minutes": step * SLOT_MINUTES,
@@ -367,7 +379,8 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
 
     return {
         "day": day_iso,
-        "status": "OK" if complete else "INCOMPLETE (raw data: " + ", ".join(f"{d} {st}" for d, st in raw_days.items() if st != "complete") + ")",
+        "status": "OK" if complete else "INCOMPLETE (raw data: " + ", ".join(
+            [f"{d} {st}" for d, st in raw_days.items() if st != "complete"] + [f"MRMS {d} {st}" for d, st in mrms_days.items() if st != "complete"]) + ")",
         "complete": complete,
         "seconds": time.monotonic() - t_start,
         "bytes": directory_size(out_path),

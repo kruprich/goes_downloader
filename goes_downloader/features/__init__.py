@@ -7,19 +7,21 @@ The feature step: raw day stores -> CNN inputs and lightning labels on one grid,
 
 Everything is set by the "features" section of config.json (README.md lists the options). Modules:
 settings (the config), expressions (derived channels), grid (target grid, regridding, sun and satellite
-geometry), raw (reading the raw stores), glm (flashes, flash footprints, labels), geography (the one-time
-static fields), build (the day builder and the runs).
+geometry), raw (reading the raw stores), mrms (MRMS radar on the grid), glm (flashes, flash footprints,
+labels), geography (the one-time static fields), build (the day builder and the runs).
 
 Grid: the ABI fixed grid, coarsened by an integer factor from the finest product used. Each cell is a block
 of coarsen x coarsen reference pixels counted from the uncropped CONUS sector's first pixel, so cells nest
 exactly in the 2 km and 10 km ABI grids. Products at least as fine as the cell are aggregated over the
 source pixels whose centres fall in it (mean/min/max/std/fraction); coarser products take the pixel
 containing the cell centre. GLM flashes and events go to the cell containing their view angle, recovered
-with the lightning ellipsoid GLM navigates to, so they line up with the cloud tops ABI sees.
+with the lightning ellipsoid GLM navigates to, so they line up with the cloud tops ABI sees. MRMS pixels
+go through the same mapping, which puts a radar column on the cell of the flashes above it (mrms.py); each
+cell aggregates the pixels placed in it.
 
 Time: slot t holds the ABI scan starting in [t, t+5 min). The issue time is the end of the slot
 (t + 5 min): every input ends there and every label window starts there. Solar channels are computed for
-the middle of the slot.
+the middle of the slot; MRMS channels take the newest file before the issue time, if under 10 min old.
 
 GLM: "count" channels and centroid labels use each flash's centroid. "extent" channels and labels use its
 footprint, built as glmtools builds flash-extent density (LightningCast's truth): each event's GLM pixel,
@@ -51,14 +53,17 @@ Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr (Zarr format 3, like the 
 
 Root attrs:
   complete = true only if the day's raw store and every neighbouring raw day that was read (lookback for
-  lags and gap filling, lookahead for labels) are complete. A neighbour outside the raw config's date range
-  never will be, so it counts as unavailable instead: its slots are NaN / unknown. Incomplete days are
-  rebuilt from scratch on the next run.
+  lags and gap filling, lookahead for labels) are complete, and every MRMS day read. A neighbour outside the
+  raw config's date range never will be, so it counts as unavailable instead: its slots are NaN / unknown.
+  Incomplete days are rebuilt from scratch on the next run.
+  raw_days, mrms_days (with MRMS channels): {YYYY-MM-DD: complete, incomplete or missing} of the days read;
+  a complete store is rebuilt when one of them has since completed.
   channel_stats / label_stats: per-day sums for normalisation and class balance (combine with --stats).
   label_stats counts each label's cells on its own grid (n_cells, n_known, n_positive), so a labels_fine
   label has factor x factor as many as the grid.
   grid, fine_grid (with labels_fine), channels, helper_channels, labels, glm (with the footprint method),
-  time_step_minutes, geography_path: how the store was built.
+  mrms (with MRMS channels: lightning_ellipsoid_km, max_age_minutes), time_step_minutes, geography_path:
+  how the store was built.
 
 The geography store (<output_root_dir>/geography.zarr, one for all days) is described in geography.py.
 """

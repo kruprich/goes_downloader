@@ -19,7 +19,8 @@ from goes_downloader.common import SLOTS_PER_DAY
 from goes_downloader.crop import latlon_to_scan_angle
 from goes_downloader.features.build import build_day, check_geography
 from goes_downloader.features.geography import EARTH_RADIUS_KM, build_geography, rasterize_rings, regrid_source
-from goes_downloader.features.grid import SolarGeometry, grid_latlon, make_grid, satellite_zenith_deg
+from goes_downloader.features.grid import SolarGeometry, glm_projection, grid_latlon, make_grid, satellite_zenith_deg
+from goes_downloader.features.mrms import NO_ECHO, OUTSIDE_COVERAGE
 from goes_downloader.features.settings import GeographySpec, load_feature_config
 from goes_downloader.store import consolidate
 
@@ -104,6 +105,45 @@ def write_glm(path: str, flashes, covered: np.ndarray, orphans=()):
     consolidate(root)
 
 
+def mrms_dbz(minute: int, lat: np.ndarray, lon: np.ndarray, beacon) -> np.ndarray:
+    """
+    dBZ of the test MRMS file `minute` minutes after DAY1 00:00: outside radar coverage west of 88.65 W, echoes
+    of -15..45 dBZ south of 33.25 N that change from file to file, no echo elsewhere, 60 dBZ at the beacon pixel.
+    """
+    la, lo = np.meshgrid(lat, lon, indexing="ij")
+    iy, ix = np.meshgrid(np.arange(len(lat)), np.arange(len(lon)), indexing="ij")
+    v = np.where(la < 33.25, (iy * 7 + ix * 3 + minute) % 61 - 15.0, NO_ECHO)
+    v[lo < -88.65] = OUTSIDE_COVERAGE
+    v[beacon] = 60.0
+    return v
+
+
+def write_mrms_day(root_dir: str, day: str, minutes, lat, lon, beacon, failed=()):
+    """
+    An MRMS day store as download_mrms writes it, product "refl": a file 40 s after each of `minutes` (after the
+    day's midnight), packed as MRMS packs reflectivity; `failed` minutes are listed but weren't decoded.
+    """
+    d = datetime.strptime(day, "%Y-%m-%d")
+    root = zarr.open_group(os.path.join(root_dir, str(d.year), f"{d.year}{d.timetuple().tm_yday:03d}.zarr"), mode="w")
+    first = (d - datetime.strptime(DAY1, "%Y-%m-%d")).days * 1440  # minutes from DAY1's midnight
+    present = np.array([m not in failed for m in minutes], np.uint8)
+    values = np.full((len(minutes), len(lat), len(lon)), 65535, np.uint16)
+    for i, m in enumerate(minutes):
+        if present[i]:
+            values[i] = np.round((mrms_dbz(first + m, lat, lon, beacon) + 999) * 10)
+    g = root.require_group("refl")
+    g.create_array("value", data=values, chunks=(1, len(lat), len(lon)))
+    g.create_array("time", data=np.array([T1 + (first + m) * MIN + 40 * 10**9 for m in minutes], np.int64))
+    g.create_array("present", data=present)
+    g.create_array("scale_factor", data=np.where(present, 0.1, np.nan))
+    g.create_array("add_offset", data=np.where(present, -999.0, np.nan))
+    g.create_array("lat", data=lat)
+    g.create_array("lon", data=lon)
+    g.attrs.update(has_frames=True, fill_value=65535)
+    root.attrs.update(day_utc=day, complete=True)
+    consolidate(root)
+
+
 def config(tmp_path, end=DAY2, **features):
     raw = {
         "bucket": "s3://test", "start_date_utc": DAY1, "end_date_utc": end, "raw_output_root_dir": str(tmp_path / "raw"),
@@ -113,6 +153,7 @@ def config(tmp_path, end=DAY2, **features):
             {"key": "p10", "product_prefix": "B", "filename_must_contain": "B-M6", "data_variable": "V", "dqf_variable": "DQF"},
         ],
         "glm_product": {"key": "glm", "product_prefix": "G", "filename_must_contain": "G"},
+        "mrms": {"output_root_dir": str(tmp_path / "mrms"), "products": [{"key": "refl", "prefix": "CONUS/Refl"}]},
         "features": {
             "output_root_dir": str(tmp_path / "features"),
             "start_date_utc": DAY1, "end_date_utc": DAY2,
@@ -186,6 +227,50 @@ def built(tmp_path, raw_days):
     (tmp_path / "raw").symlink_to(raw_days)
     cfg = load_feature_config(config(tmp_path))
     return cfg, make_grid(cfg)
+
+
+@pytest.fixture(scope="module")
+def mrms_days(raw_days):
+    """
+    MRMS days 1 and 2 on a 0.01 deg grid through flash A's centroid, which holds the beacon: (root, lat, lon,
+    beacon). Day 1 has a file every 2 min to 03:00, none 01:00-01:30, the one of 02:04 failed, and files again
+    from 23:00; day 2 starts at 00:06. Tests must not write into them.
+    """
+    lat, lon = grid_latlon(make_grid(load_feature_config(config(raw_days.parent))))
+    mlat = float(lat[5, 5]) + 0.01 * np.arange(45, -86, -1)  # rows north to south, as MRMS's
+    mlon = float(lon[5, 5]) + 0.01 * np.arange(-45, 90)
+    root = raw_days.parent / "mrms"
+    day1 = [m for m in range(0, 180, 2) if not 60 <= m < 90] + list(range(1380, 1440, 2))
+    write_mrms_day(str(root), DAY1, day1, mlat, mlon, (45, 45), failed={124})
+    write_mrms_day(str(root), DAY2, list(range(6, 60, 2)), mlat, mlon, (45, 45))
+    return root, mlat, mlon, (45, 45)
+
+
+MRMS_CHANNELS = [
+    {"name": "a", "product": "p2"},
+    {"name": "r_max", "mrms": "refl", "aggregation": "max"},
+    {"name": "r_mean", "mrms": "refl", "aggregation": "mean", "no_echo": 0, "min_valid_fraction": 0.9},
+]
+
+
+def mrms_config(tmp_path, **features):
+    """MRMS channels, with GLM (and so MRMS) on the lightning ellipsoid."""
+    return load_feature_config(config(tmp_path, channels=MRMS_CHANNELS, labels=[],
+                                      glm={"lightning_ellipsoid_km": {"equatorial": 14.0, "polar": 6.0}}, **features))
+
+
+def mrms_expected(grid, lat, lon, dbz, how, no_echo=-20.0, min_valid=0.5, ellipsoid=(14.0, 6.0)):
+    """The MRMS channel pixel by pixel: each pixel mapped as a GLM flash at its lat/lon is, then cell by cell."""
+    la, lo = np.meshgrid(lat, lon, indexing="ij")
+    x, y = latlon_to_scan_angle(la, lo, glm_projection(grid.projection, ellipsoid))
+    cell, v = grid.cells_of(np.asarray(x), np.asarray(y)).ravel(), dbz.ravel()
+    out = np.full(grid.ny * grid.nx, np.nan)
+    for c in np.unique(cell[cell >= 0]):
+        px = v[cell == c]
+        covered = np.where(px == NO_ECHO, no_echo, px)[px != OUTSIDE_COVERAGE]
+        if covered.size and covered.size >= min_valid * px.size:
+            out[c] = covered.max() if how == "max" else covered.mean()
+    return out.reshape(grid.ny, grid.nx)
 
 
 def cells(mask):
@@ -549,11 +634,84 @@ def test_glm_mapping_round_trips_through_the_grid(built):
     np.testing.assert_array_equal(grid.cells_of(x, y).reshape(grid.ny, grid.nx), np.arange(grid.ny * grid.nx).reshape(grid.ny, grid.nx))
 
 
+def test_mrms_channels_aggregate_the_radar_placed_as_glm_flashes_are(built, mrms_days, tmp_path):
+    _, grid = built
+    (tmp_path / "mrms").symlink_to(mrms_days[0])
+    cfg = mrms_config(tmp_path)
+    assert build_day(cfg, grid, DAY1)["complete"]
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
+    assert list(F["channel"][:]) == ["a", "r_max", "r_mean"]
+    assert F.attrs["channels"][1] == {"name": "r_max", "mrms": "refl", "aggregation": "max", "min_valid_fraction": 0.5, "no_echo": -20.0}
+    _, lat, lon, beacon = mrms_days
+    # Issue 00:20 reads the file of 00:18:40. No echo is -20 dBZ (0 for r_mean); cells outside radar coverage are
+    # missing, and r_mean wants 90% of a cell's pixels covered where r_max wants half
+    dbz = mrms_dbz(18, lat, lon, beacon)
+    r_max, r_mean = F["features"][1, 1], F["features"][1, 2]
+    np.testing.assert_allclose(r_max, mrms_expected(grid, lat, lon, dbz, "max"), atol=1e-4)
+    np.testing.assert_allclose(r_mean, mrms_expected(grid, lat, lon, dbz, "mean", no_echo=0, min_valid=0.9), atol=1e-4)
+    assert np.isnan(r_mean).sum() > np.isnan(r_max).sum() > 0 and (r_max == -20).any()
+    # The beacon sits at flash A's centroid: the lightning ellipsoid moves both from (5, 5) into the same cell
+    assert cells(r_max == 60) == {(5, 4)} and (5, 4) in cells(F["flash_count"][1] > 0)
+
+
+def test_mrms_takes_the_newest_file_before_the_issue_time(built, mrms_days, tmp_path):
+    _, grid = built
+    (tmp_path / "mrms").symlink_to(mrms_days[0])
+    cfg = mrms_config(tmp_path)
+    build_day(cfg, grid, DAY1)
+    build_day(cfg, grid, DAY2)
+    F1 = zarr.open_consolidated(str(tmp_path / "features/2025/2025152.zarr"), mode="r")
+    F2 = zarr.open_consolidated(str(tmp_path / "features/2025/2025153.zarr"), mode="r")
+    _, lat, lon, beacon = mrms_days
+
+    def file_of(minute):
+        return mrms_expected(grid, lat, lon, mrms_dbz(minute, lat, lon, beacon), "max")
+
+    np.testing.assert_allclose(F1["features"][4, 1], file_of(58), atol=1e-4)  # issue 01:05: 00:58:40, 6 min before
+    assert np.isnan(F1["features"][5, 1]).all()  # issue 01:20: the newest is 21 min old, a gap
+    np.testing.assert_allclose(F1["features"][8, 1], file_of(122), atol=1e-4)  # issue 02:05: 02:04:40 failed, so 02:02:40
+    # Issue 00:05 on day 2, whose first file is 00:06:40: day 1's last; day 1's last issue time, 23:50, takes 23:48:40
+    np.testing.assert_allclose(F2["features"][0, 1], file_of(1438), atol=1e-4)
+    np.testing.assert_allclose(F1["features"][95, 1], file_of(1428), atol=1e-4)
+    assert F2.attrs["mrms_days"] == {DAY1: "complete", DAY2: "complete"} and F2.attrs["mrms"]["max_age_minutes"] == 10
+
+
+def test_a_missing_mrms_day_leaves_the_day_incomplete_until_it_arrives(built, mrms_days, tmp_path):
+    from goes_downloader.features.build import features_day_path, raw_neighbour_arrived
+
+    _, grid = built
+    shared = mrms_days[0] / "2025"
+    (tmp_path / "mrms/2025").mkdir(parents=True)
+    (tmp_path / "mrms/2025/2025152.zarr").symlink_to(shared / "2025152.zarr")  # day 2 not downloaded yet
+    cfg = mrms_config(tmp_path)
+    r = build_day(cfg, grid, DAY2)
+    assert not r["complete"] and "MRMS 2025-06-02 missing" in r["status"]
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025153.zarr"), mode="r")
+    assert F.attrs["mrms_days"] == {DAY1: "complete", DAY2: "missing"}
+    assert np.isfinite(F["features"][0, 1]).any() and np.isnan(F["features"][1:, 1]).all()  # 00:05 falls back on day 1
+    path = features_day_path(cfg, datetime.strptime(DAY2, "%Y-%m-%d"))
+    assert not raw_neighbour_arrived(cfg, path)
+    (tmp_path / "mrms/2025/2025153.zarr").symlink_to(shared / "2025153.zarr")
+    assert raw_neighbour_arrived(cfg, path)
+
+
+def test_mrms_channels_need_the_mrms_section(tmp_path):
+    raw = json.load(open(config(tmp_path, channels=MRMS_CHANNELS)))
+    del raw["mrms"]
+    (tmp_path / "plain.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="need the config's \"mrms\" section"):
+        load_feature_config(str(tmp_path / "plain.json"))
+
+
 @pytest.mark.parametrize("change, match", [
     ({"channels": [{"name": "a", "product": "p2"}, {"name": "x", "expr": "mask(a)"}]}, "mask takes 2"),
     ({"channels": [{"name": "a", "product": "p9"}]}, "not in the download list"),
     ({"channels": [{"name": "a", "product": "p2"}, {"name": "x", "expr": "y + 1"}, {"name": "y", "expr": "lag(x, 5)"}]}, "cycle"),
     ({"channels": [{"name": "a", "product": "p2", "aggregaton": "min"}]}, "unknown keys"),
+    ({"channels": [{"name": "a", "product": "p2"}, {"name": "r", "mrms": "radar"}]}, "not a product of the \"mrms\" section"),
+    ({"channels": [{"name": "a", "product": "p2"}, {"name": "r", "mrms": "refl", "aggregation": "std"}]}, "aggregation must be one of"),
+    ({"channels": [{"name": "a", "product": "p2"}, {"name": "r", "mrms": "refl", "no_echo": "none"}]}, "no_echo must be a number"),
+    ({"channels": [{"name": "a", "product": "p2"}, {"name": "r", "mrms": "refl", "valid_dqf": [0]}]}, "unknown keys"),
     ({"labels": [{"name": "l", "end_minutes": 30, "source": "density"}]}, "source must be"),
     ({"labels": [{"name": "l", "start_minutes": -10, "end_minutes": 30}]}, "scan's own slot"),
     ({"labels": [{"name": "l", "end_minutes": 30, "fed_minutes": 7}]}, "dividing the 30-minute window"),

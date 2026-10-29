@@ -14,6 +14,7 @@ from ..config import LatLonBounds, RawConfig, _require, load_config
 SLOT_MINUTES = SLOT_SECONDS // 60
 
 AGGREGATIONS = ("mean", "min", "max", "std", "fraction")
+MRMS_AGGREGATIONS = ("mean", "min", "max")
 # count/energy_fj/area_km2: flash centroids; extent: flashes whose events (footprint) touched the cell
 GLM_STATS = ("count", "extent", "energy_fj", "area_km2")
 LABEL_SOURCES = ("extent", "centroid")
@@ -28,16 +29,19 @@ COMPRESSION_SHUFFLES = ("byte", "bit", "none")
 @dataclass(frozen=True)
 class ChannelSpec:
     name: str
-    kind: str  # "product", "glm", "solar" or "expr"
+    kind: str  # "product", "mrms", "glm", "solar" or "expr"
     output: bool = True
     description: str = ""
-    # kind == "product"
+    # kind == "product" (aggregation and min_valid_fraction also for "mrms")
     product: Optional[str] = None
     aggregation: str = "mean"
     values: Tuple[float, ...] = ()
     valid_dqf: Optional[Tuple[int, ...]] = (0,)
     min_valid_fraction: float = 0.5
     fill_gaps_slots: int = 0
+    # kind == "mrms": a product key of the config's "mrms" section, and the value of "covered, no echo"
+    mrms: Optional[str] = None
+    no_echo: float = -20.0  # dBZ, below every real echo, so a max is the strongest echo (README, "Channels")
     # kind == "glm"
     glm_stat: Optional[str] = None
     # kind == "solar"
@@ -99,6 +103,7 @@ class FeatureConfig:
     glm_quality_flags: Optional[Tuple[int, ...]]
     glm_ellipsoid_km: Optional[Tuple[float, float]]  # (equatorial, polar) heights above the ground ellipsoid
     glm_min_coverage: float
+    mrms_root_dir: Optional[str]  # the MRMS day stores (mrms.output_root_dir), when a channel reads them
     channels: Tuple[ChannelSpec, ...]
     labels: Tuple[LabelSpec, ...]
     geography: Tuple[GeographySpec, ...]
@@ -112,6 +117,7 @@ class FeatureConfig:
 
 CHANNEL_KEYS = {
     "product": {"product", "aggregation", "values", "valid_dqf", "min_valid_fraction", "fill_gaps_minutes"},
+    "mrms": {"mrms", "aggregation", "min_valid_fraction", "no_echo"},
     "glm": {"glm"},
     "solar": {"solar"},
     "expr": {"expr"},
@@ -149,7 +155,7 @@ def _unknown(d: Dict[str, Any], known: set, where: str) -> None:
         raise ValueError(f"{where}: unknown keys {unknown}")
 
 
-def parse_channel(i: int, c: Any, abi_keys: List[str], has_glm: bool) -> ChannelSpec:
+def parse_channel(i: int, c: Any, abi_keys: List[str], has_glm: bool, mrms_keys: List[str]) -> ChannelSpec:
     from .expressions import FUNCTION_NAMES, parse_expression
 
     where = f"features.channels[{i}]"
@@ -185,6 +191,17 @@ def parse_channel(i: int, c: Any, abi_keys: List[str], has_glm: bool) -> Channel
             min_valid_fraction=_fraction(c.get("min_valid_fraction", 0.5), f"{where}: min_valid_fraction"),
             fill_gaps_slots=minutes_to_slots(c.get("fill_gaps_minutes", 0), f"{where}: fill_gaps_minutes"),
         )
+    if kind == "mrms":
+        if c["mrms"] not in mrms_keys:
+            raise ValueError(f"{where}: mrms {c['mrms']!r} is not a product of the \"mrms\" section (products: {mrms_keys})")
+        aggregation = c.get("aggregation", "mean")
+        if aggregation not in MRMS_AGGREGATIONS:
+            raise ValueError(f"{where}: aggregation must be one of {MRMS_AGGREGATIONS}, got {aggregation!r}")
+        no_echo = c.get("no_echo", -20.0)
+        if isinstance(no_echo, bool) or not isinstance(no_echo, (int, float)):
+            raise ValueError(f"{where}: no_echo must be a number, got {no_echo!r}")
+        return ChannelSpec(**common, mrms=c["mrms"], aggregation=aggregation, no_echo=float(no_echo),
+                           min_valid_fraction=_fraction(c.get("min_valid_fraction", 0.5), f"{where}: min_valid_fraction"))
     if kind == "glm":
         if not has_glm:
             raise ValueError(f"{where}: GLM channels need \"glm\" in the download list")
@@ -300,14 +317,24 @@ def load_feature_config(config_path: str) -> FeatureConfig:
     """Reads the "features" section of the shared config.json; the raw settings come from load_config."""
     raw = load_config(config_path)
     with open(config_path, "r", encoding="utf-8") as f:
-        section = json.load(f).get("features")
+        whole = json.load(f)
+    section = whole.get("features")
     if not isinstance(section, dict):
         raise ValueError(f"{config_path} has no \"features\" object")
     _unknown(section, FEATURE_KEYS, "features")
 
     abi_keys = [p.key for p in raw.abi_products]
     has_glm = raw.glm_product is not None
-    channels = tuple(parse_channel(i, c, abi_keys, has_glm) for i, c in enumerate(_require(section, "channels", list)))
+    mrms_keys: List[str] = []
+    mrms_root_dir = None
+    if any(isinstance(c, dict) and "mrms" in c for c in section.get("channels") or []):
+        if not isinstance(whole.get("mrms"), dict):
+            raise ValueError("MRMS channels need the config's \"mrms\" section, which lists the products downloaded")
+        from ..mrms import load_mrms_config
+
+        mrms_cfg = load_mrms_config(config_path)
+        mrms_keys, mrms_root_dir = [p.key for p in mrms_cfg.products], mrms_cfg.output_root_dir
+    channels = tuple(parse_channel(i, c, abi_keys, has_glm, mrms_keys) for i, c in enumerate(_require(section, "channels", list)))
     names = [c.name for c in channels]
     if len(set(names)) != len(names):
         raise ValueError(f"channel names must be unique, got {names}")
@@ -395,6 +422,7 @@ def load_feature_config(config_path: str) -> FeatureConfig:
         glm_quality_flags=None if flags is None else _int_list(flags, "features.glm.quality_flags"),
         glm_ellipsoid_km=None if ellipsoid is None else (float(ellipsoid["equatorial"]), float(ellipsoid["polar"])),
         glm_min_coverage=_fraction(glm.get("min_coverage", 0.95), "features.glm.min_coverage"),
+        mrms_root_dir=mrms_root_dir,
         channels=channels,
         labels=labels,
         geography=geography,

@@ -21,6 +21,12 @@ def day_of_index(index: int) -> datetime:
     return EPOCH + timedelta(days=index)
 
 
+def day_states(days: Dict[int, Any]) -> Dict[str, str]:
+    """The day stores opened (anything with .root and .complete, by day index) as {YYYY-MM-DD: missing, incomplete or complete}."""
+    return {day_of_index(d).date().isoformat(): "missing" if day.root is None else ("complete" if day.complete else "incomplete")
+            for d, day in sorted(days.items())}
+
+
 class RawProduct:
     """One ABI product in one raw day store, with its maps onto the target grid."""
 

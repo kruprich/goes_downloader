@@ -152,7 +152,7 @@ def make_plan(channels: Tuple[ChannelSpec, ...], label_end_slots: List[int]) -> 
     for c in order:  # dependencies first, so need[r] is known
         if c.kind == "product":
             need[c.name] = c.fill_gaps_slots
-        elif c.kind in ("glm", "solar"):
+        elif c.kind in ("mrms", "glm", "solar"):
             need[c.name] = 0
         else:
             need[c.name] = max((off + need[r] for r, off in refs[c.name]), default=0)

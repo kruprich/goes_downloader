@@ -316,7 +316,8 @@ Every file is kept: one every 2 minutes for the CONUS mosaics, on its 0.01° lat
 the pixels whose cell overlaps `bounds`. Values stay packed as published (16-bit integers, with each
 file's scale and offset), as for ABI. MRMS marks its own gaps: in the reflectivity products, -999 is
 outside radar coverage and -99 is covered with no echo. Days are marked `complete` by the same rule
-as the GOES stores. The docstring of `goes_downloader/mrms.py` describes the layout.
+as the GOES stores. The docstring of `goes_downloader/mrms.py` describes the layout. The feature step reads
+these stores through `mrms` channels (see [MRMS channels](#mrms-channels)).
 
 The files are GRIB2 with the field packed as a PNG image; Pillow decodes the image, and the decoded
 values match eccodes exactly (checked on five files from 2025-04-10 to 2026-09-25).
@@ -403,6 +404,12 @@ It takes its values from exactly one of these sources:
   - `min_valid_fraction` (0.5) is the share of valid pixels a cell needs.
   - `fill_gaps_minutes` keeps each cell's last valid value for that long, which suits clear-sky-only
     products such as TPW and DSI.
+- **`mrms`**: a product of the config's `mrms` section (see [MRMS radar](#mrms-radar)), in physical units
+  (dBZ for reflectivity). See "MRMS channels" below.
+  - `aggregation`: `mean`, `min` or `max` over the 0.01° pixels placed in the cell (about 25 on the 4 km grid).
+  - `no_echo` (−20): the value of pixels covered by radar with no echo (MRMS's −99). Pixels outside radar
+    coverage (MRMS's −999) are missing.
+  - `min_valid_fraction` (0.5): the share of the cell's pixels in radar coverage that it needs.
 - **`glm`**: per 5-minute slot and cell, one of:
   - `count`: flash centroids
   - `extent`: flashes over the cell, each weighted by the share of the cell its GLM pixels cover
@@ -425,6 +432,42 @@ It takes its values from exactly one of these sources:
 
 For example, the example config's visible channels divide reflectance by cos(solar zenith) and are
 missing when the sun is low: `mask(c02 / cos_sza, cos_sza - 0.1)`.
+
+#### MRMS channels
+
+The example config's `refl_m10c_max` is the strongest reflectivity at −10 °C in each cell, LightningCast
+v2's radar input (Cintineo et al. 2026, Weather and Forecasting 41).
+
+- **Time.** Each slot takes the newest MRMS file decoded before its issue time, if that file is under 10
+  minutes old; otherwise the slot is missing. MRMS writes a file every 2 minutes, with occasional gaps of
+  4 (2025-07-15: 718 files, 108–241 s apart).
+- **No echo.** The −20 dBZ default sits below every echo, so a `max` is the cell's strongest echo. The
+  lowest echo in 72 files of 2025-07-14 to 16 was −16 dBZ, and the 1st percentile 2 dBZ.
+- **Missing days.** A feature day is complete only if every MRMS day it read is complete, as for the raw
+  days. `mrms_days` in the store records them, and the day is rebuilt when a missing one arrives. So
+  download MRMS before building, or the days are built twice.
+- **Placement.** Radar sees the ground under a storm; ABI and GLM see it from the satellite. A storm top
+  10 km up appears 6–20 km (2–5 cells) further from the sub-satellite point than the radar column under
+  it (median 11 km over the grid). So each MRMS pixel's lat/lon goes through exactly the mapping GLM's
+  flashes go through: read on `glm.lightning_ellipsoid_km`. GLM reports each flash at about the ground
+  position under it, so a flash over a radar column and the column land on the same cell, and so do the
+  labels. With `null` both stay on the ground.
+
+The placement was measured on 2025-07-15 and 16 by matching radar cores (≥ 35 dBZ) against flash
+footprints of the 15 minutes before and after the radar time, so that storm motion cancels. Each entry is
+the sub-cell offset of the flashes from the cores, rows (+ south) then columns (+ east), on 07-15 / 07-16:
+
+| Radar placed | West (< 105° W) | Central | East (≥ 90° W) |
+|---|---|---|---|
+| On the ground | −0.86, −1.82 / −0.80, −1.82 | −1.34, −1.36 / −1.24, −1.28 | −0.40, −0.79 / −0.69, −0.38 |
+| Like GLM's flashes (used) | −0.39, −0.04 / −0.39, −0.02 | −0.66, +0.26 / −0.61, +0.34 | +0.00, −0.15 / −0.16, +0.02 |
+| At the ellipsoid's height above the pixel | +0.92, −0.68 / +0.99, −0.62 | +0.41, −0.17 / +0.55, −0.42 | +1.23, −0.25 / +1.09, −0.09 |
+
+On the ground the flashes sit north-west of the cores, most so in the west, as parallax predicts. The last
+row puts the radar where the satellite would see a point at the lightning ellipsoid's height above each
+pixel. That differs from GLM's mapping by 4–8 km, because the ellipsoid is flatter than the Earth, and it
+overshoots: the flashes end up as much as 1.2 rows south of the cores. On 07-15, 78.9% of core cells held
+a flash cell with the mapping used, against 77.5% for the last row and 73.5% on the ground.
 
 ### Labels and GLM
 
@@ -543,14 +586,19 @@ The example config defines these fields:
 
 ### Size and speed
 
-With the example config (11 stored channels, 4 km cells, every 15 minutes, float16, LZ4HC 5), a day
-stores about 0.32 GB: 0.35 GB on 2025-07-15, against 0.41 GB with LZ4 9, which stored about 0.37 GB
-on an average day.
+With the example config before `refl_m10c_max` was added (11 stored channels, 4 km cells, every 15
+minutes, float16, LZ4HC 5), a day stores about 0.32 GB: 0.35 GB on 2025-07-15, against 0.41 GB with LZ4
+9, which stored about 0.37 GB on an average day.
 
 Building is CPU-bound. On its own 2025-07-15 took 51 s (zarr 3, LZ4HC 5). With `max_workers` set to
 the core count, 12 workers on 12 cores built a day every ~12 s (an earlier measurement, with zarr 2
 and LZ4 9). Building next to a running download is much slower, so use far fewer `--workers` then.
 The geography store takes about 16 s once its sources are cached.
+
+The MRMS channel adds 9 MB a day (2025-07-15: 363 MB against 354 MB) and 6–14 s of building. In one
+worker, 2025-07-15 took 66–74 s against 60 s without it (2026-10-28, while a model trained on the same
+machine), with the same peak memory (2.9 GB). Placing the 14.7 M MRMS pixels on the grid takes 2.4 s per
+day built; reading and aggregating a file takes 90 ms, once per output step.
 
 ## Choosing a cloud
 

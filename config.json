@@ -454,6 +454,7 @@
       {"name": "cape", "product": "dsi_cape", "fill_gaps_minutes": 60, "description": "J/kg; clear sky only, last value kept up to 60 min"},
       {"name": "lifted_index", "product": "dsi_li", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
       {"name": "k_index", "product": "dsi_ki", "fill_gaps_minutes": 60, "description": "K; clear sky only, last value kept up to 60 min"},
+      {"name": "refl_m10c_max", "mrms": "refl_m10c", "aggregation": "max", "no_echo": -20, "description": "MRMS reflectivity at -10 C (dBZ), the strongest 0.01 deg pixel in the cell, placed as GLM flashes are (README, MRMS channels); -20 where radar sees no echo, NaN outside radar coverage (offshore, Mexico, Canada)"},
       {"name": "fed", "glm": "extent", "output": false, "description": "flashes over each cell in the 5-min slot, each weighted by the share of the cell its GLM pixels cover (helper)"},
       {"name": "fed_past_15min", "expr": "sum_past(fed, 15)", "description": "flash-extent density (glmtools' method, before rounding): flashes over the cell in the 15 min before the issue time, each weighted by the share of the cell its GLM pixels cover"}
     ],

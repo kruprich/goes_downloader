@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -32,3 +34,31 @@ def iter_days_utc(start_date: str, end_date: str):
     while cur <= end:
         yield cur
         cur += timedelta(days=1)
+
+
+_CODE_VERSION = None
+
+
+def code_version() -> dict:
+    """
+    This checkout's commit and whether it had uncommitted changes, for the stores' attributes, so a model
+    trained on them can name the build (goes_lightning_model's provenance.data_version). Unknown (None)
+    outside a git checkout. Asked of git once per process.
+    """
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        import subprocess
+
+        here = os.path.dirname(os.path.abspath(__file__))
+
+        def git(*args):
+            try:
+                r = subprocess.run(["git", "-C", here, *args], capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return r.stdout.strip() if r.returncode == 0 else None
+
+        commit = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain", "--untracked-files=no") if commit else None
+        _CODE_VERSION = {"commit": commit, "dirty": bool(status) if commit else None}
+    return _CODE_VERSION

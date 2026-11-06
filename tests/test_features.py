@@ -15,7 +15,7 @@ import pytest
 import zarr
 
 from conftest import PROJECTION, REPO, chunk_dirs
-from goes_downloader.common import SLOTS_PER_DAY
+from goes_downloader.common import SLOTS_PER_DAY, code_version
 from goes_downloader.crop import latlon_to_scan_angle
 from goes_downloader.features.build import build_day, check_geography
 from goes_downloader.features.geography import EARTH_RADIUS_KM, build_geography, rasterize_rings, regrid_source
@@ -487,6 +487,15 @@ def test_channel_stats_and_valid_fractions_describe_the_stored_frames(built, tmp
             assert abs(st["sum_sq"] - (v * v).sum()) <= 1e-12 * (v * v).sum()
 
 
+def test_feature_stores_record_the_code_that_built_them(built, tmp_path):
+    cfg, grid = built
+    build_day(cfg, grid, DAY2)
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025153.zarr"), mode="r")
+    cv = F.attrs["code_version"]
+    assert cv == code_version() and set(cv) == {"commit", "dirty"}
+    assert cv["commit"] is None or (len(cv["commit"]) == 40 and isinstance(cv["dirty"], bool))
+
+
 def test_label_resolutions_must_nest_in_the_grid(built, tmp_path):
     from goes_downloader.features.build import fine_label_grid
 
@@ -524,6 +533,7 @@ def test_geography_is_built_once_on_the_same_grid(built, tmp_path):
     path = build_geography(cfg, grid)
     G = zarr.open_consolidated(path, mode="r")
     assert G.attrs["fields"] == ["sat_zenith", "height"]
+    assert G.attrs["code_version"] == code_version()
     np.testing.assert_allclose(G["height"][:], 250.0)
     np.testing.assert_allclose(G["sat_zenith"][:], satellite_zenith_deg(lat, lon, PROJECTION))
     check_geography(cfg, grid)

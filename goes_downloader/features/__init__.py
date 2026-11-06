@@ -53,6 +53,8 @@ Root attrs:
   grid, fine_grid (with labels_fine), channels, helper_channels, labels, glm (with the footprint method),
   mrms (with MRMS channels: lightning_ellipsoid_km, max_age_minutes), time_step_minutes, geography_path:
   how the store was built.
+  built_utc, code_version: when, and by which code ({commit, dirty}: this checkout's commit and whether it
+  had uncommitted changes; null outside a git checkout), so a model can name the build it trained on.
 
 The geography store (<output_root_dir>/geography.zarr, one for all days) is described in geography.py.
 """

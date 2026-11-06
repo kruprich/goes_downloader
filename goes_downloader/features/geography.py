@@ -14,7 +14,7 @@ Layout of geography.zarr (Zarr format 3)
   x[x], y[y]         float64 cell-centre scan angles (rad), the same as the feature stores'
   lat[y, x], lon[y, x] float32 cell centres (deg)
   attrs: fields (names, in order), definitions (as configured), stats (count, sum, sum_sq, min, max per
-  field, for normalisation), grid (the TargetGrid), built_utc
+  field, for normalisation), grid (the TargetGrid), built_utc, code_version (as the feature stores')
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import zarr
 
+from ..common import code_version
 from ..crop import latlon_to_scan_angle
 from ..progress import log
 from ..store import COMPRESSOR, _write_array, consolidate
@@ -393,6 +394,7 @@ def build_geography(cfg: FeatureConfig, grid: TargetGrid) -> str:
         "stats": {name: field_stats(v) for name, v in fields.items()},
         "grid": asdict(grid),
         "built_utc": datetime.now(timezone.utc).isoformat(),
+        "code_version": code_version(),
     })
     consolidate(root)
     shutil.rmtree(path, ignore_errors=True)

@@ -20,7 +20,7 @@ import numpy as np
 import zarr
 from zarr.codecs import BloscCodec
 
-from ..common import SLOTS_PER_DAY, TIME_ATTRS, iter_days_utc
+from ..common import SLOTS_PER_DAY, TIME_ATTRS, code_version, iter_days_utc
 from ..progress import format_duration, log
 from ..store import CHUNK_KEYS, _write_array, consolidate, directory_size, output_zarr_path_for_day, zarr_store_is_complete
 from .expressions import Evaluator, make_plan
@@ -364,6 +364,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
             "n_flashes": n_flashes,
             "float16_overflow": {k: v for k, v in n_overflow.items() if v},
             "built_utc": datetime.now(timezone.utc).isoformat(),
+            "code_version": code_version(),
         }
     )
     consolidate(root)

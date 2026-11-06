@@ -1,7 +1,7 @@
 {
   "bucket": "s3://noaa-goes19",
   "start_date_utc": "2025-04-10",
-  "end_date_utc": "2026-09-25",
+  "end_date_utc": "2026-11-01",
   "raw_output_root_dir": "./goes_raw2",
   "overwrite_existing": false,
   "download_method": "byte_ranges",
@@ -417,7 +417,7 @@
   "mrms": {
     "bucket": "s3://noaa-mrms-pds",
     "output_root_dir": "./mrms_raw",
-    "threads": 8,
+    "threads": 12,
     "products": [
       {"key": "refl_m10c", "prefix": "CONUS/Reflectivity_-10C_00.50", "description": "radar reflectivity (dBZ) at the -10 C isotherm, 0.01 deg, every 2 min; LightningCast v2's radar input; -999 outside radar coverage, -99 no echo"}
     ]
@@ -427,7 +427,7 @@
     "start_date_utc": null,
     "end_date_utc": null,
     "overwrite_existing": false,
-    "max_workers": 12,
+    "max_workers": 8,
     "grid": {
       "resolution_km": 4
     },
@@ -442,12 +442,16 @@
     },
     "channels": [
       {"name": "c02", "product": "mcmip_c02", "output": false, "description": "0.64 um reflectance factor (helper)"},
+      {"name": "c02_max", "product": "mcmip_c02", "aggregation": "max", "output": false, "description": "brightest 2 km 0.64 um reflectance factor in the cell (helper)"},
       {"name": "c05", "product": "mcmip_c05", "output": false, "description": "1.6 um reflectance factor (helper)"},
       {"name": "cos_sza", "solar": "cos_zenith", "output": false, "description": "cosine of the solar zenith angle (helper)"},
       {"name": "vis_064", "expr": "mask(c02 / cos_sza, cos_sza - 0.1)", "description": "0.64 um reflectance, divided by cos(solar zenith); missing when the sun is lower than ~84 deg"},
       {"name": "nir_16", "expr": "mask(c05 / cos_sza, cos_sza - 0.1)", "description": "1.6 um reflectance (ice clouds are darker), divided by cos(solar zenith); missing when the sun is lower than ~84 deg"},
+      {"name": "vis_064_max", "expr": "mask(c02_max / cos_sza, cos_sza - 0.1)", "description": "the brightest 2 km pixel of vis_064 in the cell: sub-cell bright, glaciating cumulus, which LightningCast's attribution leans on (Cintineo et al. 2022); missing when the sun is lower than ~84 deg"},
       {"name": "c13", "product": "mcmip_c13", "description": "10.3 um clean IR window (K)"},
       {"name": "c13_min", "product": "mcmip_c13", "aggregation": "min", "description": "coldest 2 km pixel in the cell (K): overshooting tops"},
+      {"name": "c13_std", "product": "mcmip_c13", "aggregation": "std", "description": "standard deviation of the 2 km pixels in the cell (K): sub-cell texture, cloud edges and gradients"},
+      {"name": "c13_change_5min", "expr": "clip(c13 - lag(c13, 5), -20, 20)", "description": "c13 minus the previous 5-min scan's (K), which the 15-min steps never show: negative where cloud tops are cooling. Clipped at 20 K, beyond which it is a cloud edge passing through the cell rather than a top cooling"},
       {"name": "c15", "product": "mcmip_c15", "description": "12.3 um dirty IR window (K)"},
       {"name": "cloud_top_height", "product": "acha", "valid_dqf": [0, 1], "description": "m; NaN under clear sky"},
       {"name": "tpw", "product": "tpw", "fill_gaps_minutes": 60, "description": "total precipitable water (mm); clear sky only, so each cell keeps its last value for up to 60 min"},

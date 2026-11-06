@@ -65,10 +65,7 @@ def _exit_now(*_: Any) -> None:
 
 
 def _init_worker() -> None:
-    """
-    Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM). Building is CPU-bound
-    and max_workers fills the cores; zarr runs Blosc on one thread (README: Size and speed).
-    """
+    """Only the main process reacts to Ctrl-C, by terminating the workers (SIGTERM)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, _exit_now)
 

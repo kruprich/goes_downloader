@@ -68,8 +68,7 @@ MRMS_KEYS = {"bucket", "output_root_dir", "threads", "products"}
 MRMS_PRODUCT_KEYS = {"key", "prefix", "description"}
 FILE_TIME = re.compile(r"_(\d{8})-(\d{6})\.grib2\.gz$")
 FILL_VALUE = int(np.iinfo(np.uint16).max)
-# A frame is mostly two sentinels. Plain zstd 9 stores it 9% smaller than Blosc zstd 3 with byte shuffle and
-# decodes twice as fast; Blosc zstd 3 with bitshuffle stored 52% more than with byte shuffle, pcodec 19% more
+# A frame is mostly two sentinels, which plain zstd 9 stored smallest (Blosc zstd 3 +10%, pcodec +31%)
 COMPRESSOR = ZstdCodec(level=9)
 
 
@@ -169,8 +168,7 @@ def decode_mrms(payload: bytes, bounds: Optional[LatLonBounds] = None) -> Dict[s
     image = Image.open(io.BytesIO(s7[5:]))
     if image.size != (ni, nj):
         raise ValueError(f"PNG image is {image.size[1]} x {image.size[0]}, expected {nj} x {ni}")
-    # Cropping before the conversion to numpy doubled the decoding rate on 8 threads: the whole field
-    # (~50 MB) is otherwise copied several times into fresh memory, and those page faults don't run in parallel
+    # Crop before converting to numpy: copies of the whole ~50 MB field page-fault, which halved the rate on 8 threads
     value = np.asarray(image.crop((xs.start, ys.start, xs.stop, ys.stop)))
     if value.dtype != np.uint16:
         raise ValueError(f"PNG image is {value.dtype}, expected uint16")
@@ -299,8 +297,7 @@ async def process_mrms_day(cfg: MrmsConfig, day: datetime, session: Any) -> Tupl
     root.attrs.update({"day_utc": label, "source_bucket": cfg.raw.bucket, "product_keys": [p.key for p in cfg.products],
                        "bounds": vars(cfg.raw.bounds) if cfg.raw.bounds is not None else None, "complete": False})
 
-    # Up to max_concurrent_http_requests files download while the threads decode and write others: with only as
-    # many again as threads, the files being decoded held half the slots and a day downloaded at ~22 MB/s
+    # max_concurrent_http_requests downloads on top of the files being decoded (2 x threads slots gave ~22 MB/s)
     inflight = asyncio.Semaphore(cfg.threads + cfg.raw.max_concurrent_http_requests)
     errors: List[str] = []
     downloaded = 0

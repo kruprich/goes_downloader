@@ -1,14 +1,10 @@
 """
 MRMS radar on the feature grid, from the MRMS day stores (layout in goes_downloader/mrms.py).
 
-Placement: radar sees the ground under a storm, ABI and GLM see it from the satellite, and a storm top
-10 km up appears 6-20 km (2-5 cells) further from the sub-satellite point than the radar column under it.
-GLM reports each flash at about the ground position under it, so each MRMS pixel's lat/lon goes through
-the very mapping GLM's do (read on features.glm.lightning_ellipsoid_km): a flash over a radar column and
-the column land on the same cell, where the satellite saw the flash, and so do the labels. With null both
-stay on the ground. Placing the pixel instead where the satellite sees the point at the ellipsoid's height
-above it, which differs by 4-8 km because that ellipsoid is flatter than the Earth, put the flashes
-0.4-1.2 rows south of the radar cores (README, "Channels").
+Placement: GLM reports each flash at about the ground position under it, so each MRMS pixel's lat/lon goes
+through the very mapping GLM's do (on features.glm.lightning_ellipsoid_km): a flash and the radar column
+under it land on the same cell, where the satellite saw the flash. Placing the pixel at the ellipsoid's
+height above it instead put the flashes up to 1.2 rows south of the radar cores (README, "MRMS channels").
 
 Time: slot s takes the latest file decoded before its issue time, (s + 1) * 5 min, if that file is less
 than MAX_AGE_NS older; otherwise the slot is missing.

@@ -4,17 +4,10 @@ Geography: fields that don't change with time (terrain, land/water, viewing angl
   python build_geography.py --config config.json
 
 Writes <features.output_root_dir>/<features.geography.path> (default geography.zarr) from the first raw
-day that defines the grid. Lat/lon sources are downloaded once into features.geography.cache_dir and kept;
-OPeNDAP URLs (.../dodsC/...) are read for the grid's area only. A source finer than the cells is aggregated
-over the source pixels whose centres fall in each cell; a coarser one is interpolated bilinearly. Rebuild
-(--overwrite) only when the grid or the fields change; build_features.py checks that its grid matches.
-
-Borders fields come from a GeoJSON file of country polygons (Natural Earth's admin-0 countries, keyed by
-ADM0_A3). The polygons are rasterized at BORDERS_RESOLUTION_DEG (even-odd rule, so holes such as the
-large lakes stay water) and aggregated like any fine source: "fraction" is the share of the cell on the
-chosen countries' land; "distance_km" is the great-circle distance from the cell centre to the nearest
-centre of a cell at least half on that land (0 for those cells). "within" keeps only polygons with a
-vertex in a lat/lon box, e.g. the contiguous US without Alaska and Hawaii.
+day that defines the grid; build_features.py checks that its grid matches (README.md, "Geography").
+Borders are rasterized at BORDERS_RESOLUTION_DEG by the even-odd rule, so holes such as the large lakes
+stay water, then aggregated like any fine source; "distance_km" is the great-circle distance from the
+cell centre to the nearest centre of a cell at least half on that land.
 
 Layout of geography.zarr (Zarr format 3)
   <field>[y, x]      float32 one array per configured field, in config order (NaN off the Earth's disk)

@@ -41,7 +41,7 @@ class ChannelSpec:
     fill_gaps_slots: int = 0
     # kind == "mrms": a product key of the config's "mrms" section, and the value of "covered, no echo"
     mrms: Optional[str] = None
-    no_echo: float = -20.0  # dBZ, below every real echo, so a max is the strongest echo (README, "Channels")
+    no_echo: float = -20.0  # dBZ, below every real echo, so a max is the strongest echo (README, "MRMS channels")
     # kind == "glm"
     glm_stat: Optional[str] = None
     # kind == "solar"

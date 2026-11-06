@@ -7,7 +7,7 @@ binning, regridding and quality filtering can all happen later, in the feature s
 Layout of <raw_output_root_dir>/YYYY/YYYYDDD.zarr
 
 Zarr format 3. Every array names its dimensions and each day's metadata is consolidated into its root
-zarr.json, so xarray can open the stores (see "Reading with xarray" below). ABI frames and GLM columns are
+zarr.json, so xarray can open the stores (README.md, "Reading the data"). ABI frames and GLM columns are
 encoded with pcodec (8-bit ones with Blosc zstd), so reading them needs numcodecs' pcodec package. Chunk
 keys use "." (abi/<key>/value/c.<slot>.0.0), so each array's chunks are files in its own directory.
 
@@ -55,8 +55,6 @@ Optional "bounds" crop (lat/lon box in config), ABI only:
   products. Each ABI product keeps the pixels whose cell overlaps that rectangle (attrs crop_y0/crop_x0
   give the offset into the uncropped grid; x/y_scan_angle_rad are the cropped coordinates). GLM is not
   cropped: every flash and event is kept (~240 MB/day), and the feature step selects what its grid needs.
-  Days already complete are not re-cropped when the bounds change; delete them or set
-  overwrite_existing.
 
 Root attrs:
   complete = true only if every listing request succeeded, every file was downloaded and decoded,
@@ -78,12 +76,6 @@ ABI group attrs (abi/<key>):
   precision_requested    the product's rounding step in physical units (null: full precision)
   goes_imager_projection the file's projection attributes
   uncropped_shape, crop_y0, crop_x0   the source grid and where the stored crop starts in it
-
-Reading with xarray (one product or GLM table across several days):
-  xr.open_mfdataset(day_paths, engine="zarr", group="abi/mcmip_c13", combine="by_coords")
-  xr.open_mfdataset(day_paths, engine="zarr", group="glm/flashes", combine="nested", concat_dim="flash")
-  xarray turns value/dqf fill values into NaN (floats); pass mask_and_scale=False for the stored integers
-  and apply scale_factor/add_offset yourself.
 """
 
 from __future__ import annotations

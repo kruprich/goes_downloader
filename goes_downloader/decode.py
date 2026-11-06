@@ -272,9 +272,7 @@ class DecodePool:
             if self.pool is pool:
                 log("!! a decode process died; starting a new process pool")
                 self.pool = self._new_pool()
-                # Before Python 3.12 the broken pool's feeder thread can block forever writing a queued
-                # file to the dead workers, which then hangs the program at exit (CPython gh-94777).
-                # Closing the read end of that pipe unblocks it, as newer Pythons do themselves.
+                # Unblocks the dead pool's feeder thread, which hung the exit before Python 3.12 (gh-94777)
                 try:
                     pool._call_queue._reader.close()
                 except Exception:

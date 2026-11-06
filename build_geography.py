@@ -1,5 +1,5 @@
 """
-build_geography.py: terrain, land/water and viewing angle on the feature grid, once.
+build_geography.py: terrain, land/water, viewing angle and country borders on the feature grid, once.
 
   python build_geography.py --config config.json [--overwrite]
 

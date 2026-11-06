@@ -1,35 +1,24 @@
 """
 The feature step: raw day stores -> CNN inputs and lightning labels on one grid, one Zarr store per UTC day.
 
-  python build_geography.py --config config.json    # once: terrain, land/water, viewing angle on the grid
+  python build_geography.py --config config.json    # once: terrain, land/water, viewing angle, borders
   python build_features.py --config config.json     # every day in the range (days already complete are skipped)
   python build_features.py --config config.json --start D --end D --stats   # normalisation statistics
 
-Everything is set by the "features" section of config.json (README.md lists the options). Modules:
-settings (the config), expressions (derived channels), grid (target grid, regridding, sun and satellite
-geometry), raw (reading the raw stores), mrms (MRMS radar on the grid), glm (flashes, flash footprints,
-labels), geography (the one-time static fields), build (the day builder and the runs).
+Everything is set by the "features" section of config.json (README.md lists the options and the methods).
 
-Grid: the ABI fixed grid, coarsened by an integer factor from the finest product used. Each cell is a block
-of coarsen x coarsen reference pixels counted from the uncropped CONUS sector's first pixel, so cells nest
-exactly in the 2 km and 10 km ABI grids. Products at least as fine as the cell are aggregated over the
-source pixels whose centres fall in it (mean/min/max/std/fraction); coarser products take the pixel
-containing the cell centre. GLM flashes and events go to the cell containing their view angle, recovered
-with the lightning ellipsoid GLM navigates to, so they line up with the cloud tops ABI sees. MRMS pixels
-go through the same mapping, which puts a radar column on the cell of the flashes above it (mrms.py); each
-cell aggregates the pixels placed in it.
+Grid: blocks of coarsen x coarsen pixels of the finest product used, counted from the uncropped CONUS
+sector's first pixel, so cells nest exactly in the 2 km and 10 km ABI grids. Finer products are aggregated
+over the pixels whose centres fall in a cell; coarser ones take the pixel containing the cell centre. GLM
+flashes and events, and MRMS pixels, go to the cell of their view angle on GLM's lightning ellipsoid.
 
 Time: slot t holds the ABI scan starting in [t, t+5 min). The issue time is the end of the slot
-(t + 5 min): every input ends there and every label window starts there. Solar channels are computed for
-the middle of the slot; MRMS channels take the newest file before the issue time, if under 10 min old.
+(t + 5 min): every input ends there and every label window starts there.
 
-GLM: "count" channels and centroid labels use each flash's centroid. "extent" channels and labels use its
-footprint, built as glmtools builds flash-extent density (LightningCast's truth): each event's GLM pixel,
-rebuilt from glmtools' pixel-corner table, spread onto the cells by area, each flash at most once per
-cell. "extent" channels hold that density before rounding; flash_extent and extent labels round it half
-up over their window (README, "Flash footprints"). Orphan events (flash_index -1 in the raw store: NOAA's
-file lacks their group or flash) are skipped. A label with min_flashes > 1 counts flash-cell hits within
-its radius.
+GLM: "count" channels and centroid labels use each flash's centroid; "extent" channels and labels its
+footprint, built as glmtools builds flash-extent density (glm.py). "extent" channels hold that density
+before rounding; flash_extent and extent labels round it half up over their window. Orphan events
+(flash_index -1) are skipped. A label with min_flashes > 1 counts flash-cell hits within its radius.
 
 Layout of <features.output_root_dir>/YYYY/YYYYDDD.zarr (Zarr format 3, like the raw stores)
   time[time]                           datetime64 slot start, every time_step_minutes

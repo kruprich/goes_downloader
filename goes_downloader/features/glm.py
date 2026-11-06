@@ -22,7 +22,7 @@ GLM_WINDOWS_PER_SLOT = SLOT_SECONDS // GLM_WINDOW_SECONDS
 # previous file's window), so the files that can hold flashes of [t0, t1) start in [t0 - 20 s, t1 + 20 s)
 FILE_MARGIN_NS = GLM_WINDOW_SECONDS * 1_000_000_000
 EVENT_CHUNK = 5_000_000  # events mapped at a time (~1 GB peak); a day has ~50 M
-COVER_BATCH = 500_000  # pixels spread onto cells at a time; each makes up to 25 (pixel, cell) pairs on a 2 km grid
+COVER_BATCH = 100_000  # pixels spread onto cells at a time; each makes up to 25 (pixel, cell) pairs on a 2 km grid
 PIXEL_CORNERS_PATH = os.path.join(os.path.dirname(__file__), "glm_pixel_corners.npz")
 # How footprints are made, recorded in every store: stores built another way hold different extents and labels
 FOOTPRINT = "glmtools pixel corners (G16 table), area-weighted, each flash at most once per cell, density rounded half up"
@@ -102,10 +102,12 @@ def pixel_cover(grid: TargetGrid, flash: np.ndarray, minute: np.ndarray, west: n
             flashes, first = np.unique(flash[a:b], return_index=True)
             m = minute[a:b][first][np.searchsorted(flashes, per_flash // ncells)]
             per_minute, inv = np.unique(m * ncells + per_flash % ncells, return_inverse=True)
-            out.append((per_minute // ncells, per_minute % ncells, np.bincount(inv, cover).astype(np.float32)))
+            # int32: a day's extents are tens of millions of entries
+            out.append(((per_minute // ncells).astype(np.int32), (per_minute % ncells).astype(np.int32),
+                        np.bincount(inv, cover).astype(np.float32)))
         a = b
     if not out:
-        return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
+        return np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32)
     return tuple(np.concatenate(p) for p in zip(*out))  # type: ignore[return-value]
 
 
@@ -183,6 +185,7 @@ class GlmTimeline:
 
         flash, minute, px, py = (_cat([p[k] for p in pixels], dt) for k, dt in enumerate((np.int64, np.int64, np.float64, np.float64)))
         sides = PixelCorners().rectangles(px, py)
+        del px, py
         self.extent = {False: pixel_cover(grid, flash, minute, *sides)}
         self.fine_ncells = 0
         if fine is not None:
@@ -224,7 +227,9 @@ class GlmTimeline:
 
     @staticmethod
     def _range(slot: np.ndarray, a: int, b: int) -> slice:
-        return slice(int(np.searchsorted(slot, a, "left")), int(np.searchsorted(slot, b, "left")))
+        # In slot's own dtype: with Python ints numpy converts an int32 array to int64 on every call
+        lo, hi = np.searchsorted(slot, np.array([a, b], slot.dtype), "left")
+        return slice(int(lo), int(hi))
 
     def sums(self, a: int, b: int, stat: str = "count") -> np.ndarray:
         """
@@ -249,7 +254,7 @@ class GlmTimeline:
         minute, cell, cover = self.extent[fine]
         lo, hi = (a - self.s0) * SLOT_MINUTES, (b - self.s0) * SLOT_MINUTES
         r = self._range(minute, lo, hi)
-        n = self.fine_ncells if fine else self.ncells
+        n = np.int64(self.fine_ncells if fine else self.ncells)  # so the keys below can't overflow minute's int32
         windows, inv = np.unique((minute[r] - lo) // minutes * n + cell[r], return_inverse=True)
         density = round_density(np.bincount(inv, cover[r]))
         out = np.zeros(n, np.int64)

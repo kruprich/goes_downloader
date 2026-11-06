@@ -80,13 +80,16 @@ class ChannelStats:
         self.count, self.sum, self.sum_sq = 0, 0.0, 0.0
         self.min, self.max = math.inf, -math.inf
 
-    def add(self, v: np.ndarray) -> None:
+    def add(self, v: np.ndarray) -> int:
+        """Adds the frame's finite values; returns how many there were."""
         v = v[np.isfinite(v)].astype(np.float64)
         if v.size:
             self.count += int(v.size)
             self.sum += float(v.sum())
-            self.sum_sq += float(np.dot(v, v))
+            # Not np.dot: OpenBLAS runs it on every core, so 8 workers start ~96 threads that spin on 6 cores
+            self.sum_sq += float(np.square(v).sum())
             self.min, self.max = min(self.min, float(v.min())), max(self.max, float(v.max()))
+        return int(v.size)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"count": self.count, "sum": self.sum, "sum_sq": self.sum_sq,
@@ -285,8 +288,7 @@ def build_day(cfg: FeatureConfig, grid: TargetGrid, day_iso: str) -> Dict[str, A
         stored = stack.astype(cfg.dtype)
         features[k] = stored
         for i, c in enumerate(outputs):
-            stats[c.name].add(stored[i])
-            valid_fraction[k, i] = float(np.isfinite(stored[i]).mean())
+            valid_fraction[k, i] = stats[c.name].add(stored[i]) / stored[i].size
 
         if glm is not None:
             a = s + 1 - step

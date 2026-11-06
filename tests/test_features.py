@@ -432,6 +432,7 @@ def test_pixel_cover_spreads_pixels_by_area_once_per_flash():
     got = {(int(mm), divmod(int(c), 5)): round(float(v), 6) for mm, c, v in zip(m, cell, cover)}
     assert got == {(0, (1, 1)): 1.0, (0, (1, 2)): 1.25, (0, (1, 3)): 0.5, (3, (0, 0)): 0.5, (3, (1, 0)): 0.5}
     assert list(m) == sorted(m)
+    assert m.dtype == cell.dtype == np.int32  # a summer day's extents are ~50 M entries, held for the whole day
     np.testing.assert_array_equal(round_density(np.array([0.49, 0.5, 1.25, 1.5])), [0, 1, 1, 2])
 
 
@@ -468,6 +469,22 @@ def test_stats_count_each_label_on_its_own_grid(built, tmp_path):
         known = labels != 255
         assert abs(stats[name]["known_fraction"] - known.mean()) < 1e-12
         assert abs(stats[name]["positive_fraction"] - (labels == 1).sum() / known.sum()) < 1e-12
+
+
+def test_channel_stats_and_valid_fractions_describe_the_stored_frames(built, tmp_path):
+    cfg, grid = built
+    build_day(cfg, grid, DAY2)
+    F = zarr.open_consolidated(str(tmp_path / "features/2025/2025153.zarr"), mode="r")
+    frames = F["features"][:]
+    assert np.array_equal(F["channel_valid_fraction"][:], np.isfinite(frames).mean(axis=(2, 3)).astype(np.float32))
+    for i, name in enumerate(F["channel"][:]):
+        v = frames[:, i][np.isfinite(frames[:, i])].astype(np.float64)
+        st = F.attrs["channel_stats"][str(name)]
+        assert st["count"] == v.size
+        if v.size:
+            assert st["min"] == v.min() and st["max"] == v.max()
+            assert abs(st["sum"] - v.sum()) <= 1e-12 * np.abs(v).sum()
+            assert abs(st["sum_sq"] - (v * v).sum()) <= 1e-12 * (v * v).sum()
 
 
 def test_label_resolutions_must_nest_in_the_grid(built, tmp_path):
